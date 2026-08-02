@@ -516,6 +516,165 @@ export const testReservedDeltaMutationAdmissionFailures = () => {
   assertNamedFailure(() => prepared.apply(), 'DeltaMutationCapabilityError')
 }
 
+export const testReservedDeltaMutationObserverFailureStillStales = () => {
+  const doc = new Y.Doc()
+  const type = doc.get('content')
+  doc.on('beforeObserverCalls', () => { throw new Error('observer failure') })
+  const prepared = type.reserveDeltaMutation(delta.create().insert('reserved').done())
+  t.fails(() => type.applyDelta(delta.create().insert('external').done()))
+  assertNamedFailure(() => prepared.apply(), 'DeltaMutationStaleError')
+  t.assert(type.toString() === 'external', 'observer failure cannot hide a committed structural revision')
+}
+
+export const testReservedDeltaMutationRechecksLivenessInsideTransaction = () => {
+  const doc = new Y.Doc()
+  const type = doc.get('content')
+  const prepared = type.reserveDeltaMutation(delta.create().insert('reserved').done())
+  let callbackCalled = false
+  doc.on('beforeTransaction', () => { doc.destroy() })
+  assertNamedFailure(
+    () => prepared.apply({ afterMutation: () => { callbackCalled = true } }),
+    'DeltaMutationStaleError'
+  )
+  t.assert(!callbackCalled && type.toString() === '', 'destroyed admission runs neither executor nor callback')
+}
+
+export const testReservedDeltaMutationOwnsCanonicalOperations = () => {
+  const textDoc = new Y.Doc()
+  const textType = textDoc.get('content')
+  const textMutation = delta.create().insert('owned')
+  const textOp = /** @type {any} */ (textMutation.children.start)
+  textOp.clone = () => textOp
+  const textPrepared = textType.reserveDeltaMutation(textMutation)
+  textOp.insert = 'mutated'
+  textPrepared.apply()
+  t.assert(textType.toString() === 'owned', 'text op dispatch and payload are privately owned')
+
+  const deleteDoc = new Y.Doc()
+  const deleteType = deleteDoc.get('content')
+  deleteType.applyDelta(delta.create().insert('abc').done())
+  const deleteMutation = delta.create().delete(1)
+  const deleteOp = /** @type {any} */ (deleteMutation.children.start)
+  deleteOp.clone = () => deleteOp
+  const deletePrepared = deleteType.reserveDeltaMutation(deleteMutation)
+  deleteOp.delete = 3
+  deletePrepared.apply()
+  t.assert(deleteType.toString() === 'bc', 'delete op dispatch and length are privately owned')
+
+  const retainDoc = new Y.Doc()
+  const retainType = retainDoc.get('content')
+  retainType.applyDelta(delta.create().insert('abc').done())
+  const retainMutation = delta.create().retain(1, { bold: {} })
+  const retainOp = /** @type {any} */ (retainMutation.children.start)
+  retainOp.clone = () => retainOp
+  const retainPrepared = retainType.reserveDeltaMutation(retainMutation)
+  retainOp.retain = 3
+  retainOp.format.bold = { forged: true }
+  retainPrepared.apply()
+  t.compare(retainType.toDeltaDeep().toJSON(), {
+    type: 'delta',
+    children: [
+      { type: 'insert', insert: 'a', format: { bold: {} } },
+      { type: 'insert', insert: 'bc' }
+    ]
+  })
+}
+
+export const testReservedDeltaMutationNestedPolymorphism = () => {
+  let overrideCalls = 0
+  let liveCalls = 0
+  class PolymorphicType extends Y.Type {
+    /**
+     * @param {delta.DeltaAny} mutation
+     * @param {any} [origin]
+     * @param {any} [options]
+     */
+    applyDelta (mutation, origin, options) {
+      overrideCalls++
+      if (this.doc?._transaction !== null) liveCalls++
+      return super.applyDelta(mutation, origin, options)
+    }
+  }
+  const doc = new Y.Doc()
+  const type = doc.get('content')
+  const child = new PolymorphicType('child')
+  const attr = new PolymorphicType('attr')
+  child.applyDelta(delta.create().insert('a').done())
+  attr.applyDelta(delta.create().insert('b').done())
+  type.applyDelta(delta.create().insert([child]).setAttr('nested', attr).done())
+  overrideCalls = 0
+  liveCalls = 0
+  const mutation = delta.create()
+    .modify(delta.create().insert('x'))
+    .modifyAttr('nested', delta.create().insert('y'))
+    .done()
+  type.applyDelta(mutation)
+  t.assert(overrideCalls === 2 && liveCalls === 2, 'ordinary nested overrides run in the parent transaction')
+  t.assert(child.toString() === '<child>xa</child>' && attr.toString() === '<attr>yb</attr>')
+
+  let updates = 0
+  doc.on('update', () => { updates++ })
+  const before = Y.encodeStateAsUpdate(doc)
+  assertNamedFailure(
+    () => type.reserveDeltaMutation(delta.create()
+      .modify(delta.create().insert('reserved'))
+      .modifyAttr('nested', delta.create().insert('reserved'))
+      .done()),
+    'DeltaMutationPreparationError'
+  )
+  t.assert(updates === 0, 'reserved custom dispatch fails before writes')
+  t.compare(Array.from(Y.encodeStateAsUpdate(doc)), Array.from(before))
+
+  const guardedDoc = new Y.Doc()
+  const guardedRoot = guardedDoc.get('content')
+  const guardedChild = new Y.Type('child')
+  guardedChild.applyDelta(delta.create().insert('a').done())
+  guardedRoot.applyDelta(delta.create().insert([guardedChild]).done())
+  const prepared = guardedRoot.reserveDeltaMutation(delta.create().modify(delta.create().insert('x')).done())
+  let callbackCalled = false
+  guardedChild.applyDelta = () => { throw new Error('unsafe override') }
+  assertNamedFailure(
+    () => prepared.apply({ afterMutation: () => { callbackCalled = true } }),
+    'DeltaMutationStaleError'
+  )
+  t.assert(!callbackCalled && guardedChild.toString() === '<child>a</child>', 'post-prepare dispatch mutation runs no executor')
+}
+
+export const testReservedDeltaMutationDeepGraphOwnedOnce = () => {
+  const depth = 256
+  /** @type {any} */
+  let nested = delta.create('leaf').insert('x')
+  let cloneCalls = 0
+  const nestedTextOp = /** @type {any} */ (nested.children.start)
+  nestedTextOp.clone = () => {
+    cloneCalls++
+    throw new Error('caller clone dispatch')
+  }
+  for (let index = 0; index < depth; index++) {
+    nested = delta.create(`n${index}`).insert([nested])
+  }
+  const doc = new Y.Doc()
+  const type = doc.get('content')
+  const prepared = type.reserveDeltaMutation(delta.create().insert([nested]).done())
+  prepared.apply()
+  t.assert(cloneCalls === 0, 'deep ownership reconstructs each structural op without caller clone dispatch')
+}
+
+export const testReservedDeltaMutationCallbackFailureIsFatal = () => {
+  const doc = new Y.Doc()
+  const type = doc.get('content')
+  const prepared = type.reserveDeltaMutation(delta.create().insert('content').done())
+  assertNamedFailure(() => prepared.apply({
+    afterMutation: () => {
+      type.setAttr('ledger', true)
+      throw new Error('trusted callback violated noexcept contract')
+    }
+  }), 'DeltaMutationInvariantError')
+  const committed = type.toDeltaDeep().children.start
+  t.assert(delta.$textOp.check(committed) && committed.insert === 'content' && type.getAttr('ledger') === true, 'trusted callback failure is fatal with no rollback')
+  assertNamedFailure(() => prepared.apply(), 'DeltaMutationCapabilityError')
+}
+
 export const testReservedDeltaMutationScaleProbes = () => {
   const text = 'x'.repeat(100000)
   const insertDoc = new Y.Doc()

@@ -703,6 +703,16 @@ const applyDeltaCanonical = (type, d, origin, renderer, activeTransaction) => {
       f.modify(/** @type {any} */ (childFix ?? delta.create().done(false)), invFormat)
       fixLen = expectedIndex + 1
     }
+    /**
+     * Ordinary application preserves nested type polymorphism. Reserved execution has already
+     * admitted canonical types and stays on this private interpreter in the captured transaction.
+     *
+     * @param {YType<any>} sub
+     * @param {delta.DeltaAny} mutation
+     */
+    const applyNestedDelta = (sub, mutation) => activeTransaction === null
+      ? sub.applyDelta(mutation, origin, { renderer })
+      : applyDeltaCanonical(sub, mutation, origin, renderer, transaction)
     const currPos = new ItemTextListPosition(null, type._start, 0, new Map(), renderer)
     for (const op of d.children) {
       if (delta.$textOp.check(op)) {
@@ -727,10 +737,10 @@ const applyDeltaCanonical = (type, d, origin, renderer, activeTransaction) => {
           for (const k in op.format) {
             (invFormat ?? (invFormat = {}))[k] = currPos.currentFormats.get(k) ?? null
           }
-          const childFix = applyDeltaCanonical(/** @type {ContentType} */ (item.content).type, op.value, origin, renderer, transaction)
+          const childFix = applyNestedDelta(/** @type {ContentType} */ (item.content).type, op.value)
           if (childFix !== null || invFormat !== undefined) appendModifyFix(childFix, invFormat)
         } else {
-          const childFix = applyDeltaCanonical(/** @type {ContentType} */ (item.content).type, op.value, origin, renderer, transaction)
+          const childFix = applyNestedDelta(/** @type {ContentType} */ (item.content).type, op.value)
           currPos.formatText(transaction, type, 1, op.format || {})
           if (childFix !== null) appendModifyFix(childFix)
         }
@@ -754,7 +764,7 @@ const applyDeltaCanonical = (type, d, origin, renderer, activeTransaction) => {
                   : undefined)
               : mapItem.content.getContent()[mapItem.length - 1])
         if (!(sub instanceof YType)) error.unexpectedCase()
-        const subFix = applyDeltaCanonical(sub, op.value, origin, renderer, transaction)
+        const subFix = applyNestedDelta(sub, op.value)
         if (subFix !== null) {
           const f = fix ?? (fix = /** @type {any} */ (delta.create()))
           f.modifyAttr(/** @type {any} */ (op.key), /** @type {any} */ (subFix))
@@ -1681,7 +1691,8 @@ export class YType extends ObservableV2 {
       d,
       origin,
       renderer,
-      (transaction, mutation) => applyDeltaCanonical(this, mutation, origin, renderer, transaction)
+      (transaction, mutation) => applyDeltaCanonical(this, mutation, origin, renderer, transaction),
+      YType.prototype.applyDelta
     )
   }
 

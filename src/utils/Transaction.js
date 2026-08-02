@@ -17,6 +17,30 @@ import * as random from 'lib0/random'
 
 export const generateNewClientId = random.uint53
 
+/** @type {WeakMap<Doc,{revision:number}>} */
+const documentStructuralRevisions = new WeakMap()
+
+/**
+ * Internal structural revision used by pre-write capabilities. The entry is allocated lazily so
+ * documents without a revision consumer only pay one WeakMap lookup for nonempty cleanup.
+ *
+ * @param {Doc} doc
+ */
+export const readDocumentStructuralRevision = doc => {
+  let revision = documentStructuralRevisions.get(doc)
+  if (revision === undefined) {
+    revision = { revision: 0 }
+    documentStructuralRevisions.set(doc, revision)
+  }
+  return revision.revision
+}
+
+/** @param {Doc} doc */
+const bumpDocumentStructuralRevision = doc => {
+  const revision = documentStructuralRevisions.get(doc)
+  if (revision !== undefined) revision.revision++
+}
+
 /**
  * A transaction is created for every change on the Yjs model. It is possible
  * to bundle changes on the Yjs model in a single transaction to
@@ -217,6 +241,9 @@ const cleanupTransactions = (transactionCleanups, i) => {
     const ds = transaction.deleteSet
     const mergeStructs = transaction._mergeStructs
     // insertIntoIdSet(store.ds, ds)
+    if (!transaction.insertSet.isEmpty() || !transaction.deleteSet.isEmpty()) {
+      bumpDocumentStructuralRevision(doc)
+    }
     try {
       doc.emit('beforeObserverCalls', [transaction, doc])
       /**

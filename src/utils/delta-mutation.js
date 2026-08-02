@@ -3,7 +3,7 @@ import * as delta from 'lib0/delta'
 import { ContentFormat, ContentType } from '../structs/Item.js'
 import { createIdSet, diffIdSet, intersectSets } from './ids.js'
 import { readRendererLifecycle, rendererContentLength } from './renderer-helpers.js'
-import { transact } from './Transaction.js'
+import { readDocumentStructuralRevision, transact } from './Transaction.js'
 
 /**
  * @typedef {{ readonly client: number, readonly clock: number, readonly length: number }} StructuralIdRange
@@ -14,13 +14,13 @@ import { transact } from './Transaction.js'
  *   readonly rangeCount: number
  * }} DeltaMutationContent
  * @typedef {{ afterMutation?: (content: DeltaMutationContent) => void }} DeltaMutationApplyOptions
+ * @typedef {(mutation: delta.DeltaAny, origin?: any, options?: any) => delta.DeltaBuilder<any>?} CanonicalDeltaApply
  * @typedef {{
  *   readonly reservation: DeltaMutationReservation,
  *   apply: (options?: DeltaMutationApplyOptions) => delta.DeltaBuilder<any>?,
  *   discard: () => void
  * }} PreparedDeltaMutation
  * @typedef {(transaction: Transaction, mutation: delta.DeltaAny) => delta.DeltaBuilder<any>?} DeltaMutationExecutor
- * @typedef {{ revision: number }} DocumentRevision
  * @typedef {{
  *   status: 'prepared'|'applying'|'consumed'|'discarded',
  *   type: YType<any>,
@@ -31,10 +31,19 @@ import { transact } from './Transaction.js'
  *   mutation: delta.DeltaAny,
  *   origin: any,
  *   rangeCountUpperBound: number,
- *   executor: DeltaMutationExecutor
+ *   executor: DeltaMutationExecutor,
+ *   canonicalApplyDelta: CanonicalDeltaApply,
+ *   guardedTypes: Set<YType<any>>
  * }} PreparedDeltaMutationState
  * @typedef {{ item: Item?, offset: number }} StructuralCursor
- * @typedef {{ deletes: IdSet, formatHazards: Set<Item>, allocates: boolean }} ReservationScan
+ * @typedef {{
+ *   deletes: IdSet,
+ *   formatHazards: Set<Item>,
+ *   allocates: boolean,
+ *   doc: Doc,
+ *   canonicalApplyDelta: CanonicalDeltaApply,
+ *   guardedTypes: Set<YType<any>>
+ * }} ReservationScan
  */
 
 export class DeltaMutationPreparationError extends Error {
@@ -73,29 +82,8 @@ export class DeltaMutationInvariantError extends Error {
   }
 }
 
-/** @type {WeakMap<Doc, DocumentRevision>} */
-const documentRevisions = new WeakMap()
-
 /** @type {WeakMap<object, PreparedDeltaMutationState>} */
 const preparedMutations = new WeakMap()
-
-/**
- * @param {Doc} doc
- */
-const getDocumentRevision = doc => {
-  let revision = documentRevisions.get(doc)
-  if (revision === undefined) {
-    const tracker = { revision: 0 }
-    revision = tracker
-    documentRevisions.set(doc, tracker)
-    doc.on('beforeObserverCalls', transaction => {
-      if (!transaction.insertSet.isEmpty() || !transaction.deleteSet.isEmpty()) {
-        tracker.revision++
-      }
-    })
-  }
-  return revision.revision
-}
 
 /**
  * @param {IdSet} ids
@@ -236,6 +224,10 @@ const findRenderedItem = (cursor, renderer) => {
  * @param {ReservationScan} scan
  */
 const scanDeltaMutation = (type, mutation, renderer, scan) => {
+  if (type.doc !== scan.doc || type.applyDelta !== scan.canonicalApplyDelta) {
+    throw new DeltaMutationPreparationError('Reserved delta mutation requires canonical target types')
+  }
+  scan.guardedTypes.add(type)
   /** @type {StructuralCursor} */
   const cursor = { item: type._start, offset: 0 }
   for (const op of mutation.children) {
@@ -295,16 +287,37 @@ const scanDeltaMutation = (type, mutation, renderer, scan) => {
  * @param {YType<any>} type
  * @param {delta.DeltaAny} mutation
  * @param {AbstractRenderer?} renderer
+ * @param {Doc} doc
+ * @param {CanonicalDeltaApply} canonicalApplyDelta
  */
-const reserveRangeCount = (type, mutation, renderer) => {
+const reserveRangeCount = (type, mutation, renderer, doc, canonicalApplyDelta) => {
   /** @type {ReservationScan} */
-  const scan = { deletes: createIdSet(), formatHazards: new Set(), allocates: false }
+  const scan = {
+    deletes: createIdSet(),
+    formatHazards: new Set(),
+    allocates: false,
+    doc,
+    canonicalApplyDelta,
+    guardedTypes: new Set()
+  }
   scanDeltaMutation(type, mutation, renderer, scan)
   let rangeCount = countRanges(scan.deletes)
   scan.formatHazards.forEach(item => {
     if (!scan.deletes.hasId(item.id)) rangeCount++
   })
-  return rangeCount + (scan.allocates ? 1 : 0)
+  return {
+    rangeCountUpperBound: rangeCount + (scan.allocates ? 1 : 0),
+    guardedTypes: scan.guardedTypes
+  }
+}
+
+/** @param {PreparedDeltaMutationState} state */
+const assertGuardedTypesFresh = state => {
+  for (const type of state.guardedTypes) {
+    if (type.doc !== state.doc || type.applyDelta !== state.canonicalApplyDelta) {
+      throw new DeltaMutationStaleError('Prepared delta mutation target dispatch changed')
+    }
+  }
 }
 
 /**
@@ -314,9 +327,10 @@ const assertFresh = state => {
   if (state.doc.isDestroyed || state.doc._transaction !== null || state.doc._transactionCleanups.length !== 0) {
     throw new DeltaMutationStaleError('Prepared delta mutation requires a quiescent live document')
   }
-  if (getDocumentRevision(state.doc) !== state.documentRevision) {
+  if (readDocumentStructuralRevision(state.doc) !== state.documentRevision) {
     throw new DeltaMutationStaleError('Prepared delta mutation document revision changed')
   }
+  assertGuardedTypesFresh(state)
   if (state.renderer !== null) {
     const lifecycle = readRendererLifecycle(state.renderer)
     if (lifecycle === null || lifecycle !== state.rendererLifecycle || !lifecycle.active) {
@@ -326,9 +340,17 @@ const assertFresh = state => {
 }
 
 /**
+ * @param {Transaction} transaction
  * @param {PreparedDeltaMutationState} state
  */
-const assertRendererFreshInsideTransaction = state => {
+const assertFreshInsideTransaction = (transaction, state) => {
+  if (state.doc.isDestroyed || state.type.doc !== state.doc) {
+    throw new DeltaMutationStaleError('Prepared delta mutation target changed before execution')
+  }
+  if (transaction.doc !== state.doc || state.doc._transaction !== transaction || transaction._done) {
+    throw new DeltaMutationInvariantError('Prepared delta mutation lost its reserved transaction')
+  }
+  assertGuardedTypesFresh(state)
   if (state.renderer !== null) {
     const lifecycle = readRendererLifecycle(state.renderer)
     if (lifecycle === null || lifecycle !== state.rendererLifecycle || !lifecycle.active) {
@@ -343,10 +365,10 @@ const assertRendererFreshInsideTransaction = state => {
  * @param {((content: DeltaMutationContent) => void)|undefined} afterMutation
  */
 const applyInTransaction = (transaction, state, afterMutation) => {
+  assertFreshInsideTransaction(transaction, state)
   if (!transaction.insertSet.isEmpty() || !transaction.deleteSet.isEmpty()) {
     throw new DeltaMutationInvariantError('beforeTransaction mutated the reserved document before delta execution')
   }
-  assertRendererFreshInsideTransaction(state)
   const beforeInserts = cloneIdSet(transaction.insertSet)
   const beforeDeletes = cloneIdSet(transaction.deleteSet)
   const fix = state.executor(transaction, state.mutation)
@@ -421,88 +443,21 @@ const assertPositiveLength = value => {
 }
 
 /**
- * Validate the original op graph before `cloneDeep`, whose fallback branches assume every op is
- * canonical and would otherwise turn a forged attribute op into a delete.
- *
- * @param {delta.DeltaAny} mutation
- */
-const validateDeltaMutation = mutation => {
-  /** @type {Set<delta.DeltaAny>} */
-  const validating = new Set()
-  /** @type {Set<delta.DeltaAny>} */
-  const validated = new Set()
-  /** @param {delta.DeltaAny} current */
-  const validate = current => {
-    if (!delta.$deltaAny.check(current)) throw new DeltaMutationPreparationError('Delta contains an invalid nested delta')
-    if (validating.has(current)) throw new DeltaMutationPreparationError('Delta contains a cyclic nested delta')
-    if (validated.has(current)) return
-    validating.add(current)
-    for (const op of current.children) {
-      if (delta.$textOp.check(op)) {
-        if (typeof op.insert !== 'string') throw new DeltaMutationPreparationError('Delta contains invalid text content')
-        assertPositiveLength(op.length)
-      } else if (delta.$insertOp.check(op)) {
-        if (!Array.isArray(op.insert)) throw new DeltaMutationPreparationError('Delta contains invalid inserted content')
-        assertPositiveLength(op.length)
-        for (const value of op.insert) {
-          if (delta.$deltaAny.check(value)) validate(value)
-        }
-      } else if (delta.$retainOp.check(op)) {
-        assertPositiveLength(op.retain)
-      } else if (delta.$deleteOp.check(op)) {
-        assertPositiveLength(op.delete)
-      } else if (delta.$modifyOp.check(op)) {
-        validate(op.value)
-      } else {
-        throw new DeltaMutationPreparationError('Delta contains an unsupported child operation')
-      }
-    }
-    for (const op of current.attrs) {
-      if (delta.$setAttrOp.check(op)) {
-        if (delta.$deltaAny.check(op.value)) {
-          throw new DeltaMutationPreparationError('Delta attributes cannot be set to a nested delta')
-        }
-      } else if (delta.$deleteAttrOp.check(op)) {
-        // no value to validate
-      } else if (delta.$modifyAttrOp.check(op)) {
-        validate(op.value)
-      } else {
-        throw new DeltaMutationPreparationError('Delta contains an unsupported attribute operation')
-      }
-    }
-    validating.delete(current)
-    validated.add(current)
-  }
-  validate(mutation)
-}
-
-/**
  * Detach every mutable input the canonical interpreter can consume. Raw shared types and subdocs
  * are rejected because preparation cannot privately own them without mutating preliminary content
  * or cloning a document; callers can express nested shared types with owned delta syntax instead.
+ * Every source delta is inspected and rebuilt once. In particular, caller-controlled `op.clone`
+ * dispatch is never used.
  *
  * @param {delta.DeltaAny} mutation
  * @param {YType<any>} target
  * @param {Doc} doc
  */
 const ownDeltaMutation = (mutation, target, doc) => {
-  validateDeltaMutation(mutation)
   /** @type {Map<object, any>} */
   const values = new Map()
   /** @type {Set<object>} */
-  const visiting = new Set()
-  /** @type {Set<delta.DeltaAny>} */
-  const visitedDeltas = new Set()
-  /**
-   * @param {delta.DeltaAny} source
-   * @return {delta.DeltaAny}
-   */
-  function cloneDelta (source) {
-    validateDeltaMutation(source)
-    const owned = /** @type {delta.DeltaAny} */ (/** @type {any} */ (delta.cloneDeep)(source))
-    ownDelta(owned)
-    return owned
-  }
+  const visitingValues = new Set()
   /**
    * @param {any} value
    * @param {'child'|'attr'|'data'} context
@@ -519,8 +474,7 @@ const ownDeltaMutation = (mutation, target, doc) => {
       throw new DeltaMutationPreparationError('Embedded documents are unsupported by reserved delta mutation')
     }
     if (delta.$deltaAny.check(value)) {
-      if (context !== 'child') throw new DeltaMutationPreparationError('Nested deltas are only valid as direct child content')
-      return cloneDelta(value)
+      throw new DeltaMutationPreparationError('Nested deltas are only valid as direct child content')
     }
     if (typeof value === 'function') throw new DeltaMutationPreparationError('Delta contains an unsupported function value')
     if (context === 'attr') {
@@ -531,7 +485,7 @@ const ownDeltaMutation = (mutation, target, doc) => {
     }
     const existing = values.get(value)
     if (existing !== undefined) {
-      if (visiting.has(value)) throw new DeltaMutationPreparationError('Delta contains a cyclic value')
+      if (visitingValues.has(value)) throw new DeltaMutationPreparationError('Delta contains a cyclic value')
       return existing
     }
     if (value instanceof Uint8Array) {
@@ -547,13 +501,13 @@ const ownDeltaMutation = (mutation, target, doc) => {
     if (Array.isArray(value)) {
       const owned = new Array(value.length)
       values.set(value, owned)
-      visiting.add(value)
+      visitingValues.add(value)
       try {
         for (let index = 0; index < value.length; index++) {
           if (Object.prototype.hasOwnProperty.call(value, index)) owned[index] = cloneValue(value[index], 'data')
         }
       } finally {
-        visiting.delete(value)
+        visitingValues.delete(value)
       }
       return owned
     }
@@ -563,7 +517,7 @@ const ownDeltaMutation = (mutation, target, doc) => {
     }
     const owned = Object.create(prototype)
     values.set(value, owned)
-    visiting.add(value)
+    visitingValues.add(value)
     try {
       Object.keys(value).forEach(key => {
         Object.defineProperty(owned, key, {
@@ -574,33 +528,184 @@ const ownDeltaMutation = (mutation, target, doc) => {
         })
       })
     } finally {
-      visiting.delete(value)
+      visitingValues.delete(value)
     }
     return owned
   }
-  /** @param {delta.DeltaAny} owned */
-  const ownDelta = owned => {
-    if (visitedDeltas.has(owned)) return
-    visitedDeltas.add(owned)
-    for (const op of owned.children) {
-      if (delta.$insertOp.check(op)) {
-        for (let index = 0; index < op.insert.length; index++) op.insert[index] = cloneValue(op.insert[index], 'child')
-      } else if (delta.$modifyOp.check(op)) {
-        ownDelta(op.value)
-      }
-      if ('format' in op) /** @type {any} */ (op).format = cloneValue(op.format, 'data')
-      if ('attribution' in op) /** @type {any} */ (op).attribution = cloneValue(op.attribution, 'data')
+
+  /** @type {Map<delta.DeltaAny,delta.DeltaAny>} */
+  const ownedDeltas = new Map()
+  /** @type {Map<delta.DeltaAny,0|1|2>} */
+  const deltaStates = new Map()
+  /** @type {Map<delta.DeltaAny,any>} */
+  const records = new Map()
+  /** @type {delta.DeltaAny[]} */
+  const completed = []
+
+  /** @param {any} key */
+  const ownKey = key => {
+    if (
+      (typeof key !== 'string' && typeof key !== 'number') ||
+      (typeof key === 'number' && !Number.isSafeInteger(key))
+    ) {
+      throw new DeltaMutationPreparationError('Delta contains an invalid attribute key')
     }
-    for (const op of owned.attrs) {
-      if (delta.$setAttrOp.check(op)) {
-        /** @type {any} */ (op).value = cloneValue(op.value, 'attr')
-      } else if (delta.$modifyAttrOp.check(op)) {
-        ownDelta(op.value)
+    return key
+  }
+
+  /** @param {delta.DeltaAny} source */
+  const inspectDelta = source => {
+    if (!delta.$deltaAny.check(source)) {
+      throw new DeltaMutationPreparationError('Delta contains an invalid nested delta')
+    }
+    const OwnedDeltaBuilder = /** @type {any} */ (delta.DeltaBuilder)
+    const owned = /** @type {delta.DeltaAny} */ (new OwnedDeltaBuilder(source.name, source.$schema))
+    ownedDeltas.set(source, owned)
+    /** @type {any[]} */
+    const children = []
+    /** @type {any[]} */
+    const attrs = []
+    /** @type {delta.DeltaAny[]} */
+    const nested = []
+    for (const op of source.children) {
+      if (delta.$textOp.check(op)) {
+        const insert = op.insert
+        if (typeof insert !== 'string') throw new DeltaMutationPreparationError('Delta contains invalid text content')
+        assertPositiveLength(insert.length)
+        children.push({
+          kind: 'text',
+          insert,
+          format: cloneValue(op.format, 'data'),
+          attribution: cloneValue(op.attribution, 'data')
+        })
+      } else if (delta.$insertOp.check(op)) {
+        const insert = op.insert
+        if (!Array.isArray(insert)) throw new DeltaMutationPreparationError('Delta contains invalid inserted content')
+        assertPositiveLength(insert.length)
+        const content = insert.map(value => {
+          if (delta.$deltaAny.check(value)) {
+            nested.push(value)
+            return value
+          }
+          return cloneValue(value, 'child')
+        })
+        children.push({
+          kind: 'insert',
+          insert: content,
+          format: cloneValue(op.format, 'data'),
+          attribution: cloneValue(op.attribution, 'data')
+        })
+      } else if (delta.$retainOp.check(op)) {
+        const retain = op.retain
+        assertPositiveLength(retain)
+        children.push({
+          kind: 'retain',
+          retain,
+          format: cloneValue(op.format, 'data'),
+          attribution: cloneValue(op.attribution, 'data')
+        })
+      } else if (delta.$deleteOp.check(op)) {
+        const length = op.delete
+        assertPositiveLength(length)
+        children.push({ kind: 'delete', length })
+      } else if (delta.$modifyOp.check(op)) {
+        const value = op.value
+        if (!delta.$deltaAny.check(value)) throw new DeltaMutationPreparationError('Delta contains an invalid nested delta')
+        nested.push(value)
+        children.push({
+          kind: 'modify',
+          value,
+          format: cloneValue(op.format, 'data'),
+          attribution: cloneValue(op.attribution, 'data')
+        })
+      } else {
+        throw new DeltaMutationPreparationError('Delta contains an unsupported child operation')
       }
-      if ('attribution' in op) /** @type {any} */ (op).attribution = cloneValue(op.attribution, 'data')
+    }
+    for (const op of source.attrs) {
+      if (delta.$setAttrOp.check(op)) {
+        const value = op.value
+        if (delta.$deltaAny.check(value)) {
+          throw new DeltaMutationPreparationError('Delta attributes cannot be set to a nested delta')
+        }
+        attrs.push({
+          kind: 'set',
+          key: ownKey(op.key),
+          value: cloneValue(value, 'attr'),
+          attribution: cloneValue(op.attribution, 'data')
+        })
+      } else if (delta.$deleteAttrOp.check(op)) {
+        attrs.push({
+          kind: 'delete',
+          key: ownKey(op.key),
+          attribution: cloneValue(op.attribution, 'data')
+        })
+      } else if (delta.$modifyAttrOp.check(op)) {
+        const value = op.value
+        if (!delta.$deltaAny.check(value)) throw new DeltaMutationPreparationError('Delta contains an invalid nested delta')
+        nested.push(value)
+        attrs.push({
+          kind: 'modify',
+          key: ownKey(op.key),
+          value,
+          attribution: cloneValue(op.attribution, 'data')
+        })
+      } else {
+        throw new DeltaMutationPreparationError('Delta contains an unsupported attribute operation')
+      }
+    }
+    records.set(source, { owned, children, attrs, nested })
+    return nested
+  }
+
+  /** @type {Array<{source:delta.DeltaAny,exit:boolean}>} */
+  const stack = [{ source: mutation, exit: false }]
+  while (stack.length > 0) {
+    const frame = /** @type {{source:delta.DeltaAny,exit:boolean}} */ (stack.pop())
+    const state = deltaStates.get(frame.source)
+    if (frame.exit) {
+      deltaStates.set(frame.source, 2)
+      completed.push(frame.source)
+    } else if (state === 1) {
+      throw new DeltaMutationPreparationError('Delta contains a cyclic nested delta')
+    } else if (state !== 2) {
+      deltaStates.set(frame.source, 1)
+      const nested = inspectDelta(frame.source)
+      stack.push({ source: frame.source, exit: true })
+      for (let index = nested.length - 1; index >= 0; index--) {
+        stack.push({ source: nested[index], exit: false })
+      }
     }
   }
-  return cloneDelta(mutation)
+
+  for (const source of completed) {
+    const { owned, children, attrs } = records.get(source)
+    for (const op of children) {
+      if (op.kind === 'text') {
+        owned.insert(op.insert, op.format, op.attribution)
+      } else if (op.kind === 'insert') {
+        owned.insert(/** @type {any[]} */ (op.insert).map(value => ownedDeltas.get(value) ?? value), op.format, op.attribution)
+      } else if (op.kind === 'retain') {
+        owned.retain(op.retain, op.format, op.attribution)
+      } else if (op.kind === 'delete') {
+        owned.delete(op.length)
+      } else {
+        owned.modify(ownedDeltas.get(op.value), op.format, op.attribution)
+      }
+    }
+    for (const op of attrs) {
+      if (op.kind === 'set') {
+        owned.setAttr(op.key, op.value, op.attribution)
+      } else if (op.kind === 'delete') {
+        owned.deleteAttr(op.key, op.attribution)
+      } else {
+        owned.modifyAttr(op.key, ownedDeltas.get(op.value), op.attribution)
+      }
+    }
+    owned.origin = source.origin
+    owned.isFinal = source.isFinal
+  }
+  return /** @type {delta.DeltaAny} */ (ownedDeltas.get(mutation))
 }
 
 /**
@@ -609,9 +714,10 @@ const ownDeltaMutation = (mutation, target, doc) => {
  * @param {any} origin
  * @param {AbstractRenderer?} renderer
  * @param {DeltaMutationExecutor} executor
+ * @param {CanonicalDeltaApply} canonicalApplyDelta
  * @return {PreparedDeltaMutation}
  */
-export const createPreparedDeltaMutation = (type, mutation, origin, renderer, executor) => {
+export const createPreparedDeltaMutation = (type, mutation, origin, renderer, executor, canonicalApplyDelta) => {
   const doc = type.doc
   if (doc === null || doc.isDestroyed) {
     throw new DeltaMutationPreparationError('Delta mutation target must be integrated in a live document')
@@ -619,7 +725,7 @@ export const createPreparedDeltaMutation = (type, mutation, origin, renderer, ex
   if (doc._transaction !== null || doc._transactionCleanups.length !== 0) {
     throw new DeltaMutationPreparationError('Delta mutation preparation requires a quiescent document')
   }
-  const documentRevision = getDocumentRevision(doc)
+  const documentRevision = readDocumentStructuralRevision(doc)
   let rendererLifecycle = null
   if (renderer !== null) {
     rendererLifecycle = readRendererLifecycle(renderer)
@@ -632,7 +738,7 @@ export const createPreparedDeltaMutation = (type, mutation, origin, renderer, ex
       doc.isDestroyed ||
       doc._transaction !== null ||
       doc._transactionCleanups.length !== 0 ||
-      getDocumentRevision(doc) !== documentRevision ||
+      readDocumentStructuralRevision(doc) !== documentRevision ||
       (renderer !== null && readRendererLifecycle(renderer) !== rendererLifecycle)
     ) {
       throw new DeltaMutationStaleError('Delta mutation state changed during preparation')
@@ -651,12 +757,15 @@ export const createPreparedDeltaMutation = (type, mutation, origin, renderer, ex
   }
   let ownedMutation
   let rangeCountUpperBound
+  let guardedTypes
   try {
     ownedMutation = ownDeltaMutation(mutation, type, doc)
     if (ownedMutation.isEmpty()) {
       throw new DeltaMutationPreparationError('Cannot reserve an empty delta mutation')
     }
-    rangeCountUpperBound = reserveRangeCount(type, ownedMutation, renderer)
+    const reservation = reserveRangeCount(type, ownedMutation, renderer, doc, canonicalApplyDelta)
+    rangeCountUpperBound = reservation.rangeCountUpperBound
+    guardedTypes = reservation.guardedTypes
   } catch (cause) {
     assertPreparationFresh()
     throw cause
@@ -674,7 +783,9 @@ export const createPreparedDeltaMutation = (type, mutation, origin, renderer, ex
     mutation: ownedMutation,
     origin,
     rangeCountUpperBound,
-    executor
+    executor,
+    canonicalApplyDelta,
+    guardedTypes
   })
   return capability
 }
