@@ -2170,3 +2170,175 @@ export const testRdtBaseFormatClearInsideSuggestionDeletedParagraphCacheDrift = 
   }
   t.assert(cached.equals(fresh), 'maintained .delta must equal a fresh deep render after a base format clear inside a suggestion-deleted paragraph')
 }
+
+export const testAttributionResolveContentIdsExactAccept = () => {
+  const base = new Y.Doc({ gc: false })
+  base.clientID = 1
+  base.get('text').insert(0, 'ab')
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Array<Y.ContentIds>} */
+  const changes = []
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) changes.push(Y.createContentIdsFromUpdate(update))
+  })
+  suggestion.get('text').insert(1, 'X')
+  suggestion.get('text').insert(2, 'Y')
+  const origin = {}
+  const counts = { base: 0, suggestion: 0, change: 0 }
+  base.on('update', () => { counts.base++ })
+  suggestion.on('update', () => { counts.suggestion++ })
+  renderer.on('change', (_ids, eventOrigin, local) => {
+    counts.change++
+    t.assert(eventOrigin === origin)
+    t.assert(local === false)
+  })
+
+  renderer.resolveContentIds(changes[0], 'accept', origin)
+  t.assert(base.get('text').toString() === 'aXb')
+  t.assert(suggestion.get('text').toString() === 'aXYb')
+  t.assert(!Y.intersectSets(changes[1].inserts, renderer.inserts).isEmpty(), 'adjacent suggestion stays pending')
+  t.compare(counts, { base: 1, suggestion: 0, change: 1 })
+
+  renderer.resolveContentIds(changes[0], 'accept', origin)
+  t.compare(counts, { base: 1, suggestion: 0, change: 1 })
+  t.fails(() => renderer.resolveContentIds(changes[0], 'reject', origin))
+  t.compare(counts, { base: 1, suggestion: 0, change: 1 })
+}
+
+/**
+ * Expansion boundary: a later same-client insertion must remain independently reviewable even
+ * when its origin is an earlier pending insertion. Encoding only the later structural range is
+ * causally blocked; encoding its origin too would resolve adjacent content outside the union.
+ */
+export const testAttributionResolveContentIdsLaterAdjacentAccept = () => {
+  const base = new Y.Doc({ gc: false })
+  base.clientID = 1
+  base.get('text').insert(0, 'a')
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Array<Y.ContentIds>} */
+  const changes = []
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) changes.push(Y.createContentIdsFromUpdate(update))
+  })
+  suggestion.get('text').insert(1, 'X')
+  suggestion.get('text').insert(2, 'Y')
+
+  renderer.resolveContentIds(changes[1], 'accept', {})
+
+  t.assert(base.get('text').toString() === 'aY', 'later adjacent suggestion accepts independently')
+  t.assert(suggestion.get('text').toString() === 'aXY', 'earlier adjacent suggestion stays pending')
+  t.assert(!Y.intersectSets(changes[0].inserts, renderer.inserts).isEmpty(), 'earlier attribution remains pending')
+}
+
+export const testAttributionResolveContentIdsExactReject = () => {
+  const base = new Y.Doc({ gc: true })
+  base.clientID = 1
+  base.get('text').insert(0, 'abc')
+  const suggestion = Y.cloneDoc(base, { gc: true, isSuggestionDoc: true })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Y.ContentIds?} */
+  let ids = null
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) ids = Y.createContentIdsFromUpdate(update)
+  })
+  suggestion.transact(() => {
+    suggestion.get('text').delete(1, 1)
+    suggestion.get('text').insert(1, 'X')
+  })
+  const exactIds = /** @type {Y.ContentIds} */ (/** @type {unknown} */ (ids))
+  const origin = {}
+  const counts = { base: 0, suggestion: 0, change: 0 }
+  base.on('update', () => { counts.base++ })
+  suggestion.on('update', (_update, eventOrigin, _doc, tr) => {
+    counts.suggestion++
+    t.assert(eventOrigin === origin)
+    t.assert(tr.local === true)
+  })
+  renderer.on('change', (_changed, eventOrigin, local) => {
+    counts.change++
+    t.assert(eventOrigin === origin)
+    t.assert(local === false)
+  })
+
+  renderer.resolveContentIds(exactIds, 'reject', origin)
+  t.assert(base.get('text').toString() === 'abc')
+  t.assert(suggestion.get('text').toString() === 'abc')
+  t.compare(counts, { base: 1, suggestion: 1, change: 1 })
+  renderer.resolveContentIds(exactIds, 'reject', origin)
+  t.compare(counts, { base: 1, suggestion: 1, change: 1 })
+  t.fails(() => renderer.resolveContentIds(exactIds, 'accept', origin))
+  t.compare(counts, { base: 1, suggestion: 1, change: 1 })
+}
+
+export const testAttributionResolveContentIdsGcReloadNestedReject = () => {
+  const source = new Y.Doc({ gc: true })
+  source.clientID = 1
+  source.get('root').applyDelta(delta.create().insert([delta.create('paragraph', {}, 'nested')]).done())
+  const baseUpdate = Y.encodeStateAsUpdate(source)
+  const deletionSource = Y.createDocFromUpdate(baseUpdate, { gc: true, isSuggestionDoc: true })
+  let deletionUpdate = new Uint8Array()
+  deletionSource.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) deletionUpdate = update
+  })
+  deletionSource.get('root').delete(0, 1)
+  const ids = Y.createContentIdsFromUpdate(deletionUpdate)
+
+  const base = Y.createDocFromUpdate(baseUpdate, { gc: true })
+  const suggestion = new Y.Doc({ gc: true, isSuggestionDoc: true })
+  // Delete-set-first persistence reconstruction must recover once its source structs arrive.
+  Y.applyUpdate(suggestion, deletionUpdate)
+  Y.applyUpdate(suggestion, baseUpdate)
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  renderer.resolveContentIds(ids, 'reject', {})
+
+  const expected = delta.create().insert([delta.create('paragraph', {}, 'nested')]).done()
+  t.assert(base.get('root').toDeltaDeep().equals(expected))
+  t.assert(suggestion.get('root').toDeltaDeep().equals(expected))
+  t.assert(renderer.inserts.clients.size === 0 && renderer.deletes.clients.size === 0)
+}
+
+export const testAttributionResolveContentIdsAtomicPreflight = () => {
+  const base = new Y.Doc({ gc: true })
+  base.clientID = 1
+  base.get('text').insert(0, 'abc')
+  const suggestion = Y.cloneDoc(base, { gc: true, isSuggestionDoc: true })
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Y.ContentIds?} */
+  let ids = null
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) ids = Y.createContentIdsFromUpdate(update)
+  })
+  suggestion.get('text').delete(1, 1)
+  const exactIds = /** @type {Y.ContentIds} */ (/** @type {unknown} */ (ids))
+  const unknown = Y.createIdSet()
+  unknown.add(999, 0, 1)
+  const invalid = Y.createContentIds(exactIds.inserts, Y.mergeIdSets([exactIds.deletes, unknown]))
+  const counts = { base: 0, suggestion: 0, change: 0 }
+  base.on('update', () => { counts.base++ })
+  suggestion.on('update', () => { counts.suggestion++ })
+  renderer.on('change', () => { counts.change++ })
+  const beforeBase = base.get('text').toString()
+  const beforeSuggestion = suggestion.get('text').toString()
+
+  t.fails(() => renderer.resolveContentIds(invalid, 'reject', {}))
+  t.assert(base.get('text').toString() === beforeBase)
+  t.assert(suggestion.get('text').toString() === beforeSuggestion)
+  t.compare(counts, { base: 0, suggestion: 0, change: 0 })
+
+  const foreignBase = new Y.Doc({ gc: true })
+  const foreignRenderer = Y.createDiffRenderer(foreignBase, suggestion)
+  const foreignCounts = { base: 0, suggestion: 0, change: 0 }
+  foreignBase.on('update', () => { foreignCounts.base++ })
+  suggestion.on('update', () => { foreignCounts.suggestion++ })
+  foreignRenderer.on('change', () => { foreignCounts.change++ })
+  t.fails(() => foreignRenderer.resolveContentIds(Y.createContentIds(Y.createIdSet(), exactIds.deletes), 'reject', {}))
+  t.compare(foreignCounts, { base: 0, suggestion: 0, change: 0 })
+
+  renderer.resolveContentIds(Y.createContentIds(), 'accept', {})
+  t.compare(counts, { base: 0, suggestion: 0, change: 0 })
+}

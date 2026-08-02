@@ -10,6 +10,7 @@ import { applyUpdate, encodeStateAsUpdate } from './encoding.js'
 import { UpdateEncoderV1 } from './UpdateEncoder.js'
 import { transact } from './Transaction.js'
 import { UndoManager, StackItem } from './UndoManager.js'
+import { Doc } from './Doc.js'
 
 import { $renderer, AttributedContent } from './renderer-helpers.js'
 
@@ -197,6 +198,142 @@ const collectSuggestedChanges = (tr, renderer, start, end, collectAll) => {
   return { inserts, deletes }
 }
 
+const diffResolutionReceipts = new WeakMap()
+
+const createResolutionReceipt = () => ({ inserts: createIdSet(), deletes: createIdSet() })
+
+/**
+ * @param {ContentIds} ids
+ */
+const copyContentIds = ids => {
+  if (ids == null || ids.inserts == null || ids.deletes == null || typeof ids.inserts.forEach !== 'function' || typeof ids.deletes.forEach !== 'function') {
+    throw new Error('Invalid ContentIds')
+  }
+  /**
+   * @param {IdSet} source
+   */
+  const copy = source => {
+    const result = createIdSet()
+    source.forEach((range, client) => {
+      const end = range.clock + range.len
+      if (!Number.isSafeInteger(client) || client < 0 || !Number.isSafeInteger(range.clock) || range.clock < 0 || !Number.isSafeInteger(range.len) || range.len <= 0 || !Number.isSafeInteger(end)) {
+        throw new Error('Invalid ContentIds range')
+      }
+      result.add(client, range.clock, range.len)
+    })
+    // Normalize duplicates/overlaps on the defensive copy.
+    result.forEach(() => {})
+    return result
+  }
+  return { inserts: copy(ids.inserts), deletes: copy(ids.deletes) }
+}
+
+/**
+ * @param {IdSet} left
+ * @param {IdSet|IdMap<any>} right
+ */
+const isSubset = (left, right) => diffIdSet(left, right).isEmpty()
+
+/**
+ * @param {IdSet} left
+ * @param {IdSet} right
+ */
+const overlaps = (left, right) => !intersectSets(left, right).isEmpty()
+
+/**
+ * Visit the exact slices of `ids`, failing on holes before callers mutate a document.
+ *
+ * @param {StructStore} store
+ * @param {IdSet} ids
+ * @param {(struct:GC|Item|Skip, offset:number, len:number)=>boolean} predicate
+ * @param {string} message
+ */
+const assertStructCoverage = (store, ids, predicate, message) => {
+  ids.forEach((range, client) => {
+    const structs = store.clients.get(client)
+    if (structs == null || structs.length === 0) throw new Error(message)
+    let left = 0
+    let right = structs.length - 1
+    while (left <= right) {
+      const middle = (left + right) >>> 1
+      const struct = structs[middle]
+      if (range.clock < struct.id.clock) {
+        right = middle - 1
+      } else if (range.clock >= struct.id.clock + struct.length) {
+        left = middle + 1
+      } else {
+        left = middle
+        break
+      }
+    }
+    let index = left
+    let clock = range.clock
+    const end = range.clock + range.len
+    while (clock < end) {
+      const struct = structs[index++]
+      if (struct == null || struct.id.clock > clock || struct.id.clock + struct.length <= clock) throw new Error(message)
+      const offset = clock - struct.id.clock
+      const len = Math.min(struct.length - offset, end - clock)
+      if (!predicate(struct, offset, len)) throw new Error(message)
+      clock += len
+    }
+  })
+}
+
+/**
+ * @param {Item} struct
+ * @param {Doc} doc
+ */
+const isIntegratedItem = (struct, doc) => struct.isItem && struct.parent != null && typeof struct.parent !== 'string' && /** @type {YType} */ (struct.parent).doc === doc
+
+/**
+ * Build the exact reject update on an isolated non-GC merge. Applying the base state first is
+ * what preserves canonical deleted payload when the suggestion store contains ContentDeleted/GC.
+ *
+ * @param {DiffRenderer} renderer
+ * @param {ContentIds} ids
+ */
+const prepareRejectUpdate = (renderer, ids) => {
+  const inserts = diffIdSet(ids.inserts, ids.deletes)
+  const deletes = diffIdSet(ids.deletes, ids.inserts)
+  const scratch = new Doc({ gc: false, isSuggestionDoc: true })
+  try {
+    applyUpdate(scratch, encodeStateAsUpdate(renderer._prevDoc))
+    applyUpdate(scratch, encodeStateAsUpdate(renderer._nextDoc))
+    scratch.clientID = renderer._nextDoc.clientID
+
+    assertStructCoverage(scratch.store, deletes, struct => isIntegratedItem(/** @type {Item} */ (struct), scratch) && struct.deleted && !(/** @type {Item} */ (struct).content instanceof ContentDeleted), 'Missing canonical deletion preimage')
+
+    const undoManager = new UndoManager(scratch)
+    /** @type {Transaction?} */
+    let undoTransaction = null
+    /** @param {Transaction} tr */
+    const capture = tr => {
+      if (tr.origin === undoManager) undoTransaction = tr
+    }
+    scratch.on('afterTransaction', capture)
+    try {
+      undoManager.undoStack.push(new StackItem(inserts, deletes))
+      undoManager.undo()
+    } finally {
+      scratch.off('afterTransaction', capture)
+      undoManager.destroy()
+    }
+    if (undoTransaction == null) throw new Error('Diff resolution invariant failed')
+    const tr = /** @type {Transaction} */ (undoTransaction)
+    if (!isSubset(tr.deleteSet, inserts)) throw new Error('ContentIds resolve outside their exact scope')
+    assertStructCoverage(scratch.store, inserts, struct => struct.deleted, 'ContentIds insert could not be rejected')
+    assertStructCoverage(scratch.store, deletes, struct => struct.isItem && /** @type {Item} */ (struct).redone != null, 'ContentIds delete could not be rejected')
+
+    const encoder = new UpdateEncoderV1()
+    writeStructsFromIdSet(encoder, scratch.store, mergeIdSets([ids.inserts, tr.insertSet]))
+    writeIdSet(encoder, mergeIdSets([ids.inserts, ids.deletes]))
+    return encoder.toUint8Array()
+  } finally {
+    scratch.destroy()
+  }
+}
+
 export class Attributions {
   constructor () {
     this.inserts = createIdMap()
@@ -243,6 +380,7 @@ export class DiffRenderer extends ObservableV2 {
     this._prevDoc = prevDoc
     this._prevDocStore = prevDoc.store
     this._nextDoc = nextDoc
+    diffResolutionReceipts.set(this, { accepted: createResolutionReceipt(), rejected: createResolutionReceipt() })
     // update before observer calls fired
     this._nextBOH = nextDoc.on('beforeObserverCalls', tr => {
       // update inserts
@@ -387,6 +525,68 @@ export class DiffRenderer extends ObservableV2 {
       um.destroy()
     })
     this.acceptChanges(start, end)
+  }
+
+  /**
+   * Resolve exactly the supplied structural IDs without positional expansion.
+   *
+   * @param {ContentIds} ids
+   * @param {'accept'|'reject'} disposition
+   * @param {unknown} [origin]
+   */
+  resolveContentIds (ids, disposition, origin) {
+    if (disposition !== 'accept' && disposition !== 'reject') throw new Error('Invalid diff resolution disposition')
+    const requested = copyContentIds(ids)
+    const receipts = /** @type {{accepted:ContentIds,rejected:ContentIds}} */ (diffResolutionReceipts.get(this))
+    const receipt = disposition === 'accept' ? receipts.accepted : receipts.rejected
+    const opposite = disposition === 'accept' ? receipts.rejected : receipts.accepted
+    if (overlaps(requested.inserts, opposite.inserts) || overlaps(requested.deletes, opposite.deletes)) {
+      throw new Error('ContentIds already resolved with the opposite disposition')
+    }
+
+    const actionable = {
+      inserts: diffIdSet(requested.inserts, receipt.inserts),
+      deletes: diffIdSet(requested.deletes, receipt.deletes)
+    }
+    if (actionable.inserts.isEmpty() && actionable.deletes.isEmpty()) return
+    if (!isSubset(actionable.inserts, this.inserts) || !isSubset(actionable.deletes, this.deletes)) {
+      throw new Error('ContentIds are unknown or outside this renderer')
+    }
+    if (this._prevDoc.store !== this._prevDocStore) throw new Error('Canonical base store mismatch')
+
+    const inserts = diffIdSet(actionable.inserts, actionable.deletes)
+    const deletes = diffIdSet(actionable.deletes, actionable.inserts)
+    assertStructCoverage(this._nextDoc.store, actionable.inserts, struct => struct.isItem ? isIntegratedItem(/** @type {Item} */ (struct), this._nextDoc) : disposition === 'reject', 'Missing or out-of-scope suggestion source')
+    assertStructCoverage(this._nextDoc.store, actionable.deletes, struct => struct.deleted && (!struct.isItem || isIntegratedItem(/** @type {Item} */ (struct), this._nextDoc)), 'Missing or out-of-scope suggestion deletion')
+    if (disposition === 'accept') {
+      assertStructCoverage(this._nextDoc.store, inserts, struct => isIntegratedItem(/** @type {Item} */ (struct), this._nextDoc) && !struct.deleted && !(/** @type {Item} */ (struct).content instanceof ContentDeleted), 'Missing suggested insertion payload')
+    }
+    assertStructCoverage(this._prevDocStore, deletes, struct => isIntegratedItem(/** @type {Item} */ (struct), this._prevDoc) && !struct.deleted && !(/** @type {Item} */ (struct).content instanceof ContentDeleted), 'Missing canonical deletion preimage')
+
+    const encoder = new UpdateEncoderV1()
+    let update
+    if (disposition === 'accept') {
+      writeStructsFromIdSet(encoder, this._nextDoc.store, actionable.inserts)
+      writeIdSet(encoder, actionable.deletes)
+      update = encoder.toUint8Array()
+    } else {
+      update = prepareRejectUpdate(this, actionable)
+    }
+
+    insertIntoIdSet(receipt.inserts, actionable.inserts)
+    insertIntoIdSet(receipt.deletes, actionable.deletes)
+    if (disposition === 'accept') {
+      applyUpdate(this._prevDoc, update, origin)
+    } else {
+      this._nextDoc.transact(tr => {
+        applyUpdate(this._nextDoc, update)
+        applyUpdate(this._prevDoc, update, origin)
+        // `applyUpdate` forces an enclosing transaction remote. This is still the local reject
+        // transaction; restoring the flag also prevents the scratch-generated ids from rotating
+        // the suggestion document's client id during cleanup.
+        tr.local = true
+      }, origin)
+    }
   }
 
   /**
