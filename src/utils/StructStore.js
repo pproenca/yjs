@@ -1,12 +1,21 @@
 import { Skip } from '../structs/Skip.js'
 import { CausalHole, sameCausalHoleMetadata } from '../structs/CausalHole.js'
 import { GC } from '../structs/GC.js'
-import { createID } from './ID.js'
+import { createID, ID } from './ID.js'
 import { createDeleteSetFromStructStore, createIdSet } from './ids.js'
 import { findIndexSS } from './transaction-helpers.js'
 
-/** @type {WeakMap<StructStore,number>} */
-const pendingRevisions = new WeakMap()
+/** @typedef {import('./BlockSet.js').BlockSet} BlockSet */
+/** @typedef {import('./ids.js').IdSet} IdSet */
+
+/**
+ * @typedef {{missing:Map<number,number>,update:Uint8Array<ArrayBuffer>,blocks?:BlockSet|null,deletes?:IdSet|null,sensitive?:IdSet|null}} PendingStructs
+ * @typedef {{update:Uint8Array<ArrayBuffer>,deletes?:IdSet|null}} PendingDeletes
+ * @typedef {{indexed:boolean,structs:PendingStructs|null,deletes:PendingDeletes|null,revision:number,batchDepth:number,batchBase:{structs:PendingStructs|null,deletes:PendingDeletes|null}|null}} PendingState
+ */
+
+/** @type {WeakMap<StructStore,PendingState>} */
+const pendingStates = new WeakMap()
 
 /** @param {Uint8Array} left @param {Uint8Array} right */
 const equalPendingBytes = (left, right) => {
@@ -19,8 +28,8 @@ const equalPendingBytes = (left, right) => {
 }
 
 /**
- * @param {{ missing: Map<number, number>, update: Uint8Array<ArrayBuffer> }} left
- * @param {{ missing: Map<number, number>, update: Uint8Array<ArrayBuffer> }} right
+ * @param {{ missing: Map<number, number>, update: Uint8Array }} left
+ * @param {{ missing: Map<number, number>, update: Uint8Array }} right
  */
 const equalPendingStructs = (left, right) => {
   if (left === right) return true
@@ -32,35 +41,147 @@ const equalPendingStructs = (left, right) => {
 }
 
 /** @param {StructStore} store */
-export const getPendingRevision = store => pendingRevisions.get(store) ?? 0
+const getPendingState = store => {
+  const state = pendingStates.get(store)
+  if (state === undefined) throw new Error('StructStore pending state is unavailable')
+  return state
+}
 
-/**
- * Commit pending structs produced by the update decoder. Direct field writes intentionally bypass
- * the revision so proof-cache snapshots can reject unsupported mutation.
- *
- * @param {StructStore} store
- * @param {null | { missing: Map<number, number>, update: Uint8Array<ArrayBuffer> }} pending
- */
-export const commitPendingStructs = (store, pending) => {
-  const current = store.pendingStructs
-  const changed = current === null || pending === null
-    ? current !== pending
-    : !equalPendingStructs(current, pending)
-  store.pendingStructs = pending
-  if (changed) pendingRevisions.set(store, getPendingRevision(store) + 1)
+/** @param {null|{missing:Map<number,number>,update:Uint8Array}} left @param {null|{missing:Map<number,number>,update:Uint8Array}} right */
+const equalPendingStructState = (left, right) => left === null || right === null
+  ? left === right
+  : equalPendingStructs(left, right)
+
+/** @param {null|{update:Uint8Array}} left @param {null|{update:Uint8Array}} right */
+const equalPendingDeleteState = (left, right) => left === null || right === null
+  ? left === right
+  : equalPendingBytes(left.update, right.update)
+
+/** @param {StructStore} store */
+export const getPendingRevision = store => getPendingState(store).revision
+
+/** @param {StructStore} store @returns {PendingStructs|null} */
+export const readPendingStructs = store => {
+  const state = getPendingState(store)
+  return state.indexed ? state.structs : /** @type {PendingStructs|null} */ (store.pendingStructs)
+}
+
+/** @param {StructStore} store @returns {PendingDeletes|null} */
+export const readPendingDs = store => {
+  const state = getPendingState(store)
+  if (state.indexed) return state.deletes
+  const pending = /** @type {Uint8Array<ArrayBuffer>|null} */ (store.pendingDs)
+  return pending === null ? null : { update: pending }
+}
+
+/** @param {Map<number,number>} missing @param {BlockSet} blocks @param {IdSet} deletes */
+const createPendingSensitivity = (missing, blocks, deletes) => {
+  const sensitive = createIdSet()
+  missing.forEach((clock, client) => sensitive.add(client, clock, 1))
+  blocks.clients.forEach(range => {
+    range.refs.forEach(struct => {
+      if (struct.constructor !== Skip) sensitive.add(struct.id.client, struct.id.clock, struct.length)
+      const anchors = 'origin' in struct
+        ? [struct.origin, struct.rightOrigin, struct.parent]
+        : []
+      for (const anchor of anchors) {
+        if (anchor instanceof ID) {
+          sensitive.add(anchor.client, anchor.clock, 1)
+        }
+      }
+    })
+  })
+  deletes.forEach((range, client) => sensitive.add(client, range.clock, range.len))
+  return sensitive
+}
+
+/** @param {StructStore} store @param {IdSet} inserts */
+export const pendingProofAffectedByInserts = (store, inserts) => {
+  const state = getPendingState(store)
+  const structSensitivity = state.structs?.sensitive ?? null
+  const deleteSensitivity = state.deletes?.deletes ?? null
+  for (const [client, ranges] of inserts.clients) {
+    for (const range of ranges.getIds()) {
+      if (
+        structSensitivity?.intersects(client, range.clock, range.len) ||
+        deleteSensitivity?.intersects(client, range.clock, range.len)
+      ) return true
+    }
+  }
+  return false
+}
+
+/** @param {StructStore} store */
+export const beginPendingTransaction = store => {
+  const state = getPendingState(store)
+  if (state.batchDepth++ === 0) {
+    state.batchBase = { structs: state.structs, deletes: state.deletes }
+  }
+}
+
+/** @param {StructStore} store */
+export const endPendingTransaction = store => {
+  const state = getPendingState(store)
+  if (state.batchDepth === 0) throw new Error('StructStore pending transaction is not open')
+  if (--state.batchDepth !== 0) return
+  const base = /** @type {NonNullable<PendingState['batchBase']>} */ (state.batchBase)
+  const structsEqual = equalPendingStructState(base.structs, state.structs)
+  const deletesEqual = equalPendingDeleteState(base.deletes, state.deletes)
+  if (structsEqual) state.structs = base.structs
+  if (deletesEqual) state.deletes = base.deletes
+  if (!structsEqual || !deletesEqual) state.revision++
+  state.batchBase = null
 }
 
 /**
  * @param {StructStore} store
- * @param {null | Uint8Array<ArrayBuffer>} pending
+ * @param {null|{missing:Map<number,number>,update:Uint8Array<ArrayBuffer>}} pending
+ * @param {(update:Uint8Array<ArrayBuffer>)=>{blocks:BlockSet,deletes:IdSet}} [index]
  */
-export const commitPendingDs = (store, pending) => {
-  const current = store.pendingDs
-  const changed = current === null || pending === null
-    ? current !== pending
-    : !equalPendingBytes(current, pending)
-  store.pendingDs = pending
-  if (changed) pendingRevisions.set(store, getPendingRevision(store) + 1)
+export const commitPendingStructs = (store, pending, index) => {
+  const state = getPendingState(store)
+  if (!state.indexed) {
+    store.pendingStructs = pending
+    return
+  }
+  if (equalPendingStructState(state.structs, pending)) return
+  if (pending === null) {
+    state.structs = null
+  } else {
+    if (index === undefined) throw new TypeError('Pending structs require a decoder index')
+    const update = pending.update.slice()
+    const indexed = index(update)
+    state.structs = {
+      missing: new Map(pending.missing),
+      update,
+      blocks: indexed.blocks,
+      deletes: indexed.deletes,
+      sensitive: createPendingSensitivity(pending.missing, indexed.blocks, indexed.deletes)
+    }
+  }
+  if (state.batchDepth === 0) state.revision++
+}
+
+/**
+ * @param {StructStore} store
+ * @param {null|{update:Uint8Array<ArrayBuffer>}} pending
+ * @param {(update:Uint8Array<ArrayBuffer>)=>IdSet} [index]
+ */
+export const commitPendingDs = (store, pending, index) => {
+  const state = getPendingState(store)
+  if (!state.indexed) {
+    store.pendingDs = pending?.update ?? null
+    return
+  }
+  if (equalPendingDeleteState(state.deletes, pending)) return
+  if (pending === null) {
+    state.deletes = null
+  } else {
+    if (index === undefined) throw new TypeError('Pending deletes require a decoder index')
+    const update = pending.update.slice()
+    state.deletes = { update, deletes: index(update) }
+  }
+  if (state.batchDepth === 0) state.revision++
 }
 
 /** @param {ID|string} parent @param {string|null} parentSub */
@@ -81,28 +202,46 @@ const sameSparseMetadataAt = (left, right, clock, end) => {
 }
 
 export class StructStore {
-  constructor () {
-    pendingRevisions.set(this, 0)
+  /** @param {boolean} [indexedPending] */
+  constructor (indexedPending = false) {
+    pendingStates.set(this, { indexed: indexedPending, structs: null, deletes: null, revision: 0, batchDepth: 0, batchBase: null })
     /**
      * Causal holes are an internal sparse extension hidden from the ordinary StructStore contract.
      * @type {Map<number,Array<GC|Item|Skip>>}
      */
     this.clients = new Map()
+    if (!indexedPending) {
+      Object.defineProperties(this, {
+        pendingStructs: { value: null, writable: true, enumerable: true, configurable: true },
+        pendingDs: { value: null, writable: true, enumerable: true, configurable: true }
+      })
+    }
     // this.ds = new IdSet()
-    /**
-     * @type {null | { missing: Map<number, number>, update: Uint8Array<ArrayBuffer> }}
-     */
-    this.pendingStructs = null
-    /**
-     * @type {null | Uint8Array<ArrayBuffer>}
-     */
-    this.pendingDs = null
     this.skips = createIdSet()
     this.causalHoles = createIdSet()
     /** @type {Map<string,Set<CausalHole>>} */
     this.causalHolesByParent = new Map()
     /** @type {Map<string,Set<CausalHole>>} */
     this.causalHolesByParentGroup = new Map()
+  }
+
+  /** @returns {{missing:Map<number,number>,update:Uint8Array<ArrayBuffer>}|null} */
+  get pendingStructs () {
+    const pending = readPendingStructs(this)
+    return pending === null ? null : { missing: new Map(pending.missing), update: pending.update.slice() }
+  }
+
+  set pendingStructs (pending) {
+    throw new TypeError('pendingStructs is read-only')
+  }
+
+  /** @returns {Uint8Array<ArrayBuffer>|null} */
+  get pendingDs () {
+    return readPendingDs(this)?.update.slice() ?? null
+  }
+
+  set pendingDs (pending) {
+    throw new TypeError('pendingDs is read-only')
   }
 
   get ds () {

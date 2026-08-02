@@ -108,20 +108,22 @@ export const writeBlockSet = (encoder, blocks) => {
   // Write items with higher client ids first
   // This heavily improves the conflict algorithm.
   array.from(blocks.clients.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, blockrange]) => {
-    writeStructs(encoder, blockrange.refs, client, [new IdRange(0, number.MAX_SAFE_INTEGER)])
+    writeStructs(encoder, blockrange.refs, client, [new IdRange(blockrange.startClock ?? 0, number.MAX_SAFE_INTEGER)])
   })
 }
 
 class BlockRange {
   /**
    * @param {Array<Item|GC|Skip|CausalHole>} refs
+   * @param {number|null} [startClock]
    */
-  constructor (refs) {
+  constructor (refs, startClock = null) {
     this.i = 0
     /**
      * @type {Array<Item | GC | Skip | CausalHole>}
      */
     this.refs = refs
+    this.startClock = startClock
   }
 }
 
@@ -131,6 +133,31 @@ export class BlockSet {
      * @type {Map<number, BlockRange>}
      */
     this.clients = map.create()
+  }
+
+  /**
+   * Select the suffix that diff-update encoding would emit for each client. The decoded structs are
+   * immutable here; Item.write applies the first partial-clock offset without slicing its content.
+   *
+   * @param {Map<number,number>} state
+   */
+  filterStateVector (state) {
+    const filtered = new BlockSet()
+    this.clients.forEach((range, client) => {
+      const refs = range.refs
+      const clock = state.get(client) ?? 0
+      let left = 0
+      let right = refs.length
+      while (left < right) {
+        const middle = (left + right) >>> 1
+        const struct = refs[middle]
+        if (struct.id.clock + struct.length <= clock) left = middle + 1
+        else right = middle
+      }
+      while (left < refs.length && refs[left].constructor === Skip) left++
+      if (left < refs.length) filtered.clients.set(client, new BlockRange(refs.slice(left), math.max(clock, refs[left].id.clock)))
+    })
+    return filtered
   }
 
   toIdSet () {
@@ -205,6 +232,12 @@ export class BlockSet {
       if (ranges == null) {
         this.clients.set(clientid, newranges)
       } else {
+        if (ranges.startClock !== null || newranges.startClock !== null) {
+          ranges.startClock = math.min(
+            ranges.startClock ?? ranges.refs[0].id.clock,
+            newranges.startClock ?? newranges.refs[0].id.clock
+          )
+        }
         if (
           ranges.refs.some(block => block.constructor === CausalHole) ||
           newranges.refs.some(block => block.constructor === CausalHole)

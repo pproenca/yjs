@@ -11,6 +11,7 @@ import { UpdateEncoderV1 } from './UpdateEncoder.js'
 import { transact } from './Transaction.js'
 import { UndoManager, StackItem } from './UndoManager.js'
 import { Doc } from './Doc.js'
+import { readPendingDs, readPendingStructs } from './StructStore.js'
 
 import { $renderer, AttributedContent, cloneRendererContentAttribute, cloneRendererIdMap, cloneRendererIdSet, destroyRendererLifecycle, initializeRendererLifecycle, invalidateRendererLifecycle } from './renderer-helpers.js'
 
@@ -629,8 +630,8 @@ export class DiffRenderer extends ObservableV2 {
     }
     if (projection.prevDoc.store !== projection.prevDocStore) throw new Error('Canonical base store mismatch')
     if (
-      projection.prevDoc.store.pendingStructs !== null || projection.prevDoc.store.pendingDs !== null ||
-      projection.nextDoc.store.pendingStructs !== null || projection.nextDoc.store.pendingDs !== null
+      readPendingStructs(projection.prevDoc.store) !== null || readPendingDs(projection.prevDoc.store) !== null ||
+      readPendingStructs(projection.nextDoc.store) !== null || readPendingDs(projection.nextDoc.store) !== null
     ) {
       throw new Error('Diff resolution requires complete document stores')
     }
@@ -656,8 +657,8 @@ export class DiffRenderer extends ObservableV2 {
 
     const recordReceipt = () => {
       if (
-        projection.prevDoc.store.pendingStructs !== null || projection.prevDoc.store.pendingDs !== null ||
-        projection.nextDoc.store.pendingStructs !== null || projection.nextDoc.store.pendingDs !== null
+        readPendingStructs(projection.prevDoc.store) !== null || readPendingDs(projection.prevDoc.store) !== null ||
+        readPendingStructs(projection.nextDoc.store) !== null || readPendingDs(projection.nextDoc.store) !== null
       ) {
         throw new Error('Diff resolution produced incomplete document stores')
       }

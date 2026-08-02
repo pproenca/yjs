@@ -1,5 +1,6 @@
 import * as t from 'lib0/testing'
 import * as encoding from 'lib0/encoding'
+import * as decoding from 'lib0/decoding'
 
 import {
   contentRefs,
@@ -17,9 +18,11 @@ import {
 import * as Y from '../src/index.js'
 import { CausalHole, sameCausalHoleMetadata } from '../src/structs/CausalHole.js'
 import { normalizeDocOptions } from '../src/utils/Doc.js'
-import { getPendingRevision } from '../src/utils/StructStore.js'
+import { readBlockSet, writeBlockSet } from '../src/utils/BlockSet.js'
+import { commitPendingDs, commitPendingStructs, getPendingRevision, readPendingStructs } from '../src/utils/StructStore.js'
 import { _testOnlyGetSparsePendingProofRuns, writeStateAsUpdate } from '../src/utils/encoding.js'
 import { writeStructsFromIdSetWithCausalHoles } from '../src/utils/encoding-helpers.js'
+import { UpdateDecoderV1, UpdateDecoderV2 } from '../src/utils/UpdateDecoder.js'
 
 /**
  * @param {Array<Y.GC|Y.Item|Y.Skip|CausalHole>} structs
@@ -99,6 +102,60 @@ const encodeDeleteSet = (deleteSet, Encoder) => {
   encoding.writeVarUint(encoder.restEncoder, 0)
   Y.writeIdSet(encoder, deleteSet)
   return encoder.toUint8Array()
+}
+
+/** @param {Uint8Array<ArrayBuffer>} update */
+const decodePendingIndex = update => {
+  const decoder = new UpdateDecoderV2(decoding.createDecoder(update))
+  return { blocks: readBlockSet(decoder), deletes: Y.readIdSet(decoder) }
+}
+
+/** @param {Y.Doc} doc @param {Map<number,number>} missing @param {Uint8Array<ArrayBuffer>} update @param {Uint8Array<ArrayBuffer>} [indexedUpdate] */
+const commitPendingUpdate = (doc, missing, update, indexedUpdate = update) => {
+  commitPendingStructs(doc.store, { missing, update }, ownedUpdate => decodePendingIndex(indexedUpdate === update ? ownedUpdate : indexedUpdate))
+}
+
+/** @param {Y.Doc} doc @param {Uint8Array<ArrayBuffer>} update */
+const commitPendingDelete = (doc, update) => {
+  commitPendingDs(doc.store, { update }, ownedUpdate => decodePendingIndex(ownedUpdate).deletes)
+}
+
+/** @param {Map<number,number>} state */
+const encodeStateVectorMap = state => {
+  const encoder = encoding.createEncoder()
+  encoding.writeVarUint(encoder, state.size)
+  state.forEach((clock, client) => {
+    encoding.writeVarUint(encoder, client)
+    encoding.writeVarUint(encoder, clock)
+  })
+  return encoding.toUint8Array(encoder)
+}
+
+/** @param {Y.Doc} doc @param {Uint8Array<ArrayBuffer>} stateVector @param {typeof Y.UpdateEncoderV1|typeof Y.UpdateEncoderV2} Encoder */
+const encodeSparseStateLegacy = (doc, stateVector, Encoder) => {
+  const state = Y.decodeStateVector(stateVector)
+  const stateEncoder = new Encoder()
+  writeStateAsUpdate(stateEncoder, doc, state)
+  const Decoder = Encoder === Y.UpdateEncoderV1 ? UpdateDecoderV1 : UpdateDecoderV2
+  const stateDecoder = new Decoder(decoding.createDecoder(stateEncoder.toUint8Array()))
+  const blocks = readBlockSet(stateDecoder)
+  const deletes = [Y.readIdSet(stateDecoder)]
+  const pending = readPendingStructs(doc.store)
+  if (pending !== null) {
+    const pendingDecoder = new UpdateDecoderV2(decoding.createDecoder(Y.diffUpdateV2(pending.update, stateVector)))
+    blocks.insertInto(readBlockSet(pendingDecoder))
+    deletes.push(Y.readIdSet(pendingDecoder))
+  }
+  const pendingDeletes = doc.store.pendingDs
+  if (pendingDeletes !== null) {
+    const pendingDeleteDecoder = new UpdateDecoderV2(decoding.createDecoder(pendingDeletes))
+    readBlockSet(pendingDeleteDecoder)
+    deletes.push(Y.readIdSet(pendingDeleteDecoder))
+  }
+  const result = new Encoder()
+  writeBlockSet(result, blocks)
+  Y.writeIdSet(result, Y.mergeIdSets(deletes))
+  return result.toUint8Array()
 }
 
 const createCausalHoleBase = () => {
@@ -345,29 +402,22 @@ export const testSparsePendingStateSerializesWithDocumentContext = () => {
 export const testSparsePendingStateRejectsInvalidInternalTransport = () => {
   ;[Y.encodeStateAsUpdate, Y.encodeStateAsUpdateV2].forEach(encode => {
     const withGc = createCausalHoleBase()
-    withGc.store.pendingStructs = {
-      missing: new Map(),
-      update: encodeStructs([new Y.GC(Y.createID(7, 0), 1)], Y.UpdateEncoderV2)
-    }
+    const gcUpdate = encodeStructs([new Y.GC(Y.createID(7, 0), 1)], Y.UpdateEncoderV2)
+    commitPendingUpdate(withGc, new Map(), gcUpdate)
     t.fails(() => encode(withGc))
 
     const withUnsupportedRef = createCausalHoleBase()
-    withUnsupportedRef.store.pendingStructs = {
-      missing: new Map(),
-      update: encodeUnsupportedSparseRef(12, Y.UpdateEncoderV2)
-    }
+    commitPendingUpdate(withUnsupportedRef, new Map(), encodeUnsupportedSparseRef(12, Y.UpdateEncoderV2), Y.encodeStateAsUpdateV2(new Y.Doc()))
     t.fails(() => encode(withUnsupportedRef))
 
     const withConflict = createCausalHoleBase()
     Y.applyUpdateV2(withConflict, encodeCausalHoles([
       new CausalHole(Y.createID(2, 0), 1, Y.createID(1, 0), null, 'text', null)
     ], Y.UpdateEncoderV2))
-    withConflict.store.pendingStructs = {
-      missing: new Map(),
-      update: encodeCausalHoles([
-        new CausalHole(Y.createID(2, 0), 1, null, null, 'other', null)
-      ], Y.UpdateEncoderV2)
-    }
+    const conflict = encodeCausalHoles([
+      new CausalHole(Y.createID(2, 0), 1, null, null, 'other', null)
+    ], Y.UpdateEncoderV2)
+    commitPendingUpdate(withConflict, new Map(), conflict)
     t.fails(() => encode(withConflict))
   })
 }
@@ -400,17 +450,21 @@ export const testSparsePendingStateRejectsForgedMissingPairsBeforeFiltering = ()
         Y.applyUpdateV2(doc, encodeCausalHoles([
           new CausalHole(Y.createID(2, 0), 1, Y.createID(1, 0), null, 'text', null)
         ], Y.UpdateEncoderV2))
-        doc.store.pendingStructs = {
-          missing: new Map([[99, 0]]),
-          update: pendingItem
-        }
-        if (withPendingDelete) doc.store.pendingDs = pendingDelete
+        commitPendingUpdate(doc, new Map([[99, 0]]), pendingItem)
+        if (withPendingDelete) commitPendingDelete(doc, pendingDelete)
         const hole = doc.store.getCausalHole(Y.createID(2, 0))
         const pendingStructs = doc.store.pendingStructs
         const pendingDs = doc.store.pendingDs
         t.fails(() => encode(doc, stateVector))
         t.assert(doc.store.getCausalHole(Y.createID(2, 0)) === hole)
-        t.assert(doc.store.pendingStructs === pendingStructs && doc.store.pendingDs === pendingDs)
+        const pendingStructsAfter = doc.store.pendingStructs
+        const pendingDsAfter = doc.store.pendingDs
+        t.assert(
+          pendingStructs !== null && pendingStructsAfter !== null &&
+          pendingStructs.missing.size === pendingStructsAfter.missing.size &&
+          pendingStructs.update.every((value, index) => pendingStructsAfter.update[index] === value) &&
+          (pendingDs === null ? pendingDsAfter === null : pendingDsAfter !== null && pendingDs.every((value, index) => pendingDsAfter[index] === value))
+        )
         t.assert(doc.get('text').toString() === 'a')
       })
     })
@@ -465,6 +519,165 @@ export const testSparseCombinedPendingStateRoundtrips = () => {
   })
 }
 
+export const testIndexedPendingFilterPreservesSameClientPrefixes = () => {
+  ;[
+    { event: 'update', apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate },
+    { event: 'updateV2', apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2 }
+  ].forEach(({ event, apply, encode }) => {
+    const source = new Y.Doc({ gc: false })
+    source.clientID = 2
+    /** @type {Array<Uint8Array<ArrayBuffer>>} */
+    const updates = []
+    source.on(/** @type {'update'} */ (event), update => updates.push(update))
+    source.get('text').insert(0, 'a')
+    source.get('text').insert(1, 'b')
+    source.get('text').insert(2, 'c')
+
+    const doc = new Y.Doc({ gc: false, sparseExactResolution: true })
+    apply(doc, updates[0])
+    apply(doc, updates[2])
+    t.assert(doc.get('text').toString() === 'a' && doc.store.pendingStructs !== null)
+
+    const reload = new Y.Doc({ gc: false, sparseExactResolution: true })
+    apply(reload, encode(doc))
+    t.assert(reload.get('text').toString() === 'a' && reload.store.pendingStructs !== null)
+
+    const known = new Y.Doc({ gc: false, sparseExactResolution: true })
+    apply(known, updates[0])
+    apply(known, encode(doc, Y.encodeStateVector(known)))
+    t.assert(known.get('text').toString() === 'a' && known.store.pendingStructs !== null)
+  })
+}
+
+export const testOrdinaryPendingFieldsKeepUpstreamDescriptors = () => {
+  const store = new Y.Doc().store
+  const pendingStructs = { missing: new Map([[1, 0]]), update: new Uint8Array([0, 0]) }
+  const pendingDs = new Uint8Array([0, 0])
+  const structsDescriptor = Object.getOwnPropertyDescriptor(store, 'pendingStructs')
+  const deletesDescriptor = Object.getOwnPropertyDescriptor(store, 'pendingDs')
+
+  t.assert(
+    structsDescriptor?.value === null && structsDescriptor.writable && structsDescriptor.enumerable && structsDescriptor.configurable &&
+    deletesDescriptor?.value === null && deletesDescriptor.writable && deletesDescriptor.enumerable && deletesDescriptor.configurable
+  )
+  store.pendingStructs = pendingStructs
+  store.pendingDs = pendingDs
+  t.assert(store.pendingStructs === pendingStructs && store.pendingDs === pendingDs)
+  t.compareArrays(Object.keys(store).slice(0, 3), ['clients', 'pendingStructs', 'pendingDs'])
+
+  const sparseStore = new Y.Doc({ gc: false, sparseExactResolution: true }).store
+  t.assert(
+    !Object.prototype.hasOwnProperty.call(sparseStore, 'pendingStructs') &&
+    !Object.prototype.hasOwnProperty.call(sparseStore, 'pendingDs')
+  )
+  t.fails(() => { sparseStore.pendingStructs = pendingStructs })
+  t.fails(() => { sparseStore.pendingDs = pendingDs })
+}
+
+export const testIndexedPendingFilterMatchesLegacySparseEncoding = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, event: 'update', apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate },
+    { Encoder: Y.UpdateEncoderV2, event: 'updateV2', apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2 }
+  ].forEach(({ Encoder, event, apply, encode }) => {
+    const doc = new Y.Doc({ gc: false, sparseExactResolution: true })
+    ;[40, 41].forEach(client => {
+      const source = new Y.Doc({ gc: false })
+      source.clientID = client
+      /** @type {Array<Uint8Array<ArrayBuffer>>} */
+      const updates = []
+      source.on(/** @type {'update'} */ (event), update => updates.push(update))
+      source.get(`client-${client}`).insert(0, 'abcd')
+      source.get(`client-${client}`).insert(4, 'efgh')
+      source.get(`client-${client}`).insert(8, 'ijkl')
+      apply(doc, updates[0])
+      apply(doc, updates[2])
+    })
+    apply(doc, encodeCausalHoles([
+      new CausalHole(Y.createID(42, 0), 2, null, null, 'holes', null)
+    ], Encoder))
+    const pendingDelete = Y.createIdSet()
+    pendingDelete.add(99, 0, 2)
+    apply(doc, encodeDeleteSet(pendingDelete, Encoder))
+
+    ;[
+      new Map(),
+      new Map([[40, 2], [41, 6], [42, 1]]),
+      new Map([[40, 10], [41, 9], [42, 2]]),
+      new Map([[40, 99], [41, 99], [42, 99]])
+    ].forEach(state => {
+      const stateVector = encodeStateVectorMap(state)
+      t.compareArrays(Array.from(encode(doc, stateVector)), Array.from(encodeSparseStateLegacy(doc, stateVector, Encoder)))
+    })
+  })
+
+  const leadingSkip = encodeStructs([
+    new Y.Skip(Y.createID(50, 0), 2),
+    new Y.Item(Y.createID(50, 2), null, null, null, null, 'text', null, new Y.ContentString('abcdef'))
+  ], Y.UpdateEncoderV2)
+  const indexed = decodePendingIndex(leadingSkip)
+  ;[0, 1, 2, 3, 7, 99].forEach(clock => {
+    const stateVector = encodeStateVectorMap(new Map([[50, clock]]))
+    const encoder = new Y.UpdateEncoderV2()
+    writeBlockSet(encoder, indexed.blocks.filterStateVector(Y.decodeStateVector(stateVector)))
+    Y.writeIdSet(encoder, indexed.deletes)
+    t.compareArrays(Array.from(encoder.toUint8Array()), Array.from(Y.diffUpdateV2(leadingSkip, stateVector)))
+  })
+}
+
+export const testSparseSkipAndIndexedPendingScalingInvariants = () => {
+  ;[2_000_000, 16_000_000].forEach(size => {
+    const doc = new Y.Doc({ gc: false, sparseExactResolution: true })
+    doc.clientID = 60
+    doc.get('large').insert(0, 'a'.repeat(size))
+
+    const source = new Y.Doc({ gc: false })
+    source.clientID = 61
+    /** @type {Array<Uint8Array<ArrayBuffer>>} */
+    const updates = []
+    source.on('update', update => updates.push(update))
+    source.get('pending').insert(0, 'a')
+    source.get('pending').insert(1, 'b')
+    Y.applyUpdate(doc, updates[1])
+
+    const skip = encodeStructs([new Y.Skip(Y.createID(62, 0), 1)], Y.UpdateEncoderV1)
+    t.assert(skip.byteLength === 7)
+    Y.applyUpdate(doc, skip)
+    const stateVector = encodeStateVectorMap(new Map([[60, size], [61, 2], [62, 1]]))
+    t.assert(Y.encodeStateAsUpdate(doc, stateVector).byteLength < 256)
+    const revision = getPendingRevision(doc.store)
+    const proofRuns = _testOnlyGetSparsePendingProofRuns(doc)
+    const pending = readPendingStructs(doc.store)
+    const blocks = pending?.blocks
+    for (let index = 0; index < 50; index++) Y.applyUpdate(doc, skip)
+    t.assert(getPendingRevision(doc.store) === revision)
+    t.assert(Y.encodeStateAsUpdate(doc, stateVector).byteLength < 256)
+    t.assert(Y.encodeStateAsUpdateV2(doc, stateVector).byteLength < 256)
+    t.assert(_testOnlyGetSparsePendingProofRuns(doc) === proofRuns)
+    t.assert(readPendingStructs(doc.store)?.blocks === blocks)
+  })
+
+  ;[8_000_000, 16_000_000].forEach(size => {
+    const source = new Y.Doc({ gc: false })
+    source.clientID = 63
+    /** @type {Array<Uint8Array<ArrayBuffer>>} */
+    const updates = []
+    source.on('update', update => updates.push(update))
+    source.get('pending').insert(0, 'a')
+    source.get('pending').insert(1, 'x'.repeat(size))
+    const doc = new Y.Doc({ gc: false, sparseExactResolution: true })
+    Y.applyUpdate(doc, updates[1])
+    Y.encodeStateAsUpdate(doc, encodeStateVectorMap(new Map([[63, size + 1]])))
+    const pending = readPendingStructs(doc.store)
+    const revision = getPendingRevision(doc.store)
+    const proofRuns = _testOnlyGetSparsePendingProofRuns(doc)
+    ;[size - 2, size - 1, size, size + 1].forEach(clock => {
+      Y.encodeStateAsUpdateV2(doc, encodeStateVectorMap(new Map([[63, clock]])))
+      t.assert(readPendingStructs(doc.store)?.blocks === pending?.blocks)
+    })
+    t.assert(getPendingRevision(doc.store) === revision && _testOnlyGetSparsePendingProofRuns(doc) === proofRuns)
+  })
+}
+
 export const testSparsePendingProofCacheTracksTransactionsAndDefensiveSnapshots = () => {
   const doc = new Y.Doc({ gc: false, sparseExactResolution: true })
   doc.clientID = 21
@@ -501,21 +714,12 @@ export const testSparsePendingProofCacheTracksTransactionsAndDefensiveSnapshots 
   t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 1)
 
   const pending = /** @type {NonNullable<typeof doc.store.pendingStructs>} */ (doc.store.pendingStructs)
-  const originalByte = pending.update[pending.update.byteLength - 1]
   pending.update[pending.update.byteLength - 1] ^= 1
-  t.fails(() => Y.encodeStateAsUpdate(doc, currentState))
-  pending.update[pending.update.byteLength - 1] = originalByte
   pending.missing.set(999, 0)
-  t.fails(() => Y.encodeStateAsUpdateV2(doc, currentState))
-  pending.missing.delete(999)
-  const replacedMissing = new Map(pending.missing)
-  replacedMissing.set(999, 0)
-  doc.store.pendingStructs = {
-    missing: replacedMissing,
-    update: pending.update.slice()
-  }
-  t.fails(() => Y.encodeStateAsUpdate(doc, currentState))
-  doc.store.pendingStructs = pending
+  t.assert(Y.encodeStateAsUpdate(doc, currentState).byteLength < 256)
+  t.assert(Y.encodeStateAsUpdateV2(doc, currentState).byteLength < 256)
+  t.fails(() => { doc.store.pendingStructs = pending })
+  t.fails(() => { doc.store.pendingStructs = null })
   t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 1)
 
   const deletes = Y.createIdSet()
@@ -525,28 +729,78 @@ export const testSparsePendingProofCacheTracksTransactionsAndDefensiveSnapshots 
   Y.encodeStateAsUpdate(doc, currentState)
   t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 2)
   const pendingDelete = /** @type {Uint8Array<ArrayBuffer>} */ (doc.store.pendingDs)
-  const deleteByte = pendingDelete[pendingDelete.byteLength - 1]
   pendingDelete[pendingDelete.byteLength - 1] ^= 1
-  t.fails(() => Y.encodeStateAsUpdateV2(doc, currentState))
-  pendingDelete[pendingDelete.byteLength - 1] = deleteByte
+  Y.encodeStateAsUpdateV2(doc, currentState)
+  t.fails(() => { doc.store.pendingDs = pendingDelete })
+  t.fails(() => { doc.store.pendingDs = null })
+  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 2)
 
   doc.get('unrelated').insert(0, 'z')
   Y.encodeStateAsUpdateV2(doc, currentState)
-  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 3)
+  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 2)
 
   doc.transact(() => {
     Y.encodeStateAsUpdate(doc, currentState)
     Y.encodeStateAsUpdateV2(doc, currentState)
   })
-  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 5)
+  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 4)
   Y.encodeStateAsUpdate(doc, currentState)
-  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 5)
+  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 4)
 
   doc.clientID = 22
   Y.applyUpdate(doc, sourceUpdates[0])
   t.assert(doc.store.pendingStructs === null && doc.get('pending').toString() === 'ab')
   Y.encodeStateAsUpdateV2(doc, currentState)
-  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 6)
+  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 5)
+}
+
+export const testSparsePendingProofInvalidatesOnlyForDependencies = () => {
+  const source = new Y.Doc({ gc: false })
+  source.clientID = 70
+  /** @type {Array<Uint8Array<ArrayBuffer>>} */
+  const updates = []
+  source.on('updateV2', update => updates.push(update))
+  source.get('text').insert(0, 'abcd')
+  source.get('text').insert(4, 'e')
+
+  const doc = new Y.Doc({ gc: false, sparseExactResolution: true })
+  Y.applyUpdateV2(doc, updates[1])
+  Y.encodeStateAsUpdateV2(doc)
+  t.assert(doc.store.pendingStructs !== null && _testOnlyGetSparsePendingProofRuns(doc) === 1)
+  const revision = getPendingRevision(doc.store)
+
+  const unrelated = new Y.Doc({ gc: false })
+  unrelated.clientID = 71
+  unrelated.get('other').insert(0, 'x')
+  Y.applyUpdateV2(doc, Y.encodeStateAsUpdateV2(unrelated))
+  Y.encodeStateAsUpdateV2(doc)
+  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 1)
+
+  Y.applyUpdateV2(doc, updates[0])
+  Y.encodeStateAsUpdateV2(doc)
+  t.assert(doc.store.pendingStructs === null && doc.get('text').toString() === 'abcde')
+  t.assert(getPendingRevision(doc.store) > revision && _testOnlyGetSparsePendingProofRuns(doc) === 1)
+
+  const deleteSource = new Y.Doc({ gc: false })
+  deleteSource.clientID = 72
+  /** @type {Array<Uint8Array<ArrayBuffer>>} */
+  const deleteUpdates = []
+  deleteSource.on('updateV2', update => deleteUpdates.push(update))
+  deleteSource.get('text').insert(0, 'a')
+  deleteSource.get('text').delete(0, 1)
+
+  const deleteDoc = new Y.Doc({ gc: false, sparseExactResolution: true })
+  Y.applyUpdateV2(deleteDoc, deleteUpdates[1])
+  Y.encodeStateAsUpdateV2(deleteDoc)
+  t.assert(deleteDoc.store.pendingDs !== null && _testOnlyGetSparsePendingProofRuns(deleteDoc) === 1)
+  const deleteRevision = getPendingRevision(deleteDoc.store)
+  Y.applyUpdateV2(deleteDoc, Y.encodeStateAsUpdateV2(unrelated))
+  Y.encodeStateAsUpdateV2(deleteDoc)
+  t.assert(_testOnlyGetSparsePendingProofRuns(deleteDoc) === 1)
+  Y.applyUpdateV2(deleteDoc, deleteUpdates[0])
+  Y.encodeStateAsUpdateV2(deleteDoc)
+  t.assert(deleteDoc.store.pendingDs === null && deleteDoc.get('text').toString() === '')
+  t.assert(getPendingRevision(deleteDoc.store) > deleteRevision && _testOnlyGetSparsePendingProofRuns(deleteDoc) === 1)
 }
 
 export const testLargePendingTransportIgnoresEmptyTransactions = () => {

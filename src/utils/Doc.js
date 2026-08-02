@@ -8,7 +8,7 @@ import * as map from 'lib0/map'
 import * as array from 'lib0/array'
 import * as promise from 'lib0/promise'
 
-import { getPendingRevision, StructStore } from './StructStore.js'
+import { beginPendingTransaction, endPendingTransaction, getPendingRevision, pendingProofAffectedByInserts, StructStore } from './StructStore.js'
 import { transact, generateNewClientId } from './Transaction.js'
 import { hasSparseTransport } from './sparse-transport.js'
 import { YType } from '../ytype.js'
@@ -123,7 +123,7 @@ export class Doc extends ObservableV2 {
      * @type {Map<string, YType>}
      */
     this.share = new Map()
-    this.store = new StructStore()
+    this.store = new StructStore(sparseExactResolution)
     /**
      * @type {Transaction | null}
      */
@@ -148,13 +148,15 @@ export class Doc extends ObservableV2 {
       const transactionGeneration = { generation: 0, pendingTransactions: 0, destroyed: false, pendingBefore: new WeakMap() }
       transactionGenerations.set(this, transactionGeneration)
       this.on('beforeTransaction', transaction => {
+        beginPendingTransaction(this.store)
         transactionGeneration.pendingTransactions++
         transactionGeneration.pendingBefore.set(transaction, getPendingRevision(this.store))
       })
       this.on('beforeObserverCalls', transaction => {
+        endPendingTransaction(this.store)
         const pendingBefore = transactionGeneration.pendingBefore.get(transaction)
         if (
-          transaction.insertSet.clients.size > 0 ||
+          pendingProofAffectedByInserts(this.store, transaction.insertSet) ||
           transaction.deleteSet.clients.size > 0 ||
           hasSparseTransport(transaction) ||
           pendingBefore === undefined ||
