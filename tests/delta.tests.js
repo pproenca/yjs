@@ -2,6 +2,8 @@ import * as Y from '../src/index.js'
 import * as delta from 'lib0/delta'
 import * as t from 'lib0/testing'
 import * as s from 'lib0/schema'
+import { ContentType, Item } from '../src/structs/Item.js'
+import { cloneRendererContentAttribute } from '../src/utils/renderer-helpers.js'
 
 /**
  * Delta is a versatile format enabling you to efficiently describe changes. It is part of lib0, so
@@ -244,6 +246,35 @@ const appendUnsupportedChild = mutation => {
   children.len++
   mutation.childCnt++
   return mutation
+}
+
+/** @param {() => any} run */
+const withPoisonedDeltaDispatch = run => {
+  const listPrototype = Object.getPrototypeOf(delta.create().children)
+  const targets = [
+    [listPrototype, Symbol.iterator],
+    ...[delta.$deltaAny, delta.$textOp, delta.$insertOp, delta.$retainOp, delta.$deleteOp, delta.$modifyOp, delta.$setAttrOp, delta.$deleteAttrOp, delta.$modifyAttrOp].map(schema => [schema, 'check']),
+    ...['insert', 'delete', 'retain', 'modify', 'setAttr', 'deleteAttr', 'modifyAttr', 'useFormats', 'useAttribution', 'done', 'isEmpty'].map(key => [delta.DeltaBuilder.prototype, key])
+  ]
+  const descriptors = targets.map(([target, key]) => Object.getOwnPropertyDescriptor(target, key))
+  try {
+    for (let index = 0; index < targets.length; index++) {
+      const [target, key] = targets[index]
+      Object.defineProperty(target, key, {
+        configurable: true,
+        value: () => { throw new Error('mutable lib0 delta dispatch') },
+        writable: true
+      })
+    }
+    return run()
+  } finally {
+    for (let index = targets.length - 1; index >= 0; index--) {
+      const [target, key] = targets[index]
+      const descriptor = descriptors[index]
+      if (descriptor === undefined) Reflect.deleteProperty(target, key)
+      else Object.defineProperty(target, key, descriptor)
+    }
+  }
 }
 
 export const testReservedDeltaMutationAtomicCapture = () => {
@@ -639,6 +670,289 @@ export const testReservedDeltaMutationAvoidsMutableCanonicalDispatch = () => {
   t.assert(fromCalls === 0 && child.doc === nestedDoc && child.toString() === '<p>child</p>')
 }
 
+const createRenderedDeletedPair = () => {
+  const base = new Y.Doc({ gc: false })
+  base.clientID = 1
+  const suggestion = new Y.Doc({ isSuggestionDoc: true, gc: false })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion, { attrs: new Y.Attributions() })
+  base.get('content').applyDelta(delta.create().insert([
+    delta.create('first').insert('first'),
+    delta.create('second').insert('second')
+  ]).done())
+  const type = suggestion.get('content')
+  type.useRenderer(renderer)
+  const first = /** @type {Y.Type} */ (type.get(0))
+  const second = /** @type {Y.Type} */ (type.get(1))
+  type.applyDelta(delta.create().delete(1).done())
+  return { suggestion, renderer, type, first, second }
+}
+
+export const testReservedDeltaMutationSealsRendererExecution = () => {
+  {
+    const { renderer, type, first, second } = createRenderedDeletedPair()
+    const prepared = type.reserveDeltaMutation(delta.create().modify(delta.create().insert('target:')).done(), null, { renderer })
+    let publicCalls = 0
+    Object.defineProperties(renderer, {
+      hasItem: {
+        configurable: true,
+        value: () => {
+          publicCalls++
+          return false
+        }
+      },
+      contentLength: {
+        configurable: true,
+        value: () => {
+          publicCalls++
+          throw new Error('public renderer contentLength')
+        }
+      },
+      readContent: {
+        configurable: true,
+        value: () => {
+          publicCalls++
+          throw new Error('public renderer readContent')
+        }
+      }
+    })
+    let failure = null
+    try {
+      prepared.apply()
+    } catch (error) {
+      failure = error
+    } finally {
+      Reflect.deleteProperty(renderer, 'hasItem')
+      Reflect.deleteProperty(renderer, 'contentLength')
+      Reflect.deleteProperty(renderer, 'readContent')
+    }
+    t.assert(failure === null && publicCalls === 0, 'reserved execution never calls public renderer properties')
+    t.assert(first.toString() === '<first />', 'rendered tombstone is handled as a fix-only target')
+    t.assert(second.toString() === '<second>second</second>', 'live decoy is not retargeted')
+  }
+
+  {
+    const { renderer, type } = createRenderedDeletedPair()
+    const prepared = type.reserveDeltaMutation(delta.create().insert('prefix').delete(1).done(), null, { renderer })
+    const hasItem = renderer.hasItem.bind(renderer)
+    const contentLength = renderer.contentLength.bind(renderer)
+    let publicCalls = 0
+    Object.defineProperties(renderer, {
+      hasItem: {
+        configurable: true,
+        value: (/** @type {Item} */ item) => {
+          publicCalls++
+          return hasItem(item)
+        }
+      },
+      contentLength: {
+        configurable: true,
+        value: (/** @type {Item} */ item) => {
+          publicCalls++
+          return contentLength(item)
+        }
+      },
+      readContent: {
+        configurable: true,
+        value: () => {
+          publicCalls++
+          throw new Error('public renderer readContent after prefix insert')
+        }
+      }
+    })
+    const mapDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'map')
+    const spliceDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, 'splice')
+    let mapCalls = 0
+    let spliceCalls = 0
+    /**
+     * @this {any}
+     * @param {...any} args
+     */
+    const guardedMap = function (...args) {
+      if (args[0] === cloneRendererContentAttribute) {
+        mapCalls++
+        throw new Error('mutable renderer attrs map after reserve')
+      }
+      return Reflect.apply(/** @type {Function} */ (mapDescriptor?.value), this, args)
+    }
+    /**
+     * @this {any}
+     * @param {...any} args
+     */
+    const guardedSplice = function (...args) {
+      const inserted = args[2]
+      if (args[1] === 0 && inserted != null && typeof inserted === 'object' && 'clock' in inserted && 'len' in inserted && 'attrs' in inserted) {
+        spliceCalls++
+        throw new Error('mutable renderer slice splice after reserve')
+      }
+      return Reflect.apply(/** @type {Function} */ (spliceDescriptor?.value), this, args)
+    }
+    /** @type {any} */
+    let failure = null
+    try {
+      // eslint-disable-next-line no-extend-native
+      Object.defineProperties(Array.prototype, {
+        map: {
+          configurable: true,
+          value: guardedMap
+        },
+        splice: {
+          configurable: true,
+          value: guardedSplice
+        }
+      })
+      prepared.apply()
+    } catch (error) {
+      failure = error
+    } finally {
+      // eslint-disable-next-line no-extend-native
+      Object.defineProperty(Array.prototype, 'map', /** @type {PropertyDescriptor} */ (mapDescriptor))
+      // eslint-disable-next-line no-extend-native
+      Object.defineProperty(Array.prototype, 'splice', /** @type {PropertyDescriptor} */ (spliceDescriptor))
+      Reflect.deleteProperty(renderer, 'hasItem')
+      Reflect.deleteProperty(renderer, 'contentLength')
+      Reflect.deleteProperty(renderer, 'readContent')
+    }
+    t.assert(failure === null && publicCalls === 0 && mapCalls === 0 && spliceCalls === 0, `renderer mutation cannot fail after a partial insert: ${failure?.message ?? 'no failure'}, public=${publicCalls}, map=${mapCalls}, splice=${spliceCalls}`)
+    t.assert(/** @type {any} */ (type.toDelta({ renderer, deep: true }).toJSON()).children[0].insert === 'prefix')
+  }
+}
+
+export const testReservedDeltaMutationUsesCanonicalNestedIntegration = () => {
+  const typeDescriptor = Object.getOwnPropertyDescriptor(ContentType.prototype, 'type')
+  const contentIntegrateDescriptor = Object.getOwnPropertyDescriptor(ContentType.prototype, 'integrate')
+  const decoyDoc = new Y.Doc()
+  const decoy = decoyDoc.get('decoy')
+  let setterCalls = 0
+  let contentIntegrateCalls = 0
+  let failure = null
+  const doc = new Y.Doc()
+  const type = doc.get('content')
+  try {
+    Object.defineProperty(ContentType.prototype, 'type', {
+      configurable: true,
+      get () { return decoy },
+      set (_value) { setterCalls++ }
+    })
+    const prepared = type.reserveDeltaMutation(delta.create().insert([delta.create('child').insert('owned')]).done())
+    Object.defineProperty(ContentType.prototype, 'integrate', {
+      configurable: true,
+      value: () => {
+        contentIntegrateCalls++
+        throw new Error('mutable ContentType integration')
+      }
+    })
+    prepared.apply()
+  } catch (error) {
+    failure = error
+  } finally {
+    if (typeDescriptor === undefined) Reflect.deleteProperty(ContentType.prototype, 'type')
+    else Object.defineProperty(ContentType.prototype, 'type', typeDescriptor)
+    Object.defineProperty(ContentType.prototype, 'integrate', /** @type {PropertyDescriptor} */ (contentIntegrateDescriptor))
+  }
+  t.assert(failure === null && setterCalls === 0 && contentIntegrateCalls === 0, 'private ContentType construction and integration bypass mutable prototypes')
+  const child = /** @type {Y.Type} */ (type.get(0))
+  t.assert(child.doc === doc && child.name === 'child' && child.toString() === '<child>owned</child>')
+  t.assert(decoy.doc === decoyDoc && decoy._item === null, 'decoy type stays detached from the reserved item')
+
+  const itemDoc = new Y.Doc()
+  const itemType = itemDoc.get('content')
+  const itemPrepared = itemType.reserveDeltaMutation(delta.create().insert([delta.create('child').insert('owned')]).done())
+  const itemIntegrateDescriptor = Object.getOwnPropertyDescriptor(Item.prototype, 'integrate')
+  let itemIntegrateCalls = 0
+  failure = null
+  try {
+    Object.defineProperty(Item.prototype, 'integrate', {
+      configurable: true,
+      value: () => {
+        itemIntegrateCalls++
+        throw new Error('mutable Item integration')
+      }
+    })
+    itemPrepared.apply()
+  } catch (error) {
+    failure = error
+  } finally {
+    Object.defineProperty(Item.prototype, 'integrate', /** @type {PropertyDescriptor} */ (itemIntegrateDescriptor))
+  }
+  t.assert(failure === null && itemIntegrateCalls === 0, 'reserved inserts use the private Item integration kernel')
+  t.assert(/** @type {Y.Type} */ (itemType.get(0)).toString() === '<child>owned</child>')
+}
+
+export const testReservedDeltaMutationAvoidsInheritedArraySetters = () => {
+  const indexDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, '0')
+  /** @param {any[]} target @param {any} value */
+  const defineIndex = (target, value) => Object.defineProperty(target, '0', {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true
+  })
+  {
+    const doc = new Y.Doc()
+    const type = doc.get('content')
+    const sentinel = 'reserved-array-value-c3'
+    const prepared = type.reserveDeltaMutation(delta.create().insert([sentinel]).done())
+    let setterCalls = 0
+    let failure = null
+    try {
+      // eslint-disable-next-line no-extend-native
+      Object.defineProperty(Array.prototype, '0', {
+        configurable: true,
+        get () { return undefined },
+        set (value) {
+          if (value === sentinel) {
+            setterCalls++
+            throw new Error('reserved value setter')
+          }
+          defineIndex(this, value)
+        }
+      })
+      prepared.apply()
+    } catch (error) {
+      failure = error
+    } finally {
+      if (indexDescriptor === undefined) Reflect.deleteProperty(Array.prototype, '0')
+      // eslint-disable-next-line no-extend-native
+      else Object.defineProperty(Array.prototype, '0', indexDescriptor)
+    }
+    t.assert(failure === null && setterCalls === 0, 'reserved value grouping defines dense own indices')
+    t.compare(type.toArray(), [sentinel])
+  }
+
+  {
+    const doc = new Y.Doc()
+    const type = doc.get('content')
+    const prepared = type.reserveDeltaMutation(delta.create().insert('range').done())
+    let setterCalls = 0
+    let failure = null
+    let exact = null
+    try {
+      // eslint-disable-next-line no-extend-native
+      Object.defineProperty(Array.prototype, '0', {
+        configurable: true,
+        get () { return undefined },
+        set (value) {
+          if (value !== null && typeof value === 'object' && Number.isSafeInteger(value.client) && Number.isSafeInteger(value.clock) && Number.isSafeInteger(value.length)) {
+            setterCalls++
+            throw new Error('reserved range setter')
+          }
+          defineIndex(this, value)
+        }
+      })
+      prepared.apply({ afterMutation: content => { exact = content } })
+    } catch (error) {
+      failure = error
+    } finally {
+      if (indexDescriptor === undefined) Reflect.deleteProperty(Array.prototype, '0')
+      // eslint-disable-next-line no-extend-native
+      else Object.defineProperty(Array.prototype, '0', indexDescriptor)
+    }
+    t.assert(failure === null && setterCalls === 0, 'exact range freezing defines dense own indices')
+    assertReservedContent(/** @type {any} */ (exact), prepared.reservation)
+  }
+}
+
 export const testReservedDeltaMutationRenderedTombstoneFixParity = () => {
   const base = new Y.Doc({ gc: false })
   base.clientID = 1
@@ -656,33 +970,12 @@ export const testReservedDeltaMutationRenderedTombstoneFixParity = () => {
   suggestion.on('update', () => { updates++ })
   const before = Array.from(Y.encodeStateAsUpdate(suggestion))
   const ordinaryFix = type.applyDelta(mutation, null, { renderer })
-  const prepared = type.reserveDeltaMutation(mutation, null, { renderer })
-  const listPrototype = Object.getPrototypeOf(mutation.children)
-  const iteratorDescriptor = Object.getOwnPropertyDescriptor(listPrototype, Symbol.iterator)
-  const schemaChecks = [delta.$deltaAny, delta.$modifyOp, delta.$retainOp, delta.$insertOp, delta.$deleteOp]
   const originalFrom = Y.Type.from
   let fix
   try {
-    Object.defineProperty(delta.DeltaBuilder.prototype, 'isEmpty', {
-      configurable: true,
-      value: () => { throw new Error('mutable fix dispatch') }
-    })
-    Object.defineProperty(listPrototype, Symbol.iterator, {
-      configurable: true,
-      value: () => { throw new Error('mutable fix list dispatch') }
-    })
-    for (let index = 0; index < schemaChecks.length; index++) {
-      Object.defineProperty(schemaChecks[index], 'check', {
-        configurable: true,
-        value: () => { throw new Error('mutable schema dispatch') }
-      })
-    }
     Y.Type.from = () => { throw new Error('mutable type factory') }
-    fix = prepared.apply()
+    fix = withPoisonedDeltaDispatch(() => type.reserveDeltaMutation(mutation, null, { renderer }).apply())
   } finally {
-    Reflect.deleteProperty(delta.DeltaBuilder.prototype, 'isEmpty')
-    Object.defineProperty(listPrototype, Symbol.iterator, /** @type {PropertyDescriptor} */ (iteratorDescriptor))
-    for (let index = 0; index < schemaChecks.length; index++) Reflect.deleteProperty(schemaChecks[index], 'check')
     Y.Type.from = originalFrom
   }
   t.compare(
@@ -711,11 +1004,11 @@ export const testReservedDeltaMutationRenderedTombstoneFixParity = () => {
   attrType.applyDelta(delta.create().deleteAttr('title').done())
   const attrMutation = delta.create().modifyAttr('title', delta.create().insert('X')).done()
   const attrOrdinaryFix = attrType.applyDelta(attrMutation, null, { renderer: attrRenderer })
-  const attrFix = attrType.reserveDeltaMutation(
+  const attrFix = withPoisonedDeltaDispatch(() => attrType.reserveDeltaMutation(
     attrMutation,
     null,
     { renderer: attrRenderer }
-  ).apply()
+  ).apply())
   t.compare(
     /** @type {delta.DeltaBuilder<any>} */ (attrFix).toJSON(),
     /** @type {delta.DeltaBuilder<any>} */ (attrOrdinaryFix).toJSON()
@@ -798,7 +1091,8 @@ export const testReservedDeltaMutationRenderedTombstoneNodeFormatFixParity = () 
   let updates = 0
   suggestion.on('update', () => { updates++ })
   const ordinaryFix = type.applyDelta(createMutation(), null, { renderer })
-  const reservedFix = type.reserveDeltaMutation(createMutation(), null, { renderer }).apply()
+  const reservedMutation = createMutation()
+  const reservedFix = withPoisonedDeltaDispatch(() => type.reserveDeltaMutation(reservedMutation, null, { renderer }).apply())
   t.compare(
     /** @type {delta.DeltaBuilder<any>} */ (reservedFix).toJSON(),
     /** @type {delta.DeltaBuilder<any>} */ (ordinaryFix).toJSON()
@@ -857,6 +1151,18 @@ export const testReservedDeltaMutationRejectsMalformedNamesKeysAndOversizeGraphs
     () => type.reserveDeltaMutation(delta.create().setAttr('payload', payloadNodes).done()),
     'DeltaMutationPreparationError'
   )
+
+  /** @type {any} */
+  let shared = delta.create('leaf').insert('x').done()
+  for (let depth = 0; depth < 16; depth++) {
+    shared = delta.create(`shared${depth}`).insert([shared, shared]).done()
+  }
+  const sharedStart = Date.now()
+  assertNamedFailure(
+    () => type.reserveDeltaMutation(delta.create().insert([shared]).done()),
+    'DeltaMutationPreparationError'
+  )
+  t.assert(Date.now() - sharedStart < 2000, 'expanded shared-DAG cost rejects without exponential materialization')
   t.assert(updates === 0 && type.toDeltaDeep().isEmpty(), 'all resource and shape failures are prewrite')
 }
 
@@ -894,7 +1200,7 @@ export const testTransactionSetupHookFailuresCleanUp = () => {
     doc.on(event, () => {
       if (throwHook) throw sentinel
     })
-    doc.on('afterTransaction', () => {
+    doc.on('afterTransactionCleanup', () => {
       if (throwCleanup) {
         throwCleanup = false
         throw new Error('cleanup failure must not replace setup failure')

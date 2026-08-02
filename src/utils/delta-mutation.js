@@ -1,8 +1,8 @@
 import * as delta from 'lib0/delta'
 
-import { ContentFormat, ContentType } from '../structs/Item.js'
+import { ContentFormat, ContentType, createContentTypeCanonical } from '../structs/Item.js'
 import { createIdSet, diffIdSet, intersectSets } from './ids.js'
-import { readRendererLifecycle, rendererContentLength } from './renderer-helpers.js'
+import { readRendererExecutionAdapter, readRendererLifecycle, rendererContentLength } from './renderer-helpers.js'
 import { readDocumentStructuralRevision, transact } from './Transaction.js'
 
 /**
@@ -20,12 +20,14 @@ import { readDocumentStructuralRevision, transact } from './Transaction.js'
  *   apply: (options?: DeltaMutationApplyOptions) => delta.DeltaBuilder<any>?,
  *   discard: () => void
  * }} PreparedDeltaMutation
- * @typedef {(transaction: Transaction, mutation: object) => delta.DeltaBuilder<any>?} DeltaMutationExecutor
+ * @typedef {(transaction: Transaction, mutation: object, renderer: AbstractRenderer?) => delta.DeltaBuilder<any>?} DeltaMutationExecutor
+ * @typedef {(type:YType<any>, renderer:AbstractRenderer?) => DeltaMutationPlan} DeltaMutationPlanRenderer
  * @typedef {{
  *   status: 'prepared'|'applying'|'consumed'|'discarded',
  *   type: YType<any>,
  *   doc: Doc,
  *   renderer: AbstractRenderer?,
+ *   executionRenderer: AbstractRenderer?,
  *   rendererLifecycle: Readonly<{revision:number,active:boolean}>?,
  *   documentRevision: number,
  *   mutation: object,
@@ -43,7 +45,8 @@ import { readDocumentStructuralRevision, transact } from './Transaction.js'
  *   doc: Doc,
  *   canonicalApplyDelta: CanonicalDeltaApply,
  *   guardedTypes: Set<YType<any>>,
- *   createNestedType: (name:null|string) => YType<any>
+ *   createNestedType: (name:null|string) => YType<any>,
+ *   renderDeltaPlan: DeltaMutationPlanRenderer
  * }} ReservationScan
  * @typedef {{ readonly name: null|string, readonly children: readonly any[], readonly attrs: readonly any[], readonly preparedFix?: delta.DeltaBuilder<any>? }} DeltaMutationPlan
  */
@@ -62,9 +65,396 @@ const objectFreeze = Object.freeze
 const objectCreate = Object.create
 const objectDefineProperty = Object.defineProperty
 const reflectApply = Reflect.apply
+const arrayPop = Array.prototype.pop
 const objectHasOwnProperty = Object.prototype.hasOwnProperty
 /** @param {object} value @param {PropertyKey} key */
 const objectHasOwn = (value, key) => reflectApply(objectHasOwnProperty, value, [key])
+/** @param {any[]} values @param {number} index @param {any} value */
+const defineDenseIndex = (values, index, value) => {
+  objectDefineProperty(values, index, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true
+  })
+}
+/** @param {any[]} values @param {any} value */
+const appendDense = (values, value) => defineDenseIndex(values, values.length, value)
+const privateDeltaPlans = new WeakSet()
+
+/** @param {any} value */
+const isRecord = value => {
+  if (value === null || typeof value !== 'object') return false
+  const prototype = objectGetPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+/** @param {any} value */
+const isEmptyDimension = value => value == null || objectKeys(value).length === 0
+
+/**
+ * Equality for owned wire values used only by format/attribution inversion. Inputs are finite and
+ * accessor-free by admission or renderer capture.
+ *
+ * @param {any} left
+ * @param {any} right
+ * @param {Map<object,Set<object>>} [seen]
+ */
+const equalOwnedValues = (left, right, seen = new Map()) => {
+  if (Object.is(left, right)) return true
+  if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return false
+  const leftPrototype = objectGetPrototypeOf(left)
+  if (leftPrototype !== objectGetPrototypeOf(right)) return false
+  let rights = seen.get(left)
+  if (rights?.has(right)) return true
+  if (rights === undefined) {
+    rights = new Set()
+    seen.set(left, rights)
+  }
+  rights.add(right)
+  if (leftPrototype === Uint8Array.prototype) {
+    if (left.byteLength !== right.byteLength) return false
+    for (let index = 0; index < left.byteLength; index++) {
+      if (left[index] !== right[index]) return false
+    }
+    return true
+  }
+  if (leftPrototype === Date.prototype) {
+    return reflectApply(Date.prototype.getTime, left, []) === reflectApply(Date.prototype.getTime, right, [])
+  }
+  if (leftPrototype !== Array.prototype && leftPrototype !== Object.prototype && leftPrototype !== null) return false
+  const leftKeys = objectKeys(left)
+  const rightKeys = objectKeys(right)
+  if (leftKeys.length !== rightKeys.length) return false
+  for (let index = 0; index < leftKeys.length; index++) {
+    const key = leftKeys[index]
+    if (!objectHasOwn(right, key) || !equalOwnedValues(left[key], right[key], seen)) return false
+  }
+  return true
+}
+
+/** @return {Object<string,any>} */
+const createRecord = () => objectCreate(Object.prototype)
+
+/** @param {Object<string,any>} target @param {string} key @param {any} value */
+const defineRecordValue = (target, key, value) => {
+  objectDefineProperty(target, key, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true
+  })
+}
+
+/**
+ * Resolve a tri-state format/attribution update against stored data. Attribution's `format` key is
+ * the sole nested merge dimension, matching lib0 delta semantics without invoking its mutable API.
+ *
+ * @param {Object<string,any>|null|undefined} stored
+ * @param {Object<string,any>} update
+ * @param {boolean} deep
+ */
+const mergeResolvedDimension = (stored, update, deep) => {
+  const result = createRecord()
+  if (isRecord(stored)) {
+    const storedRecord = /** @type {Object<string,any>} */ (stored)
+    const keys = objectKeys(storedRecord)
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index]
+      const value = storedRecord[key]
+      if (value === null) continue
+      if (deep && key === 'format' && isRecord(value)) {
+        const format = mergeResolvedDimension(value, createRecord(), false)
+        if (!isEmptyDimension(format)) defineRecordValue(result, key, format)
+      } else {
+        defineRecordValue(result, key, value)
+      }
+    }
+  }
+  const keys = objectKeys(update)
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index]
+    const value = update[key]
+    if (value === undefined) continue
+    if (deep && key === 'format' && isRecord(value)) {
+      const format = mergeResolvedDimension(result[key], value, false)
+      if (isEmptyDimension(format)) Reflect.deleteProperty(result, key)
+      else defineRecordValue(result, key, format)
+    } else if (value === null) {
+      Reflect.deleteProperty(result, key)
+    } else {
+      defineRecordValue(result, key, value)
+    }
+  }
+  return result
+}
+
+/**
+ * @param {Object<string,any>|null|undefined} stored
+ * @param {Object<string,any>|null|undefined} update
+ * @param {boolean} deep
+ */
+const combineDataDimension = (stored, update, deep) => {
+  if (update === null) return null
+  if (update === undefined || isEmptyDimension(update)) return isEmptyDimension(stored) ? null : stored
+  const merged = mergeResolvedDimension(stored, update, deep)
+  return isEmptyDimension(merged) ? null : merged
+}
+
+/**
+ * @param {Object<string,any>|null|undefined} from
+ * @param {Object<string,any>|null|undefined} to
+ * @param {boolean} deep
+ */
+const diffDimension = (from, to, deep) => {
+  if (equalOwnedValues(from, to)) return undefined
+  if (isEmptyDimension(to) && (deep || from == null)) return null
+  const update = createRecord()
+  const fromRecord = isRecord(from) ? /** @type {Object<string,any>} */ (from) : null
+  const toRecord = isRecord(to) ? /** @type {Object<string,any>} */ (to) : null
+  if (toRecord !== null) {
+    const keys = objectKeys(toRecord)
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index]
+      const toValue = toRecord[key]
+      const fromValue = fromRecord !== null && objectHasOwn(fromRecord, key) ? fromRecord[key] : null
+      if (!equalOwnedValues(toValue, fromValue)) {
+        defineRecordValue(
+          update,
+          key,
+          deep && key === 'format' && isRecord(toValue) && isRecord(fromValue)
+            ? diffDimension(fromValue, toValue, false)
+            : toValue
+        )
+      }
+    }
+  }
+  if (fromRecord !== null) {
+    const keys = objectKeys(fromRecord)
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index]
+      if (toRecord === null || !objectHasOwn(toRecord, key)) defineRecordValue(update, key, null)
+    }
+  }
+  return update
+}
+
+/**
+ * @param {Object<string,any>|null|undefined} stored
+ * @param {Object<string,any>|null|undefined} update
+ * @param {boolean} deep
+ */
+const inverseDimension = (stored, update, deep) => {
+  if (update === undefined) return undefined
+  const merged = update === null ? null : mergeResolvedDimension(stored, update, deep)
+  return diffDimension(isEmptyDimension(merged) ? null : merged, stored ?? null, deep)
+}
+
+/** @param {null|string} name @param {any[]} children @param {any[]} attrs */
+const sealDeltaPlan = (name, children, attrs) => {
+  const plan = objectFreeze({
+    name,
+    children: objectFreeze(children),
+    attrs: objectFreeze(attrs),
+    preparedFix: null
+  })
+  privateDeltaPlans.add(plan)
+  return /** @type {DeltaMutationPlan} */ (plan)
+}
+
+class DeltaMutationPlanBuilder {
+  /** @param {null|string} name */
+  constructor (name) {
+    this.name = name
+    /** @type {any[]} */
+    this.children = []
+    /** @type {any[]} */
+    this.attrs = []
+    /** @type {Object<string,any>|null} */
+    this.usedFormats = null
+    /** @type {Object<string,any>|null} */
+    this.usedAttribution = null
+  }
+
+  /** @param {Object<string,any>|null} formats */
+  useFormats (formats) {
+    this.usedFormats = formats
+    return this
+  }
+
+  /** @param {Object<string,any>|null} attribution */
+  useAttribution (attribution) {
+    this.usedAttribution = attribution
+    return this
+  }
+
+  /** @param {any} value @param {any} [format] @param {any} [attribution] */
+  insert (value, format, attribution) {
+    const ownedFormat = combineDataDimension(this.usedFormats, format, false)
+    const ownedAttribution = combineDataDimension(this.usedAttribution, attribution, true)
+    if (typeof value === 'string') {
+      appendDense(this.children, { kind: 'text', insert: value, length: value.length, format: ownedFormat, attribution: ownedAttribution })
+    } else {
+      /** @type {any[]} */
+      const insert = []
+      for (let index = 0; index < value.length; index++) {
+        const entry = value[index]
+        appendDense(insert, objectFreeze(privateDeltaPlans.has(entry) ? { kind: 'nested', value: entry } : { kind: 'value', value: entry }))
+      }
+      appendDense(this.children, { kind: 'insert', insert: objectFreeze(insert), length: insert.length, format: ownedFormat, attribution: ownedAttribution })
+    }
+    return this
+  }
+
+  /** @param {number} length */
+  delete (length) {
+    appendDense(this.children, { kind: 'delete', length })
+    return this
+  }
+
+  /** @param {number} length @param {any} [format] @param {any} [attribution] */
+  retain (length, format, attribution) {
+    appendDense(this.children, { kind: 'retain', retain: length, length, format, attribution })
+    return this
+  }
+
+  /** @param {DeltaMutationPlan} value @param {any} [format] @param {any} [attribution] */
+  modify (value, format, attribution) {
+    appendDense(this.children, { kind: 'modify', value, length: 1, format, attribution })
+    return this
+  }
+
+  /** @param {string} key @param {any} value @param {any} [attribution] */
+  setAttr (key, value, attribution) {
+    appendDense(this.attrs, { kind: 'set', key, value, attribution: combineDataDimension(null, attribution, true) })
+    return this
+  }
+
+  /** @param {string} key @param {any} [attribution] */
+  deleteAttr (key, attribution) {
+    appendDense(this.attrs, { kind: 'delete', key, attribution: combineDataDimension(null, attribution, true) })
+    return this
+  }
+
+  /** @param {string} key @param {DeltaMutationPlan} value @param {any} [attribution] */
+  modifyAttr (key, value, attribution) {
+    appendDense(this.attrs, { kind: 'modify', key, value, attribution })
+    return this
+  }
+
+  done () {
+    for (let index = 0; index < this.children.length; index++) objectFreeze(this.children[index])
+    for (let index = 0; index < this.attrs.length; index++) objectFreeze(this.attrs[index])
+    return sealDeltaPlan(this.name, this.children, this.attrs)
+  }
+}
+
+/** @param {null|string} name */
+export const createDeltaMutationPlanBuilder = name => new DeltaMutationPlanBuilder(name)
+
+/**
+ * Compute a fix over immutable plans. This mirrors delta inversion only; mutation still runs solely
+ * through applyDeltaCanonical.
+ *
+ * @param {DeltaMutationPlan} mutation
+ * @param {DeltaMutationPlan} base
+ */
+const invertDeltaMutationPlan = (mutation, base) => {
+  const inverse = new DeltaMutationPlanBuilder(mutation.name === base.name ? mutation.name : null)
+  /** @type {Map<string,any>} */
+  const baseAttrs = new Map()
+  for (let index = 0; index < base.attrs.length; index++) {
+    const op = base.attrs[index]
+    baseAttrs.set(op.key, op)
+  }
+  for (let index = 0; index < mutation.attrs.length; index++) {
+    const op = mutation.attrs[index]
+    const baseOp = baseAttrs.get(op.key)
+    if (op.kind === 'modify' && baseOp?.kind === 'set' && privateDeltaPlans.has(baseOp.value)) {
+      inverse.modifyAttr(op.key, invertDeltaMutationPlan(op.value, baseOp.value), inverseDimension(baseOp.attribution, op.attribution, true))
+    } else if (baseOp?.kind === 'set') {
+      inverse.setAttr(op.key, baseOp.value, baseOp.attribution)
+    } else if (op.kind !== 'delete') {
+      inverse.deleteAttr(op.key)
+    }
+  }
+
+  let baseIndex = 0
+  let baseOffset = 0
+  /**
+   * @param {number} length
+   * @param {(op:any,start:number,end:number) => void} consume
+   */
+  const consumeBase = (length, consume) => {
+    while (length > 0 && baseIndex < base.children.length) {
+      const op = base.children[baseIndex]
+      if (op.kind !== 'text' && op.kind !== 'insert') {
+        throw new DeltaMutationInvariantError('Rendered tombstone plan is not settled content')
+      }
+      const consumed = Math.min(length, op.length - baseOffset)
+      consume(op, baseOffset, baseOffset + consumed)
+      length -= consumed
+      baseOffset += consumed
+      if (baseOffset === op.length) {
+        baseIndex++
+        baseOffset = 0
+      }
+    }
+    return length
+  }
+
+  for (let index = 0; index < mutation.children.length; index++) {
+    const op = mutation.children[index]
+    if (op.kind === 'text' || op.kind === 'insert') {
+      inverse.delete(op.length)
+    } else if (op.kind === 'retain') {
+      const rest = consumeBase(op.retain, (baseOp, start, end) => {
+        inverse.retain(
+          end - start,
+          inverseDimension(baseOp.format, op.format, false),
+          inverseDimension(baseOp.attribution, op.attribution, true)
+        )
+      })
+      if (rest > 0) inverse.retain(rest)
+    } else if (op.kind === 'modify') {
+      if (baseIndex >= base.children.length) {
+        inverse.retain(1)
+      } else {
+        const baseOp = base.children[baseIndex]
+        if (baseOp.kind !== 'insert') {
+          throw new DeltaMutationInvariantError('Rendered tombstone modify target is not nested content')
+        }
+        const entry = baseOp.insert[baseOffset]
+        if (entry?.kind !== 'nested') {
+          throw new DeltaMutationInvariantError('Rendered tombstone modify target is not nested content')
+        }
+        inverse.modify(
+          invertDeltaMutationPlan(op.value, entry.value),
+          inverseDimension(baseOp.format, op.format, false),
+          inverseDimension(baseOp.attribution, op.attribution, true)
+        )
+        consumeBase(1, () => {})
+      }
+    } else if (op.kind === 'delete') {
+      consumeBase(op.length, (baseOp, start, end) => {
+        if (baseOp.kind === 'text') {
+          inverse.insert(baseOp.insert.slice(start, end), baseOp.format, baseOp.attribution)
+        } else {
+          /** @type {any[]} */
+          const values = []
+          for (let insertIndex = start; insertIndex < end; insertIndex++) {
+            const entry = baseOp.insert[insertIndex]
+            appendDense(values, entry.kind === 'nested' ? entry.value : entry.value)
+          }
+          inverse.insert(values, baseOp.format, baseOp.attribution)
+        }
+      })
+    } else {
+      throw new DeltaMutationInvariantError('Delta mutation plan contains an invalid child operation')
+    }
+  }
+  return inverse.done()
+}
 const canonicalDeltaPrototypes = new Set([delta.Delta.prototype, delta.DeltaBuilder.prototype])
 const canonicalListPrototype = objectGetPrototypeOf(delta.create().children)
 /** @type {Map<object,string>} */
@@ -174,7 +564,7 @@ const freezeRanges = ids => {
   /** @type {StructuralIdRange[]} */
   const result = []
   ids.forEach((range, client) => {
-    result[result.length] = objectFreeze({ client, clock: range.clock, length: range.len })
+    appendDense(result, objectFreeze({ client, clock: range.clock, length: range.len }))
   })
   for (let index = 1; index < result.length; index++) {
     const range = result[index]
@@ -184,10 +574,10 @@ const freezeRanges = ids => {
       (result[insertion - 1].client > range.client ||
         (result[insertion - 1].client === range.client && result[insertion - 1].clock > range.clock))
     ) {
-      result[insertion] = result[insertion - 1]
+      defineDenseIndex(result, insertion, result[insertion - 1])
       insertion--
     }
-    result[insertion] = range
+    defineDenseIndex(result, insertion, range)
   }
   return objectFreeze(result)
 }
@@ -319,7 +709,7 @@ const prepareInsertedTypes = (mutation, scan) => {
   for (let index = 0; index < mutation.children.length; index++) {
     const op = mutation.children[index]
     if (op.kind !== 'insert') {
-      children[index] = op
+      defineDenseIndex(children, index, op)
       continue
     }
     const insert = new Array(op.insert.length)
@@ -328,12 +718,12 @@ const prepareInsertedTypes = (mutation, scan) => {
       if (entry.kind === 'nested') {
         const value = prepareInsertedTypes(entry.value, scan)
         const type = scan.createNestedType(value.name)
-        insert[insertIndex] = objectFreeze({ kind: entry.kind, value, type, content: new ContentType(type) })
+        defineDenseIndex(insert, insertIndex, objectFreeze({ kind: entry.kind, value, type, content: createContentTypeCanonical(type) }))
       } else {
-        insert[insertIndex] = entry
+        defineDenseIndex(insert, insertIndex, entry)
       }
     }
-    children[index] = objectFreeze({ ...op, insert: objectFreeze(insert) })
+    defineDenseIndex(children, index, objectFreeze({ ...op, insert: objectFreeze(insert) }))
   }
   return objectFreeze({
     name: mutation.name,
@@ -358,9 +748,8 @@ const scanDeltaMutation = (type, mutation, renderer, scan) => {
   if (typeItem !== null && typeItem.deleted) {
     let preparedFix = null
     if (rendererContentLength(renderer, typeItem) > 0) {
-      const source = materializeDeltaMutationPlan(mutation)
-      const rendered = /** @type {delta.DeltaAny} */ (type.toDeltaDeep({ renderer }))
-      const inverse = ownDeltaMutation(delta.inverse(source, rendered))
+      const rendered = scan.renderDeltaPlan(type, renderer)
+      const inverse = invertDeltaMutationPlan(mutation, rendered)
       if (inverse.children.length > 0 || inverse.attrs.length > 0) {
         preparedFix = materializeDeltaMutationPlan(inverse)
       }
@@ -397,18 +786,18 @@ const scanDeltaMutation = (type, mutation, renderer, scan) => {
     if (op.kind === 'text' || op.kind === 'insert') {
       scan.allocates = true
       expectedIndex += op.length
-      children[index] = op.kind === 'insert' ? prepareInsertedTypes(objectFreeze({ name: null, children: objectFreeze([op]), attrs: objectFreeze([]) }), scan).children[0] : op
+      defineDenseIndex(children, index, op.kind === 'insert' ? prepareInsertedTypes(objectFreeze({ name: null, children: objectFreeze([op]), attrs: objectFreeze([]) }), scan).children[0] : op)
     } else if (op.kind === 'retain') {
       const formatting = op.format != null && objectKeys(op.format).length > 0
       if (formatting) scan.allocates = true
       advanceStructuralCursor(cursor, op.retain, renderer, scan, false, formatting)
       if (formatting) collectTrailingFormatHazards(cursor, renderer, scan)
       expectedIndex += op.length
-      children[index] = op
+      defineDenseIndex(children, index, op)
     } else if (op.kind === 'delete') {
       advanceStructuralCursor(cursor, op.length, renderer, scan, true, false)
       collectTrailingFormatHazards(cursor, renderer, scan)
-      children[index] = op
+      defineDenseIndex(children, index, op)
     } else if (op.kind === 'modify') {
       const item = findRenderedItem(cursor, renderer)
       if (item === null || item.content.constructor !== ContentType || cursor.offset !== 0) {
@@ -431,7 +820,7 @@ const scanDeltaMutation = (type, mutation, renderer, scan) => {
         }
       }
       if (value.preparedFix !== null || inverseFormat !== undefined) appendModifyFix(value.preparedFix, inverseFormat)
-      children[index] = objectFreeze({ ...op, value, inverseFormat })
+      defineDenseIndex(children, index, objectFreeze({ ...op, value, inverseFormat }))
       advanceStructuralCursor(cursor, 1, renderer, scan, false, formatting)
       if (formatting) collectTrailingFormatHazards(cursor, renderer, scan)
       expectedIndex++
@@ -449,13 +838,13 @@ const scanDeltaMutation = (type, mutation, renderer, scan) => {
         scan.deletes.add(item.id.client, item.id.clock, item.length)
         addDeletedTypeContents(item, scan)
       }
-      attrs[index] = op
+      defineDenseIndex(attrs, index, op)
     } else if (op.kind === 'delete') {
       if (item !== undefined && !item.deleted) {
         scan.deletes.add(item.id.client, item.id.clock, item.length)
         addDeletedTypeContents(item, scan)
       }
-      attrs[index] = op
+      defineDenseIndex(attrs, index, op)
     } else if (op.kind === 'modify') {
       if (
         item === undefined ||
@@ -474,7 +863,7 @@ const scanDeltaMutation = (type, mutation, renderer, scan) => {
           writable: true
         })
       }
-      attrs[index] = objectFreeze({ ...op, value })
+      defineDenseIndex(attrs, index, objectFreeze({ ...op, value }))
     } else {
       throw new DeltaMutationPreparationError('Delta contains an unsupported attribute operation')
     }
@@ -494,8 +883,9 @@ const scanDeltaMutation = (type, mutation, renderer, scan) => {
  * @param {Doc} doc
  * @param {CanonicalDeltaApply} canonicalApplyDelta
  * @param {(name:null|string) => YType<any>} createNestedType
+ * @param {DeltaMutationPlanRenderer} renderDeltaPlan
  */
-const reserveRangeCount = (type, mutation, renderer, doc, canonicalApplyDelta, createNestedType) => {
+const reserveRangeCount = (type, mutation, renderer, doc, canonicalApplyDelta, createNestedType, renderDeltaPlan) => {
   /** @type {ReservationScan} */
   const scan = {
     deletes: createIdSet(),
@@ -504,7 +894,8 @@ const reserveRangeCount = (type, mutation, renderer, doc, canonicalApplyDelta, c
     doc,
     canonicalApplyDelta,
     guardedTypes: new Set(),
-    createNestedType
+    createNestedType,
+    renderDeltaPlan
   }
   const plan = scanDeltaMutation(type, mutation, renderer, scan)
   let rangeCount = countRanges(scan.deletes)
@@ -610,7 +1001,7 @@ const applyInTransaction = (transaction, state, afterMutation) => {
   }
   const beforeInserts = cloneIdSet(transaction.insertSet)
   const beforeDeletes = cloneIdSet(transaction.deleteSet)
-  const fix = state.executor(transaction, state.mutation)
+  const fix = state.executor(transaction, state.mutation, state.executionRenderer)
   const inserts = diffIdSet(transaction.insertSet, beforeInserts)
   const deletes = diffIdSet(transaction.deleteSet, beforeDeletes)
   if (intersectSets(inserts, deletes).clients.size !== 0) {
@@ -733,7 +1124,7 @@ const ownDeltaMutation = mutation => {
     /** @type {any[]} */
     const stack = [{ source: root, target: holder, key: 'value', depth: 0, exit: false }]
     while (stack.length > 0) {
-      const frame = stack.pop()
+      const frame = reflectApply(arrayPop, stack, [])
       const source = frame.source
       if (frame.exit) {
         valueStates.set(source, 2)
@@ -802,10 +1193,10 @@ const ownDeltaMutation = mutation => {
       valueCopies.set(source, owned)
       valueStates.set(source, 1)
       assignValue(frame.target, frame.key, owned)
-      stack.push({ source, exit: true })
+      appendDense(stack, { source, exit: true })
       for (let index = keys.length - 1; index >= 0; index--) {
         const key = keys[index]
-        stack.push({ source: readOwnData(source, key), target: owned, key, depth: frame.depth + 1, exit: false })
+        appendDense(stack, { source: readOwnData(source, key), target: owned, key, depth: frame.depth + 1, exit: false })
       }
     }
     return holder.value
@@ -835,6 +1226,10 @@ const ownDeltaMutation = mutation => {
   const records = new Map()
   /** @type {Map<delta.DeltaAny, DeltaMutationPlan>} */
   const plans = new Map()
+  /** @type {Map<delta.DeltaAny, number>} */
+  const expandedCosts = new Map()
+  /** @type {Map<delta.DeltaAny, number>} */
+  const freshTypeCosts = new Map()
   /** @type {delta.DeltaAny[]} */
   const completed = []
   let planNodeCount = 0
@@ -844,6 +1239,15 @@ const ownDeltaMutation = mutation => {
     if (planNodeCount > maxDeltaMutationNodes) {
       throw new DeltaMutationPreparationError(`Delta mutation exceeds node limit ${maxDeltaMutationNodes}`)
     }
+  }
+
+  /** @param {number} left @param {number} right */
+  const saturatingAdd = (left, right) => Math.min(maxDeltaMutationNodes + 1, left + right)
+  /** @param {Map<delta.DeltaAny,number>} costs @param {delta.DeltaAny} source */
+  const readCost = (costs, source) => {
+    const cost = costs.get(source)
+    if (cost === undefined) throw new DeltaMutationPreparationError('Delta contains an inconsistent nested graph')
+    return cost
   }
 
   /** @param {any} value */
@@ -857,7 +1261,7 @@ const ownDeltaMutation = mutation => {
     const result = new Array(length)
     for (let index = 0; index < length; index++) {
       if (!objectHasOwn(value, index)) throw new DeltaMutationPreparationError('Delta contains sparse inserted content')
-      result[index] = readOwnData(value, String(index))
+      defineDenseIndex(result, index, readOwnData(value, String(index)))
     }
     return result
   }
@@ -899,7 +1303,7 @@ const ownDeltaMutation = mutation => {
         if (typeof insert !== 'string') throw new DeltaMutationPreparationError('Delta contains invalid text content')
         assertPositiveLength(insert.length)
         childLength += insert.length
-        children.push({
+        appendDense(children, {
           kind,
           insert,
           length: insert.length,
@@ -914,13 +1318,13 @@ const ownDeltaMutation = mutation => {
         for (let index = 0; index < insert.length; index++) {
           const value = insert[index]
           if (isCanonicalDelta(value)) {
-            nested.push(value)
-            content[index] = { kind: 'nested', value }
+            appendDense(nested, value)
+            defineDenseIndex(content, index, { kind: 'nested', value })
           } else {
-            content[index] = { kind: 'value', value: cloneValue(value) }
+            defineDenseIndex(content, index, { kind: 'value', value: cloneValue(value) })
           }
         }
-        children.push({
+        appendDense(children, {
           kind,
           insert: content,
           length: insert.length,
@@ -931,7 +1335,7 @@ const ownDeltaMutation = mutation => {
         const retain = readOwnData(node, 'retain')
         assertPositiveLength(retain)
         childLength += retain
-        children.push({
+        appendDense(children, {
           kind,
           retain,
           length: retain,
@@ -942,13 +1346,13 @@ const ownDeltaMutation = mutation => {
         const length = readOwnData(node, 'delete')
         assertPositiveLength(length)
         childLength += length
-        children.push({ kind, length })
+        appendDense(children, { kind, length })
       } else if (kind === 'modify') {
         const value = readOwnData(node, 'value')
         if (!isCanonicalDelta(value)) throw new DeltaMutationPreparationError('Delta contains an invalid nested delta')
-        nested.push(value)
+        appendDense(nested, value)
         childLength++
-        children.push({
+        appendDense(children, {
           kind,
           value,
           length: 1,
@@ -985,14 +1389,14 @@ const ownDeltaMutation = mutation => {
       if (kind === 'set') {
         const value = readOwnData(op, 'value')
         if (isCanonicalDelta(value)) throw new DeltaMutationPreparationError('Delta attributes cannot be set to a nested delta')
-        attrs.push({
+        appendDense(attrs, {
           kind,
           key,
           value: cloneValue(value),
           attribution: cloneDimension(readOwnData(op, 'attribution'), 'attribution')
         })
       } else if (kind === 'deleteAttr') {
-        attrs.push({
+        appendDense(attrs, {
           kind: 'delete',
           key,
           attribution: cloneDimension(readOwnData(op, 'attribution'), 'attribution')
@@ -1000,8 +1404,8 @@ const ownDeltaMutation = mutation => {
       } else if (kind === 'modifyAttr') {
         const value = readOwnData(op, 'value')
         if (!isCanonicalDelta(value)) throw new DeltaMutationPreparationError('Delta contains an invalid nested delta')
-        nested.push(value)
-        attrs.push({
+        appendDense(nested, value)
+        appendDense(attrs, {
           kind: 'modify',
           key,
           value,
@@ -1018,22 +1422,22 @@ const ownDeltaMutation = mutation => {
   /** @type {Array<{source:delta.DeltaAny,depth:number,exit:boolean}>} */
   const stack = [{ source: mutation, depth: 0, exit: false }]
   while (stack.length > 0) {
-    const frame = /** @type {{source:delta.DeltaAny,depth:number,exit:boolean}} */ (stack.pop())
+    const frame = /** @type {{source:delta.DeltaAny,depth:number,exit:boolean}} */ (reflectApply(arrayPop, stack, []))
     if (frame.depth > maxDeltaMutationDepth) {
       throw new DeltaMutationPreparationError(`Delta mutation exceeds nested depth limit ${maxDeltaMutationDepth}`)
     }
     const state = deltaStates.get(frame.source)
     if (frame.exit) {
       deltaStates.set(frame.source, 2)
-      completed.push(frame.source)
+      appendDense(completed, frame.source)
     } else if (state === 1) {
       throw new DeltaMutationPreparationError('Delta contains a cyclic nested delta')
     } else if (state !== 2) {
       deltaStates.set(frame.source, 1)
       const nested = inspectDelta(frame.source)
-      stack.push({ source: frame.source, depth: frame.depth, exit: true })
+      appendDense(stack, { source: frame.source, depth: frame.depth, exit: true })
       for (let index = nested.length - 1; index >= 0; index--) {
-        stack.push({ source: nested[index], depth: frame.depth + 1, exit: false })
+        appendDense(stack, { source: nested[index], depth: frame.depth + 1, exit: false })
       }
     }
   }
@@ -1041,6 +1445,35 @@ const ownDeltaMutation = mutation => {
   for (let sourceIndex = 0; sourceIndex < completed.length; sourceIndex++) {
     const source = completed[sourceIndex]
     const record = records.get(source)
+    let expandedCost = saturatingAdd(1, record.children.length + record.attrs.length)
+    let freshTypeCost = 0
+    for (let childIndex = 0; childIndex < record.children.length; childIndex++) {
+      const op = record.children[childIndex]
+      if (op.kind === 'insert') {
+        for (let insertIndex = 0; insertIndex < op.insert.length; insertIndex++) {
+          const entry = op.insert[insertIndex]
+          if (entry.kind === 'nested') {
+            expandedCost = saturatingAdd(expandedCost, readCost(expandedCosts, entry.value))
+            freshTypeCost = saturatingAdd(freshTypeCost, saturatingAdd(1, readCost(freshTypeCosts, entry.value)))
+          }
+        }
+      } else if (op.kind === 'modify') {
+        expandedCost = saturatingAdd(expandedCost, readCost(expandedCosts, op.value))
+        freshTypeCost = saturatingAdd(freshTypeCost, readCost(freshTypeCosts, op.value))
+      }
+    }
+    for (let attrIndex = 0; attrIndex < record.attrs.length; attrIndex++) {
+      const op = record.attrs[attrIndex]
+      if (op.kind === 'modify') {
+        expandedCost = saturatingAdd(expandedCost, readCost(expandedCosts, op.value))
+        freshTypeCost = saturatingAdd(freshTypeCost, readCost(freshTypeCosts, op.value))
+      }
+    }
+    if (expandedCost > maxDeltaMutationNodes || freshTypeCost > maxDeltaMutationNodes) {
+      throw new DeltaMutationPreparationError(`Delta mutation expanded occurrences exceed limit ${maxDeltaMutationNodes}`)
+    }
+    expandedCosts.set(source, expandedCost)
+    freshTypeCosts.set(source, freshTypeCost)
     /** @type {any[]} */
     const children = new Array(record.children.length)
     for (let childIndex = 0; childIndex < record.children.length; childIndex++) {
@@ -1049,23 +1482,23 @@ const ownDeltaMutation = mutation => {
         const insert = new Array(op.insert.length)
         for (let insertIndex = 0; insertIndex < op.insert.length; insertIndex++) {
           const entry = op.insert[insertIndex]
-          insert[insertIndex] = objectFreeze(entry.kind === 'nested'
+          defineDenseIndex(insert, insertIndex, objectFreeze(entry.kind === 'nested'
             ? { kind: entry.kind, value: plans.get(entry.value) }
-            : entry)
+            : entry))
         }
-        children[childIndex] = objectFreeze({ ...op, insert: objectFreeze(insert) })
+        defineDenseIndex(children, childIndex, objectFreeze({ ...op, insert: objectFreeze(insert) }))
       } else if (op.kind === 'modify') {
-        children[childIndex] = objectFreeze({ ...op, value: plans.get(op.value) })
+        defineDenseIndex(children, childIndex, objectFreeze({ ...op, value: plans.get(op.value) }))
       } else {
-        children[childIndex] = objectFreeze(op)
+        defineDenseIndex(children, childIndex, objectFreeze(op))
       }
     }
     const attrs = new Array(record.attrs.length)
     for (let attrIndex = 0; attrIndex < record.attrs.length; attrIndex++) {
       const op = record.attrs[attrIndex]
-      attrs[attrIndex] = op.kind === 'modify'
+      defineDenseIndex(attrs, attrIndex, op.kind === 'modify'
         ? objectFreeze({ ...op, value: plans.get(op.value) })
-        : objectFreeze(op)
+        : objectFreeze(op))
     }
     plans.set(source, objectFreeze({
       name: record.name,
@@ -1094,7 +1527,7 @@ export const materializeDeltaMutationPlan = plan => {
       const insert = new Array(op.insert.length)
       for (let insertIndex = 0; insertIndex < op.insert.length; insertIndex++) {
         const entry = op.insert[insertIndex]
-        insert[insertIndex] = entry.kind === 'nested' ? materializeDeltaMutationPlan(entry.value) : entry.value
+        defineDenseIndex(insert, insertIndex, entry.kind === 'nested' ? materializeDeltaMutationPlan(entry.value) : entry.value)
       }
       node = new delta.InsertOp(insert, op.format, op.attribution)
     } else if (op.kind === 'retain') {
@@ -1154,9 +1587,10 @@ export const readDeltaMutationPlan = token => {
  * @param {DeltaMutationExecutor} executor
  * @param {CanonicalDeltaApply} canonicalApplyDelta
  * @param {(name:null|string) => YType<any>} createNestedType
+ * @param {DeltaMutationPlanRenderer} renderDeltaPlan
  * @return {PreparedDeltaMutation}
  */
-export const createPreparedDeltaMutation = (type, mutation, origin, renderer, executor, canonicalApplyDelta, createNestedType) => {
+export const createPreparedDeltaMutation = (type, mutation, origin, renderer, executor, canonicalApplyDelta, createNestedType, renderDeltaPlan) => {
   const doc = type.doc
   if (doc === null || doc.isDestroyed) {
     throw new DeltaMutationPreparationError('Delta mutation target must be integrated in a live document')
@@ -1169,9 +1603,11 @@ export const createPreparedDeltaMutation = (type, mutation, origin, renderer, ex
   }
   const documentRevision = readDocumentStructuralRevision(doc)
   let rendererLifecycle = null
+  let executionRenderer = null
   if (renderer !== null) {
     rendererLifecycle = readRendererLifecycle(renderer)
-    if (rendererLifecycle === null || !rendererLifecycle.active) {
+    executionRenderer = readRendererExecutionAdapter(renderer)
+    if (rendererLifecycle === null || !rendererLifecycle.active || executionRenderer === null) {
       throw new DeltaMutationPreparationError('Delta mutation renderer must be a live tracked DiffRenderer')
     }
   }
@@ -1195,7 +1631,7 @@ export const createPreparedDeltaMutation = (type, mutation, origin, renderer, ex
     if (ownedPlan.children.length === 0 && ownedPlan.attrs.length === 0) {
       throw new DeltaMutationPreparationError('Cannot reserve an empty delta mutation')
     }
-    const reservation = reserveRangeCount(type, ownedPlan, renderer, doc, canonicalApplyDelta, createNestedType)
+    const reservation = reserveRangeCount(type, ownedPlan, executionRenderer, doc, canonicalApplyDelta, createNestedType, renderDeltaPlan)
     rangeCountUpperBound = reservation.rangeCountUpperBound
     guardedTypes = reservation.guardedTypes
     executionPlan = reservation.plan
@@ -1216,6 +1652,7 @@ export const createPreparedDeltaMutation = (type, mutation, origin, renderer, ex
     type,
     doc,
     renderer,
+    executionRenderer,
     rendererLifecycle,
     documentRevision,
     mutation: token,

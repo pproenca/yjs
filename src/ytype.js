@@ -21,6 +21,7 @@ import {
   ContentJSON,
   ContentString,
   ContentType,
+  integrateItemCanonical,
   YXmlFragmentRefID,
   YXmlElementRefID,
   YXmlHookRefID,
@@ -28,7 +29,7 @@ import {
   createContentDocFromDoc
 } from './structs/Item.js'
 import { AttributedContent, rendererContentLength } from './utils/renderer-helpers.js'
-import { createPreparedDeltaMutation, readDeltaMutationPlan } from './utils/delta-mutation.js'
+import { createDeltaMutationPlanBuilder, createPreparedDeltaMutation, readDeltaMutationPlan } from './utils/delta-mutation.js'
 import { removeEventHandlerListener, callEventHandlerListeners, addEventHandlerListener, createEventHandler } from './utils/EventHandler.js'
 import { createID } from './utils/ID.js'
 import { createIdSet, iterateStructsByIdSetWithoutSplits } from './utils/ids.js'
@@ -50,7 +51,26 @@ const maxSearchMarker = 80
 const objectCreate = Object.create
 const objectDefineProperty = Object.defineProperty
 const objectKeys = Object.keys
+const reflectApply = Reflect.apply
 const reflectDeleteProperty = Reflect.deleteProperty
+const itemIntegrationKernel = Symbol('item-integration-kernel')
+const deltaPlanBuilderFactory = Symbol('delta-plan-builder-factory')
+const deltaPlanRenderer = Symbol('delta-plan-renderer')
+/** @param {any[]} values @param {any} value */
+const appendDense = (values, value) => {
+  objectDefineProperty(values, values.length, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true
+  })
+}
+
+/** @param {YType<any>} type @param {any} opts */
+const renderNestedTypeDelta = (type, opts) => {
+  const render = opts[deltaPlanRenderer]
+  return render === undefined ? type.toDelta(opts) : render(type, opts)
+}
 
 /**
  * @todo SHOULD NOT RETURN AN OBJECT!
@@ -107,13 +127,15 @@ export class ItemTextListPosition {
    * @param {number} index
    * @param {Map<string,any>} currentFormats
    * @param {AbstractRenderer?} renderer
+   * @param {((item:Item, transaction:Transaction, offset:number) => void)?} [integrateItem]
    */
-  constructor (left, right, index, currentFormats, renderer) {
+  constructor (left, right, index, currentFormats, renderer, integrateItem = null) {
     this.left = left
     this.right = right
     this.index = index
     this.currentFormats = currentFormats
     this.renderer = renderer
+    objectDefineProperty(this, itemIntegrationKernel, { value: integrateItem })
   }
 
   /**
@@ -225,6 +247,13 @@ export class ItemTextListPosition {
   }
 }
 
+/** @param {ItemTextListPosition} position @param {Transaction} transaction @param {Item} item */
+const integratePositionItem = (position, transaction, item) => {
+  const integrateItem = /** @type {any} */ (position)[itemIntegrationKernel]
+  if (integrateItem === null) item.integrate(transaction, 0)
+  else integrateItem(item, transaction, 0)
+}
+
 /**
  * Negate applied formats
  *
@@ -257,7 +286,7 @@ const insertNegatedFormats = (transaction, parent, currPos, negatedFormats) => {
     const left = currPos.left
     const right = currPos.right
     const nextFormat = new Item(createID(ownClientId, doc.store.getClock(ownClientId)), left, left && left.lastId, right, right && right.id, parent, null, new ContentFormat(key, val))
-    nextFormat.integrate(transaction, 0)
+    integratePositionItem(currPos, transaction, nextFormat)
     currPos.right = nextFormat
     currPos.forward()
   })
@@ -323,7 +352,7 @@ const insertFormats = (transaction, parent, currPos, formats) => {
       negatedFormats.set(key, currentVal)
       const { left, right } = currPos
       currPos.right = new Item(createID(ownClientId, doc.store.getClock(ownClientId)), left, left && left.lastId, right, right && right.id, parent, null, new ContentFormat(key, val))
-      currPos.right.integrate(transaction, 0)
+      integratePositionItem(currPos, transaction, currPos.right)
       currPos.forward()
     }
   }
@@ -355,7 +384,7 @@ export const insertContent = (transaction, parent, currPos, content, formats) =>
     updateMarkerChanges(parent._searchMarker, currPos.index, content.getLength())
   }
   right = new Item(createID(ownClientId, doc.store.getClock(ownClientId)), left, left && left.lastId, right, right && right.id, parent, null, content)
-  right.integrate(transaction, 0)
+  integratePositionItem(currPos, transaction, right)
   currPos.right = right
   currPos.index = index
   currPos.forward()
@@ -725,7 +754,7 @@ const applyDeltaCanonical = (type, d, origin, renderer, activeTransaction) => {
     const applyNestedDelta = (sub, mutation) => activeTransaction === null
       ? sub.applyDelta(mutation, origin, { renderer })
       : applyDeltaCanonical(sub, mutation, origin, renderer, transaction)
-    const currPos = new ItemTextListPosition(null, type._start, 0, new Map(), renderer)
+    const currPos = new ItemTextListPosition(null, type._start, 0, new Map(), renderer, reserved ? integrateItemCanonical : null)
     /** @param {any} format */
     const getFormat = format => {
       if (!reserved) return format || {}
@@ -766,7 +795,7 @@ const applyDeltaCanonical = (type, d, origin, renderer, activeTransaction) => {
           reflectDeleteProperty(child, '_integrate')
           applyDeltaCanonical(child, entry.value, origin, renderer, transaction)
         } else {
-          values[values.length] = entry.value
+          appendDense(values, entry.value)
         }
       }
       flushValues()
@@ -844,7 +873,7 @@ const applyDeltaCanonical = (type, d, origin, renderer, activeTransaction) => {
         ? op.kind
         : (delta.$setAttrOp.check(op) ? 'set' : (delta.$deleteAttrOp.check(op) ? 'delete' : 'modify'))
       if (kind === 'set') {
-        typeMapSet(transaction, type, op.key, op.value)
+        typeMapSet(transaction, type, op.key, op.value, reserved ? integrateItemCanonical : null)
       } else if (kind === 'delete') {
         typeMapDelete(transaction, type, op.key)
       } else {
@@ -1242,10 +1271,8 @@ export class YType extends ObservableV2 {
     const { modified = (deep && itemsToRender) ? computeModifiedFromItems(/** @type {Doc} */ (this.doc).store, itemsToRender) : null } = opts
     const renderAttrs = modified?.get(this) || null
     const renderChildren = modified == null || !modified.has(this) || /** @type {Set<string|null>} */ (modified.get(this)).has(null)
-    /**
-     * @type {delta.DeltaBuilderAny}
-     */
-    const d = /** @type {any} */ (delta.create(this.name))
+    const createBuilder = /** @type {(name:null|string)=>any} */ (/** @type {any} */ (opts)[deltaPlanBuilderFactory] ?? delta.create)
+    const d = /** @type {any} */ (createBuilder(this.name))
     const optsAll = object.assign({}, opts, { renderer, modified })
     // opts has been re-computed - do not use opts after this point!
     typeMapGetDelta(d, /** @type {any} */ (this), renderAttrs, renderer, deep, modified, itemsToRender, optsAll, optsAll)
@@ -1376,19 +1403,19 @@ export class YType extends ObservableV2 {
                 usingChangedFormats = true
                 if (c.deleted && c.content.constructor === ContentType) {
                   // @todo use current transaction instead
-                  d.modify(/** @type {any} */ (c.content).type.toDelta(optsAll), undefined, attribution ?? null)
+                  d.modify(/** @type {any} */ (renderNestedTypeDelta((/** @type {ContentType} */ (c.content)).type, optsAll)), undefined, attribution ?? null)
                 } else if (c.content.constructor === ContentType && modified?.has(/** @type {ContentType} */ (c.content).type)) {
                   // a de/re-attributed node the renderer still claims (e.g. a partial accept):
                   // merge/clear its own attribution and descend so the nested walk heals exactly
                   // the child ids in `itemsToRender` — other children keep their attribution
-                  d.modify(/** @type {any} */ (c.content).type.toDelta(optsAll), undefined, attribution ?? clearedOwnAttribution())
+                  d.modify(/** @type {any} */ (renderNestedTypeDelta((/** @type {ContentType} */ (c.content)).type, optsAll)), undefined, attribution ?? clearedOwnAttribution())
                 } else {
                   d.retain(c.content.getLength(), undefined, attribution ?? clearedOwnAttribution())
                 }
               } else if (deep && c.content.constructor === ContentType) {
                 d.useFormats(currentFormats)
                 usingCurrentFormats = true
-                d.insert([/** @type {any} */(c.content).type.toDelta(optsAll)], undefined, attribution)
+                d.insert([/** @type {any} */(renderNestedTypeDelta((/** @type {ContentType} */ (c.content)).type, optsAll))], undefined, attribution)
               } else {
                 d.useFormats(currentFormats)
                 usingCurrentFormats = true
@@ -1399,7 +1426,7 @@ export class YType extends ObservableV2 {
             } else if (retainContent) {
               if (c.content.constructor === ContentType && modified?.has(/** @type {ContentType} */ (c.content).type)) {
                 // @todo use current transaction instead
-                d.modify(/** @type {any} */ (c.content).type.toDelta(optsAll))
+                d.modify(/** @type {any} */ (renderNestedTypeDelta((/** @type {ContentType} */ (c.content)).type, optsAll)))
               } else {
                 d.useFormats(changedFormats)
                 usingChangedFormats = true
@@ -1649,7 +1676,7 @@ export class YType extends ObservableV2 {
               d.useFormats(currentFormats)
               usingCurrentFormats = true
               if (deep && content.constructor === ContentType) {
-                d.insert([/** @type {any} */(content).type.toDelta(optsAll)])
+                d.insert([/** @type {any} */(renderNestedTypeDelta((/** @type {ContentType} */ (content)).type, optsAll))])
               } else if (content.constructor === ContentString) {
                 d.insert(/** @type {ContentString} */ (content).str)
               } else {
@@ -1671,7 +1698,7 @@ export class YType extends ObservableV2 {
               if (!idrange.exists) {
                 if (content.constructor === ContentType && modified?.has(/** @type {ContentType} */ (content).type)) {
                   // @todo use current transaction instead
-                  d.modify(/** @type {ContentType} */ (content).type.toDelta(optsAll))
+                  d.modify(/** @type {any} */ (renderNestedTypeDelta(/** @type {ContentType} */ (content).type, optsAll)))
                 } else {
                   d.useFormats(changedFormats)
                   usingChangedFormats = true
@@ -1684,7 +1711,7 @@ export class YType extends ObservableV2 {
                   // own attribution and descend so the nested walk heals exactly the child ids
                   // present in `itemsToRender` — children outside the change set keep their
                   // attribution (id-scoped, never a blanket subtree clear)
-                  d.modify(/** @type {ContentType} */ (content).type.toDelta(optsAll), undefined, clearedOwnAttribution())
+                  d.modify(/** @type {any} */ (renderNestedTypeDelta(/** @type {ContentType} */ (content).type, optsAll)), undefined, clearedOwnAttribution())
                 } else {
                   d.useFormats(changedFormats)
                   usingChangedFormats = true
@@ -1694,7 +1721,7 @@ export class YType extends ObservableV2 {
                 d.useFormats(currentFormats)
                 usingCurrentFormats = true
                 if (deep && content.constructor === ContentType) {
-                  d.insert([/** @type {any} */(content).type.toDelta(optsAll)])
+                  d.insert([/** @type {any} */(renderNestedTypeDelta((/** @type {ContentType} */ (content)).type, optsAll))])
                 } else if (content.constructor === ContentString) {
                   d.insert(/** @type {ContentString} */ (c).str)
                 } else {
@@ -1791,8 +1818,8 @@ export class YType extends ObservableV2 {
       d,
       origin,
       renderer,
-      (transaction, mutation) => {
-        return applyDeltaCanonical(this, readDeltaMutationPlan(mutation), origin, renderer, transaction)
+      (transaction, mutation, executionRenderer) => {
+        return applyDeltaCanonical(this, readDeltaMutationPlan(mutation), origin, executionRenderer, transaction)
       },
       YType.prototype.applyDelta,
       name => {
@@ -1803,7 +1830,8 @@ export class YType extends ObservableV2 {
           writable: true
         })
         return type
-      }
+      },
+      renderDeltaMutationPlan
     )
   }
 
@@ -2194,6 +2222,20 @@ export class YType extends ObservableV2 {
   }
 }
 
+const canonicalToDelta = YType.prototype.toDelta
+
+/** @param {YType<any>} type @param {AbstractRenderer?} renderer */
+const renderDeltaMutationPlan = (type, renderer) => {
+  /** @param {YType<any>} target @param {any} opts */
+  const render = (target, opts) => reflectApply(canonicalToDelta, target, [opts])
+  return render(type, {
+    renderer,
+    deep: true,
+    [deltaPlanBuilderFactory]: createDeltaMutationPlanBuilder,
+    [deltaPlanRenderer]: render
+  })
+}
+
 /**
  * @template {import('lib0/delta').ReadableDeltaConf} DConf
  * @param {DConf} _dconf
@@ -2553,11 +2595,12 @@ export const typeMapDelete = (transaction, parent, key) => {
  * @param {YType} parent
  * @param {string} key
  * @param {YValue} value
+ * @param {((item:Item, transaction:Transaction, offset:number) => void)?} [integrateItem]
  *
  * @private
  * @function
  */
-export const typeMapSet = (transaction, parent, key, value) => {
+export const typeMapSet = (transaction, parent, key, value, integrateItem = null) => {
   const left = parent._map.get(key) || null
   const doc = transaction.doc
   const ownClientId = doc.clientID
@@ -2588,7 +2631,9 @@ export const typeMapSet = (transaction, parent, key, value) => {
         }
     }
   }
-  new Item(createID(ownClientId, doc.store.getClock(ownClientId)), left, left && left.lastId, null, null, parent, key, content).integrate(transaction, 0)
+  const item = new Item(createID(ownClientId, doc.store.getClock(ownClientId)), left, left && left.lastId, null, null, parent, key, content)
+  if (integrateItem === null) item.integrate(transaction, 0)
+  else integrateItem(item, transaction, 0)
 }
 
 /**
@@ -2702,10 +2747,10 @@ export const typeMapGetDelta = (d, parent, attrsToRender, renderer, deep, modifi
         d.deleteAttr(key, attribution)
       }
     } else if (deep && c instanceof YType && modified?.has(c)) {
-      d.modifyAttr(key, c.toDelta(opts))
+      d.modifyAttr(key, renderNestedTypeDelta(c, opts))
     } else {
       if (deep && c instanceof YType) {
-        c = /** @type {any} */(c).toDelta(optsAll)
+        c = /** @type {any} */ (renderNestedTypeDelta(c, optsAll))
       }
       d.setAttr(key, c, attribution)
     }

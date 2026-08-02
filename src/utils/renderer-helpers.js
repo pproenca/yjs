@@ -4,6 +4,18 @@ import { ObservableV2 } from 'lib0/observable'
 
 import { createContentAttribute, createIdMap, createIdSet } from './ids.js'
 
+const objectDefineProperty = Object.defineProperty
+
+/** @param {any[]} values @param {any} value */
+const appendDense = (values, value) => {
+  objectDefineProperty(values, values.length, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true
+  })
+}
+
 /**
  * @typedef {{ revision: number, active: boolean }} RendererLifecycleSnapshot
  */
@@ -15,6 +27,35 @@ import { createContentAttribute, createIdMap, createIdSet } from './ids.js'
  * @type {WeakMap<object, Readonly<RendererLifecycleSnapshot>>}
  */
 const rendererLifecycles = new WeakMap()
+
+/**
+ * Renderer execution is a private projection capability, separate from the caller-visible renderer
+ * object. Reserved mutations retain this sealed adapter so later public property changes cannot
+ * alter targeting or fail after a write.
+ *
+ * @type {WeakMap<object, Readonly<AbstractRenderer>>}
+ */
+const rendererExecutionAdapters = new WeakMap()
+
+/**
+ * @param {object} renderer
+ * @param {AbstractRenderer} adapter
+ */
+export const registerRendererExecutionAdapter = (renderer, adapter) => {
+  error.assert(!rendererExecutionAdapters.has(renderer))
+  const sealed = Object.freeze({
+    hasItem: adapter.hasItem,
+    readContent: adapter.readContent,
+    contentLength: adapter.contentLength
+  })
+  rendererExecutionAdapters.set(renderer, /** @type {Readonly<AbstractRenderer>} */ (sealed))
+}
+
+/**
+ * @param {object} renderer
+ * @return {Readonly<AbstractRenderer>?}
+ */
+export const readRendererExecutionAdapter = renderer => rendererExecutionAdapters.get(renderer) ?? null
 
 /**
  * @param {object} renderer
@@ -137,7 +178,12 @@ const cloneRendererAttributionValue = value => {
           if (descriptor?.enumerable) {
             let item
             try { item = current[index] } catch {}
-            copied[index] = clone(item)
+            objectDefineProperty(copied, index, {
+              configurable: true,
+              enumerable: true,
+              value: clone(item),
+              writable: true
+            })
           }
         }
         return copied
@@ -176,14 +222,18 @@ export const cloneRendererIdMap = idmap => {
   /** @type {Map<ContentAttribute<any>, ContentAttribute<any>>} */
   const attributes = new Map()
   idmap.forEach((range, client) => {
-    clone.add(client, range.clock, range.len, range.attrs.map(attr => {
+    /** @type {Array<ContentAttribute<any>>} */
+    const clonedAttributes = []
+    for (let index = 0; index < range.attrs.length; index++) {
+      const attr = range.attrs[index]
       let cloned = attributes.get(attr)
       if (cloned === undefined) {
         cloned = cloneRendererContentAttribute(attr)
         attributes.set(attr, cloned)
       }
-      return cloned
-    }))
+      appendDense(clonedAttributes, cloned)
+    }
+    clone.add(client, range.clock, range.len, clonedAttributes)
   })
   return clone
 }

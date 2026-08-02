@@ -15,6 +15,14 @@ import {
 } from '../utils/transaction-helpers.js'
 
 const isDevMode = env.getVariable('node_env') === 'development'
+const objectCreate = Object.create
+const objectDefineProperty = Object.defineProperty
+const objectGetPrototypeOf = Object.getPrototypeOf
+const reflectApply = Reflect.apply
+/** @type {WeakSet<Item>} */
+const privateIntegrationItems = new WeakSet()
+/** @type {Map<object, (transaction:Transaction, item:Item) => void>} */
+const privateContentIntegrators = new Map()
 
 /**
  * @todo This should return several items
@@ -269,7 +277,13 @@ export class Item extends AbstractStruct {
       }
       addStructToIdSet(transaction.insertSet, this)
       transaction.doc.store.add(this)
-      this.content.integrate(transaction, this)
+      if (privateIntegrationItems.has(this)) {
+        const integrate = privateContentIntegrators.get(objectGetPrototypeOf(this.content))
+        if (integrate === undefined) error.unexpectedCase()
+        reflectApply(integrate, this.content, [transaction, this])
+      } else {
+        this.content.integrate(transaction, this)
+      }
       // add parent to transaction.changed
       addChangedTypeToTransaction(transaction, /** @type {YType} */ (this.parent), this.parentSub)
       if ((/** @type {YType} */ (this.parent)._item !== null && /** @type {YType} */ (this.parent)._item.deleted) || (this.parentSub !== null && this.right !== null)) {
@@ -1513,5 +1527,45 @@ export class ContentType {
    */
   getRef () {
     return 7
+  }
+}
+
+for (const Content of [ContentAny, ContentBinary, ContentDeleted, ContentDoc, ContentEmbed, ContentFormat, ContentJSON, ContentString, ContentType]) {
+  privateContentIntegrators.set(Content.prototype, Content.prototype.integrate)
+}
+
+const privateItemIntegrate = Item.prototype.integrate
+
+/**
+ * Construct the nested content owned by a reserved mutation without invoking inherited field
+ * setters. It remains a canonical ContentType for storage and encoding.
+ *
+ * @param {import('../ytype.js').YType} type
+ */
+export const createContentTypeCanonical = type => {
+  const content = /** @type {ContentType} */ (objectCreate(ContentType.prototype))
+  objectDefineProperty(content, 'type', {
+    configurable: true,
+    enumerable: true,
+    value: type,
+    writable: true
+  })
+  return content
+}
+
+/**
+ * Integrate an item through the module-captured Item/content kernels. Ordinary Item#integrate keeps
+ * its dynamic dispatch; only the reserved executor receives this capability.
+ *
+ * @param {Item} item
+ * @param {Transaction} transaction
+ * @param {number} offset
+ */
+export const integrateItemCanonical = (item, transaction, offset) => {
+  privateIntegrationItems.add(item)
+  try {
+    reflectApply(privateItemIntegrate, item, [transaction, offset])
+  } finally {
+    privateIntegrationItems.delete(item)
   }
 }

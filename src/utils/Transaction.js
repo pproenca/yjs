@@ -240,141 +240,156 @@ const cleanupTransactions = (transactionCleanups, i) => {
     const store = doc.store
     const ds = transaction.deleteSet
     const mergeStructs = transaction._mergeStructs
-    // insertIntoIdSet(store.ds, ds)
-    if (!transaction.insertSet.isEmpty() || !transaction.deleteSet.isEmpty()) {
-      bumpDocumentStructuralRevision(doc)
-    }
+    let cleanupFailed = false
+    let cleanupFailure
     try {
-      doc.emit('beforeObserverCalls', [transaction, doc])
-      /**
-       * An array of event callbacks.
-       *
-       * Each callback is called even if the other ones throw errors.
-       *
-       * @type {Array<function():void>}
-       */
-      const fs = []
-      // observe events on changed types. Deleted types are included: `callTypeObservers` tracks
-      // the event in `changedParentTypes` unconditionally (so changes inside a deleted type — e.g.
-      // a suggestion-deleted tombstone that a custom renderer still renders — bubble to live
-      // ancestors) and decides itself whether the type's own observers fire.
-      transaction.changed.forEach((subs, itemtype) =>
+      // insertIntoIdSet(store.ds, ds)
+      if (!transaction.insertSet.isEmpty() || !transaction.deleteSet.isEmpty()) {
+        bumpDocumentStructuralRevision(doc)
+      }
+      try {
+        doc.emit('beforeObserverCalls', [transaction, doc])
+        /**
+         * An array of event callbacks.
+         *
+         * Each callback is called even if the other ones throw errors.
+         *
+         * @type {Array<function():void>}
+         */
+        const fs = []
+        // observe events on changed types. Deleted types are included: `callTypeObservers` tracks
+        // the event in `changedParentTypes` unconditionally (so changes inside a deleted type — e.g.
+        // a suggestion-deleted tombstone that a custom renderer still renders — bubble to live
+        // ancestors) and decides itself whether the type's own observers fire.
+        transaction.changed.forEach((subs, itemtype) =>
+          fs.push(() => {
+            itemtype._callObserver(transaction, subs)
+          })
+        )
         fs.push(() => {
-          itemtype._callObserver(transaction, subs)
+          // deep observe events + the RDT `'delta'` channel. `changedParentTypes` holds the changed
+          // type AND all of its ancestors, so both `observeDeep` and `'delta'` bubble identically.
+          transaction.changedParentTypes.forEach((events, type) => {
+            // We need to think about the possibility that the user transforms the
+            // Y.Doc in the event.
+            // Deleted types are tracked (so changes inside them bubble to live ancestors) but fire
+            // only while something still renders them — i.e. they have a renderer attached.
+            if (type._item !== null && type._item.deleted && type._renderer === null) return
+            const hasDeep = type._dEH.l.length > 0
+            const hasDeltaListeners = (type._observers.get('delta')?.size ?? 0) > 0
+            const maintaining = type._delta !== null
+            if (!hasDeep && !hasDeltaListeners && !maintaining) return
+            /**
+             * @type {YEvent<any>}
+             */
+            const deepEventHandler = events.find(event => event.target === type) || new YEvent(type, transaction, new Set(null))
+            if (hasDeep) {
+              callEventHandlerListeners(type._dEH, deepEventHandler, transaction)
+            }
+            if (hasDeltaListeners || maintaining) {
+              // the type-rooted deep delta of this transaction (a nested `modify` chain for ancestors)
+              const change = /** @type {any} */ (deepEventHandler.getDelta({ renderer: type._renderer, deep: true }).done())
+              // a base-renderer type doesn't render deleted content, so a change that happened
+              // entirely inside a deleted subtree renders to an empty delta — don't emit those no-ops
+              if (!change.isEmpty()) {
+                type._delta?.apply(change) // keep the cache current (incl. ancestors and diff-renderer attributions)
+                if (hasDeltaListeners) type.emit('delta', [change, transaction.origin])
+              }
+            }
+          })
         })
-      )
-      fs.push(() => {
-        // deep observe events + the RDT `'delta'` channel. `changedParentTypes` holds the changed
-        // type AND all of its ancestors, so both `observeDeep` and `'delta'` bubble identically.
-        transaction.changedParentTypes.forEach((events, type) => {
-          // We need to think about the possibility that the user transforms the
-          // Y.Doc in the event.
-          // Deleted types are tracked (so changes inside them bubble to live ancestors) but fire
-          // only while something still renders them — i.e. they have a renderer attached.
-          if (type._item !== null && type._item.deleted && type._renderer === null) return
-          const hasDeep = type._dEH.l.length > 0
-          const hasDeltaListeners = (type._observers.get('delta')?.size ?? 0) > 0
-          const maintaining = type._delta !== null
-          if (!hasDeep && !hasDeltaListeners && !maintaining) return
-          /**
-           * @type {YEvent<any>}
-           */
-          const deepEventHandler = events.find(event => event.target === type) || new YEvent(type, transaction, new Set(null))
-          if (hasDeep) {
-            callEventHandlerListeners(type._dEH, deepEventHandler, transaction)
+        fs.push(() => doc.emit('afterTransaction', [transaction, doc]))
+        callAll(fs, [])
+        if (transaction._needFormattingCleanup && doc.cleanupFormatting) {
+          cleanupYTextAfterTransaction(transaction)
+        }
+      } finally {
+        // Replace deleted items with ItemDeleted / GC.
+        // This is where content is actually remove from the Yjs Doc.
+        if (doc.gc) {
+          tryGcDeleteSet(transaction, ds, doc.gcFilter)
+        }
+        tryMerge(ds, store)
+
+        // on all affected store.clients props, try to merge
+        transaction.insertSet.clients.forEach((ids, client) => {
+          const firstClock = ids.getIds()[0].clock
+          const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
+          // we iterate from right to left so we can safely remove entries
+          const firstChangePos = math.max(findIndexSS(structs, firstClock), 1)
+          for (let i = structs.length - 1; i >= firstChangePos;) {
+            i -= 1 + tryToMergeWithLefts(structs, i)
           }
-          if (hasDeltaListeners || maintaining) {
-            // the type-rooted deep delta of this transaction (a nested `modify` chain for ancestors)
-            const change = /** @type {any} */ (deepEventHandler.getDelta({ renderer: type._renderer, deep: true }).done())
-            // a base-renderer type doesn't render deleted content, so a change that happened
-            // entirely inside a deleted subtree renders to an empty delta — don't emit those no-ops
-            if (!change.isEmpty()) {
-              type._delta?.apply(change) // keep the cache current (incl. ancestors and diff-renderer attributions)
-              if (hasDeltaListeners) type.emit('delta', [change, transaction.origin])
+        })
+        // try to merge mergeStructs
+        // @todo: it makes more sense to transform mergeStructs to a DS, sort it, and merge from right to left
+        //        but at the moment DS does not handle duplicates
+        for (let i = mergeStructs.length - 1; i >= 0; i--) {
+          const { client, clock } = mergeStructs[i].id
+          const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
+          const replacedStructPos = findIndexSS(structs, clock)
+          if (replacedStructPos + 1 < structs.length) {
+            if (tryToMergeWithLefts(structs, replacedStructPos + 1) > 1) {
+              continue // no need to perform next check, both are already merged
             }
           }
-        })
-      })
-      fs.push(() => doc.emit('afterTransaction', [transaction, doc]))
-      callAll(fs, [])
-      if (transaction._needFormattingCleanup && doc.cleanupFormatting) {
-        cleanupYTextAfterTransaction(transaction)
-      }
-    } finally {
-      // Replace deleted items with ItemDeleted / GC.
-      // This is where content is actually remove from the Yjs Doc.
-      if (doc.gc) {
-        tryGcDeleteSet(transaction, ds, doc.gcFilter)
-      }
-      tryMerge(ds, store)
-
-      // on all affected store.clients props, try to merge
-      transaction.insertSet.clients.forEach((ids, client) => {
-        const firstClock = ids.getIds()[0].clock
-        const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
-        // we iterate from right to left so we can safely remove entries
-        const firstChangePos = math.max(findIndexSS(structs, firstClock), 1)
-        for (let i = structs.length - 1; i >= firstChangePos;) {
-          i -= 1 + tryToMergeWithLefts(structs, i)
-        }
-      })
-      // try to merge mergeStructs
-      // @todo: it makes more sense to transform mergeStructs to a DS, sort it, and merge from right to left
-      //        but at the moment DS does not handle duplicates
-      for (let i = mergeStructs.length - 1; i >= 0; i--) {
-        const { client, clock } = mergeStructs[i].id
-        const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
-        const replacedStructPos = findIndexSS(structs, clock)
-        if (replacedStructPos + 1 < structs.length) {
-          if (tryToMergeWithLefts(structs, replacedStructPos + 1) > 1) {
-            continue // no need to perform next check, both are already merged
+          if (replacedStructPos > 0) {
+            tryToMergeWithLefts(structs, replacedStructPos)
           }
         }
-        if (replacedStructPos > 0) {
-          tryToMergeWithLefts(structs, replacedStructPos)
+        if (!transaction.local && transaction.insertSet.clients.has(doc.clientID)) {
+          logging.print(logging.ORANGE, logging.BOLD, '[yjs] ', logging.UNBOLD, logging.RED, 'Changed the client-id because another client seems to be using it.')
+          doc.clientID = generateNewClientId()
         }
-      }
-      if (!transaction.local && transaction.insertSet.clients.has(doc.clientID)) {
-        logging.print(logging.ORANGE, logging.BOLD, '[yjs] ', logging.UNBOLD, logging.RED, 'Changed the client-id because another client seems to be using it.')
-        doc.clientID = generateNewClientId()
-      }
-      // @todo Merge all the transactions into one and provide send the data as a single update message
-      doc.emit('afterTransactionCleanup', [transaction, doc])
-      if (doc._observers.has('update')) {
-        const encoder = new UpdateEncoderV1()
-        const hasContent = writeUpdateMessageFromTransaction(encoder, transaction)
-        if (hasContent) {
-          doc.emit('update', [encoder.toUint8Array(), transaction.origin, doc, transaction])
-        }
-      }
-      if (doc._observers.has('updateV2')) {
-        const encoder = new UpdateEncoderV2()
-        const hasContent = writeUpdateMessageFromTransaction(encoder, transaction)
-        if (hasContent) {
-          doc.emit('updateV2', [encoder.toUint8Array(), transaction.origin, doc, transaction])
-        }
-      }
-      const { subdocsAdded, subdocsLoaded, subdocsRemoved } = transaction
-      if (subdocsAdded.size > 0 || subdocsRemoved.size > 0 || subdocsLoaded.size > 0) {
-        subdocsAdded.forEach(subdoc => {
-          subdoc.clientID = doc.clientID
-          if (subdoc.collectionid == null) {
-            subdoc.collectionid = doc.collectionid
+        // @todo Merge all the transactions into one and provide send the data as a single update message
+        doc.emit('afterTransactionCleanup', [transaction, doc])
+        if (doc._observers.has('update')) {
+          const encoder = new UpdateEncoderV1()
+          const hasContent = writeUpdateMessageFromTransaction(encoder, transaction)
+          if (hasContent) {
+            doc.emit('update', [encoder.toUint8Array(), transaction.origin, doc, transaction])
           }
-          doc.subdocs.add(subdoc)
-        })
-        subdocsRemoved.forEach(subdoc => doc.subdocs.delete(subdoc))
-        doc.emit('subdocs', [{ loaded: subdocsLoaded, added: subdocsAdded, removed: subdocsRemoved }, doc, transaction])
-        subdocsRemoved.forEach(subdoc => subdoc.destroy())
+        }
+        if (doc._observers.has('updateV2')) {
+          const encoder = new UpdateEncoderV2()
+          const hasContent = writeUpdateMessageFromTransaction(encoder, transaction)
+          if (hasContent) {
+            doc.emit('updateV2', [encoder.toUint8Array(), transaction.origin, doc, transaction])
+          }
+        }
+        const { subdocsAdded, subdocsLoaded, subdocsRemoved } = transaction
+        if (subdocsAdded.size > 0 || subdocsRemoved.size > 0 || subdocsLoaded.size > 0) {
+          subdocsAdded.forEach(subdoc => {
+            subdoc.clientID = doc.clientID
+            if (subdoc.collectionid == null) {
+              subdoc.collectionid = doc.collectionid
+            }
+            doc.subdocs.add(subdoc)
+          })
+          subdocsRemoved.forEach(subdoc => doc.subdocs.delete(subdoc))
+          doc.emit('subdocs', [{ loaded: subdocsLoaded, added: subdocsAdded, removed: subdocsRemoved }, doc, transaction])
+          subdocsRemoved.forEach(subdoc => subdoc.destroy())
+        }
       }
-
+    } catch (error) {
+      cleanupFailed = true
+      cleanupFailure = error
+    }
+    let continuationFailed = false
+    let continuationFailure
+    try {
       if (transactionCleanups.length <= i + 1) {
         doc._transactionCleanups = []
         doc.emit('afterAllTransactions', [doc, transactionCleanups])
       } else {
         cleanupTransactions(transactionCleanups, i + 1)
       }
+    } catch (error) {
+      continuationFailed = true
+      continuationFailure = error
     }
+    if (cleanupFailed) throw cleanupFailure
+    if (continuationFailed) throw continuationFailure
   }
 }
 
