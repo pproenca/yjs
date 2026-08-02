@@ -1586,33 +1586,77 @@ export const testReservedDeltaMutationOrdinaryParity = () => {
   const reserved = createState()
   const origin = { parity: true }
   /** @type {Uint8Array[]} */
-  const ordinaryUpdates = []
+  const ordinaryUpdatesV1 = []
   /** @type {Uint8Array[]} */
-  const reservedUpdates = []
+  const reservedUpdatesV1 = []
+  /** @type {Uint8Array[]} */
+  const ordinaryUpdatesV2 = []
+  /** @type {Uint8Array[]} */
+  const reservedUpdatesV2 = []
   /** @type {any[]} */
-  const ordinaryOrigins = []
+  const ordinaryOriginsV1 = []
   /** @type {any[]} */
-  const reservedOrigins = []
-  let ordinaryEvents = 0
-  let reservedEvents = 0
+  const reservedOriginsV1 = []
+  /** @type {any[]} */
+  const ordinaryOriginsV2 = []
+  /** @type {any[]} */
+  const reservedOriginsV2 = []
+  /** @type {any[]} */
+  const ordinaryEvents = []
+  /** @type {any[]} */
+  const reservedEvents = []
+  /** @type {any[]} */
+  const ordinaryEventOrigins = []
+  /** @type {any[]} */
+  const reservedEventOrigins = []
   ordinary.doc.on('update', (update, observedOrigin) => {
-    ordinaryUpdates.push(update)
-    ordinaryOrigins.push(observedOrigin)
+    ordinaryUpdatesV1.push(update)
+    ordinaryOriginsV1.push(observedOrigin)
   })
   reserved.doc.on('update', (update, observedOrigin) => {
-    reservedUpdates.push(update)
-    reservedOrigins.push(observedOrigin)
+    reservedUpdatesV1.push(update)
+    reservedOriginsV1.push(observedOrigin)
   })
-  ordinary.type.observe(() => { ordinaryEvents++ })
-  reserved.type.observe(() => { reservedEvents++ })
+  ordinary.doc.on('updateV2', (update, observedOrigin) => {
+    ordinaryUpdatesV2.push(update)
+    ordinaryOriginsV2.push(observedOrigin)
+  })
+  reserved.doc.on('updateV2', (update, observedOrigin) => {
+    reservedUpdatesV2.push(update)
+    reservedOriginsV2.push(observedOrigin)
+  })
+  ordinary.type.observe(event => {
+    ordinaryEvents.push({
+      childListChanged: /** @type {any} */ (event).childListChanged,
+      delta: event.delta.toJSON(),
+      deltaDeep: event.deltaDeep.toJSON(),
+      keysChanged: Array.from(event.keysChanged)
+    })
+    ordinaryEventOrigins.push(event.transaction.origin)
+  })
+  reserved.type.observe(event => {
+    reservedEvents.push({
+      childListChanged: /** @type {any} */ (event).childListChanged,
+      delta: event.delta.toJSON(),
+      deltaDeep: event.deltaDeep.toJSON(),
+      keysChanged: Array.from(event.keysChanged)
+    })
+    reservedEventOrigins.push(event.transaction.origin)
+  })
   const ordinaryFix = ordinary.type.applyDelta(createMutation(), origin)
   const prepared = reserved.type.reserveDeltaMutation(createMutation(), origin)
   const reservedFix = prepared.apply()
   t.assert(ordinaryFix === null && reservedFix === null)
-  t.assert(ordinaryUpdates.length === 1 && reservedUpdates.length === 1)
-  t.compare(Array.from(ordinaryUpdates[0]), Array.from(reservedUpdates[0]))
+  t.assert(ordinaryUpdatesV1.length === 1 && reservedUpdatesV1.length === 1)
+  t.assert(ordinaryUpdatesV2.length === 1 && reservedUpdatesV2.length === 1)
+  t.compare(Array.from(ordinaryUpdatesV1[0]), Array.from(reservedUpdatesV1[0]))
+  t.compare(Array.from(ordinaryUpdatesV2[0]), Array.from(reservedUpdatesV2[0]))
   t.compare(Array.from(Y.encodeStateAsUpdate(ordinary.doc)), Array.from(Y.encodeStateAsUpdate(reserved.doc)))
-  t.assert(ordinaryOrigins[0] === origin && reservedOrigins[0] === origin)
-  t.assert(ordinaryEvents === 1 && reservedEvents === 1)
+  t.compare(Array.from(Y.encodeStateAsUpdateV2(ordinary.doc)), Array.from(Y.encodeStateAsUpdateV2(reserved.doc)))
+  t.compare(Array.from(Y.encodeStateVector(ordinary.doc)), Array.from(Y.encodeStateVector(reserved.doc)))
+  t.assert(ordinaryOriginsV1[0] === origin && reservedOriginsV1[0] === origin)
+  t.assert(ordinaryOriginsV2[0] === origin && reservedOriginsV2[0] === origin)
+  t.assert(ordinaryEventOrigins[0] === origin && reservedEventOrigins[0] === origin)
+  t.compare(ordinaryEvents, reservedEvents)
   t.compare(ordinary.type.toDeltaDeep().toJSON(), reserved.type.toDeltaDeep().toJSON())
 }
