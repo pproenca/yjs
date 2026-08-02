@@ -480,7 +480,6 @@ export const testSparseCausalHoleVirtualAnchorConvergenceMatrix = () => {
         const reloaded = new Y.Doc({ gc: false })
         enc.applyUpdate(reloaded, enc.encodeStateAsUpdate(target))
         t.assert(reloaded.get('text').toString() === expectedSparse, `${enc.description} ${anchorSide} reload preserves virtual placement`)
-        t.assert(reloaded.store.getCausalHoleConsumers(fixture.sourceClient, 0, 1).length === 1, `${enc.description} ${anchorSide} reload rebuilds the consumer index`)
         enc.applyUpdate(reloaded, enc.convert(fixture.sourceUpdates[0]))
 
         t.assert(reloaded.get('text').toString() === expected, `${enc.description} ${anchorSide} replacement converges`)
@@ -517,7 +516,6 @@ export const testSparseCausalHoleInteriorConsumerConvergenceMatrix = () => {
     const reloaded = new Y.Doc({ gc: false })
     enc.applyUpdate(reloaded, enc.encodeStateAsUpdate(sparseDoc))
     t.assert(reloaded.get('text').toString() === 'alkmC')
-    t.assert(reloaded.store.getCausalHoleConsumers(2, 0, 2).length === 4, `${enc.description} reload rebuilds interior consumers`)
     enc.applyUpdate(reloaded, source)
 
     t.assert(reloaded.get('text').toString() === 'aAlkBmC', `${enc.description} unsplit replacement converges`)

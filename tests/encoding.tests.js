@@ -278,6 +278,136 @@ export const testCausalHoleReplacementMetadataFailsWholeUpdateAtomically = () =>
   })
 }
 
+export const testCausalHoleMergedExtensionReplay = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, merge: Y.mergeUpdates, decode: Y.decodeUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, merge: Y.mergeUpdatesV2, decode: Y.decodeUpdateV2, encode: Y.encodeStateAsUpdateV2, event: 'updateV2' }
+  ].forEach(({ Encoder, apply, merge, decode, encode, event }) => {
+    const first = encodeCausalHoles([
+      new CausalHole(Y.createID(2, 0), 1, Y.createID(1, 0), null, 'text', null)
+    ], Encoder)
+    const second = encodeCausalHoles([
+      new CausalHole(Y.createID(2, 1), 1, Y.createID(2, 0), null, 'text', null)
+    ], Encoder)
+    const unrelated = encodeStructs([
+      new Y.Item(Y.createID(9, 0), null, null, null, null, 'other', null, new Y.ContentString('u'))
+    ], Encoder)
+    const merged = merge([first, second, unrelated])
+    const mergedHole = decode(merged).structs.find(struct => struct.constructor === CausalHole)
+    t.assert(mergedHole?.id.client === 2 && mergedHole.id.clock === 0 && mergedHole.length === 2)
+
+    const target = createCausalHoleBase()
+    apply(target, first)
+    let updates = 0
+    target.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+    apply(target, merged)
+    t.assert(target.store.causalHoles.has(2, 0) && target.store.causalHoles.has(2, 1))
+    t.assert(target.store.pendingStructs === null && target.store.pendingDs === null)
+    t.assert(target.get('other').toString() === 'u' && updates === 1)
+
+    const replay = createCausalHoleBase()
+    apply(replay, encode(target))
+    t.assert(replay.store.causalHoles.has(2, 0) && replay.store.causalHoles.has(2, 1))
+    t.assert(replay.get('other').toString() === 'u')
+  })
+}
+
+export const testCausalHoleTransitivePeerGeometry = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2 }
+  ].forEach(({ Encoder, apply, encode }) => {
+    const x = new Y.Item(Y.createID(2, 0), null, Y.createID(1, 0), null, null, null, null, new Y.ContentString('X'))
+    const p = new Y.Item(Y.createID(3, 0), null, null, null, null, 'text', null, new Y.ContentString('P'))
+    const s = new Y.Item(Y.createID(4, 0), null, Y.createID(2, 0), null, null, null, null, new Y.ContentString('S'))
+    const source = encodeStructs([x], Encoder)
+
+    const canonical = createCausalHoleBase()
+    apply(canonical, encodeStructGroups([[x], [p], [s]], Encoder))
+    t.assert(canonical.get('text').toString() === 'aXSP')
+
+    const sparse = createCausalHoleBase()
+    apply(sparse, encodeStructGroups([
+      [new CausalHole(Y.createID(2, 0), 1, Y.createID(1, 0), null, 'text', null)],
+      [p],
+      [s]
+    ], Encoder))
+    t.assert(sparse.get('text').toString() === 'aSP', `${Encoder.name} transitive peers use virtual bounds`)
+    apply(sparse, source)
+    t.assert(sparse.get('text').toString() === 'aXSP' && sparse.store.causalHoles.isEmpty())
+    t.assert(sparse.store.pendingStructs === null && sparse.store.pendingDs === null)
+
+    const canonicalSnapshot = encode(canonical)
+    const sparseSnapshot = encode(sparse)
+    apply(canonical, sparseSnapshot)
+    apply(sparse, canonicalSnapshot)
+    t.assert(canonical.get('text').toString() === 'aXSP' && sparse.get('text').toString() === 'aXSP')
+  })
+}
+
+export const testCausalHoleSameClientCanonicalOrdering = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2 }
+  ].forEach(({ Encoder, apply, encode }) => {
+    const sourceItem = new Y.Item(
+      Y.createID(2, 0), null, Y.createID(1, 0), null, null, null, null, new Y.ContentString('H')
+    )
+    const peers = [
+      new Y.Item(Y.createID(3, 0), null, Y.createID(2, 0), null, null, null, null, new Y.ContentString('x')),
+      new Y.Item(Y.createID(3, 1), null, Y.createID(2, 0), null, null, null, null, new Y.ContentString('y'))
+    ]
+    const source = encodeStructs([sourceItem], Encoder)
+    const canonical = createCausalHoleBase()
+    apply(canonical, encodeStructGroups([[sourceItem], peers], Encoder))
+    t.assert(canonical.get('text').toString() === 'aHyx')
+
+    const sparse = createCausalHoleBase()
+    apply(sparse, encodeStructGroups([
+      [new CausalHole(Y.createID(2, 0), 1, Y.createID(1, 0), null, 'text', null)],
+      peers
+    ], Encoder))
+    t.assert(sparse.get('text').toString() === 'ayx', `${Encoder.name} shadow preserves ascending client stream`)
+    apply(sparse, source)
+    t.assert(sparse.get('text').toString() === 'aHyx' && sparse.store.causalHoles.isEmpty())
+    t.assert(sparse.store.pendingStructs === null && sparse.store.pendingDs === null)
+
+    const canonicalSnapshot = encode(canonical)
+    const sparseSnapshot = encode(sparse)
+    apply(canonical, sparseSnapshot)
+    apply(sparse, canonicalSnapshot)
+    t.assert(canonical.get('text').toString() === 'aHyx' && sparse.get('text').toString() === 'aHyx')
+  })
+}
+
+export const testCausalHoleForgedDuplicateParentFailsAtomically = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, event: 'updateV2' }
+  ].forEach(({ Encoder, apply, encode, event }) => {
+    const forgedParent = new Y.Item(
+      Y.createID(1, 0), null, null, null, null, 'fake', null, new Y.ContentType(new Y.Type())
+    )
+    const hole = new CausalHole(Y.createID(2, 0), 1, null, null, Y.createID(1, 0), null)
+    const bundled = encodeStructGroups([[forgedParent], [hole]], Encoder)
+    const target = createCausalHoleBase()
+    const before = encode(target)
+    const clients = new Map(target.store.clients)
+    let updates = 0
+    target.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+
+    t.fails(() => apply(target, bundled))
+    t.compareArrays(Array.from(encode(target)), Array.from(before))
+    t.assert([...clients].every(([client, structs]) => target.store.clients.get(client) === structs))
+    t.assert(!target.store.causalHoles.has(2, 0) && !target.store.clients.has(2))
+    t.assert(target.store.pendingStructs === null && target.store.pendingDs === null && updates === 0)
+
+    const replay = new Y.Doc({ gc: false })
+    apply(replay, encode(target))
+    t.assert(replay.get('text').toString() === 'a' && replay.store.causalHoles.isEmpty())
+  })
+}
+
 export const testCausalHoleLongChainValidation = () => {
   const length = 10000
   ;[
@@ -335,10 +465,6 @@ export const testCausalHoleMultilevelConsumersReloadAndSplit = () => {
     apply(sparseDoc, sparse)
     const reloaded = createCausalHoleBase()
     apply(reloaded, encode(sparseDoc))
-    t.assert(reloaded.store.getCausalHoleConsumers(2, 0, 4).length === 3, `${Encoder.name} reload indexes every source edge`)
-    t.assert(reloaded.store.getCausalHoleConsumers(3, 0, 1).length === 1, `${Encoder.name} reload indexes hole-to-hole consumers`)
-    t.assert(reloaded.store.getCausalHoleConsumers(4, 0, 1).length === 1, `${Encoder.name} reload indexes the terminal consumer`)
-    t.compare(reloaded.store.getCausalHoleConsumerBoundaries(2, 0, 4), [1, 2])
 
     apply(reloaded, source)
     ;[level1, level2].forEach(update => apply(reloaded, update))
@@ -394,6 +520,77 @@ export const testCausalHoleSameAnchorRemoteScaling = () => {
   })
 }
 
+export const testCausalHoleSameClientBoundaryScaling = () => {
+  const timingSizes = [8000, 16000, 32000]
+  const workSizes = [500, 1000, 2000]
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, apply }) => {
+    /** @param {number} size */
+    const createUpdate = size => encodeStructGroups([
+      [new CausalHole(Y.createID(2, 0), 1, Y.createID(1, 0), null, 'text', null)],
+      Array.from({ length: size }, (_, clock) => new Y.Item(
+        Y.createID(3, clock),
+        null,
+        clock === 0 ? Y.createID(2, 0) : Y.createID(3, clock - 1),
+        null,
+        null,
+        null,
+        null,
+        new Y.ContentString('x')
+      ))
+    ], Encoder)
+    /** @param {Uint8Array<ArrayBuffer>} update */
+    const countSetIterations = update => {
+      const original = Set.prototype[Symbol.iterator]
+      let iterations = 0
+      // Count structural Set iteration without exposing a production test hook.
+      // eslint-disable-next-line no-extend-native
+      Set.prototype[Symbol.iterator] = function () {
+        const iterator = original.call(this)
+        return {
+          next: () => {
+            const result = iterator.next()
+            if (!result.done) iterations++
+            return result
+          },
+          [Symbol.iterator] () { return this }
+        }
+      }
+      try {
+        apply(createCausalHoleBase(), update)
+      } finally {
+        // eslint-disable-next-line no-extend-native
+        Set.prototype[Symbol.iterator] = original
+      }
+      return iterations
+    }
+
+    const work = workSizes.map(size => countSetIterations(createUpdate(size)))
+    const workRatio = work[2] / work[1]
+    t.assert(work.every((count, index) => count < workSizes[index] * 6), `${Encoder.name} boundary work stays linear: ${work.join(',')}`)
+    t.assert(workRatio < 3.25, `${Encoder.name} boundary work is nonquadratic: ${work.join(',')} (${workRatio.toFixed(2)}x)`)
+    const updates = timingSizes.map(createUpdate)
+    apply(createCausalHoleBase(), createUpdate(100))
+    const times = updates.map(update => {
+      const samples = []
+      for (let repetition = 0; repetition < 3; repetition++) {
+        const doc = createCausalHoleBase()
+        const started = performance.now()
+        apply(doc, update)
+        samples.push(performance.now() - started)
+      }
+      return samples.sort((left, right) => left - right)[1]
+    })
+    const ratio8To16 = times[1] / times[0]
+    const ratio16To32 = times[2] / times[1]
+    t.assert(ratio8To16 < 3.25, `${Encoder.name} 8k→16k ratio ${ratio8To16.toFixed(2)} is nonquadratic`)
+    t.assert(ratio16To32 < 3.25, `${Encoder.name} 16k→32k ratio ${ratio16To32.toFixed(2)} is nonquadratic`)
+    t.assert(times[2] < 2000, `${Encoder.name} 32k-item apply stays under 2s (${times[2].toFixed(1)}ms)`)
+  })
+}
+
 export const testCausalHoleNestedParentGcFinalizationMatrix = () => {
   ;[
     { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate },
@@ -433,7 +630,6 @@ export const testCausalHoleNestedParentGcFinalizationMatrix = () => {
 
       if (gc) {
         t.assert(doc.store.causalHoles.isEmpty() && doc.store.causalHolesByParent.size === 0, `${Encoder.name} gc retires nested holes`)
-        t.assert(doc.store.causalHoleConsumers.size === 0 && doc.store.causalHoleConsumerAnchors.size === 0, `${Encoder.name} gc retires hole consumers`)
         t.assert(doc.store.getStruct(Y.createID(2, 0))?.constructor === Y.GC, `${Encoder.name} retired coverage becomes GC`)
         t.assert(doc.store.getStruct(Y.createID(4, 0))?.constructor === Y.GC, `${Encoder.name} ContentDeleted parent retires its holes`)
       } else {

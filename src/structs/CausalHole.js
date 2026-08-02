@@ -108,12 +108,6 @@ export class CausalHole {
       this.origin = sliced.origin
     }
     const store = transaction.doc.store
-    if (this.origin !== null && store.getCausalHole(this.origin) !== null) {
-      store.addCausalHoleConsumer(this.origin, this, 'origin')
-    }
-    if (this.rightOrigin !== null && store.getCausalHole(this.rightOrigin) !== null) {
-      store.addCausalHoleConsumer(this.rightOrigin, this, 'rightOrigin')
-    }
     store.installCausalHole(this)
   }
 
