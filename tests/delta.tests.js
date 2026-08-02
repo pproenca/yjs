@@ -235,6 +235,17 @@ const assertReservedContent = (content, reservation) => {
   t.assert(Object.isFrozen(content) && Object.isFrozen(content.inserts) && Object.isFrozen(content.deletes))
 }
 
+/** @param {delta.DeltaBuilder<any>} mutation */
+const appendUnsupportedChild = mutation => {
+  const children = /** @type {any} */ (mutation.children)
+  const unsupported = { clone: () => unsupported, next: null, prev: children.end }
+  children.end.next = unsupported
+  children.end = unsupported
+  children.len++
+  mutation.childCnt++
+  return mutation
+}
+
 export const testReservedDeltaMutationAtomicCapture = () => {
   const doc = new Y.Doc()
   doc.clientID = 11
@@ -409,6 +420,75 @@ export const testReservedDeltaMutationAdmissionFailures = () => {
   const unsafe = delta.create().insert('must not partially apply').setAttr('cyclic', cyclic)
   assertNamedFailure(() => type.reserveDeltaMutation(unsafe), 'DeltaMutationPreparationError')
   t.assert(updates === 0 && type.toString() === '' && type.getAttr('cyclic') === undefined, 'cyclic payload fails before any executor write')
+  const lyingEmpty = delta.create()
+  Object.defineProperty(lyingEmpty, 'isEmpty', { value: () => false })
+  assertNamedFailure(() => type.reserveDeltaMutation(lyingEmpty), 'DeltaMutationPreparationError')
+  t.assert(updates === 0 && type.toDeltaDeep().isEmpty(), 'owned emptiness cannot be bypassed by mutable dispatch')
+
+  const unsupportedChild = appendUnsupportedChild(delta.create().insert('must not partially apply'))
+  assertNamedFailure(() => type.reserveDeltaMutation(unsupportedChild), 'DeltaMutationPreparationError')
+  const unsupportedNested = appendUnsupportedChild(delta.create().insert('nested partial write'))
+  const nestedMutation = /** @type {delta.DeltaBuilder<any>} */ (delta.create())
+  nestedMutation.insert('outer partial write').insert([unsupportedNested])
+  assertNamedFailure(
+    () => type.reserveDeltaMutation(nestedMutation),
+    'DeltaMutationPreparationError'
+  )
+  const unsupportedAttr = delta.create().insert('must not partially apply')
+  Object.defineProperty(unsupportedAttr.attrs, 'forged', { enumerable: true, value: { key: 'forged' } })
+  assertNamedFailure(() => type.reserveDeltaMutation(unsupportedAttr), 'DeltaMutationPreparationError')
+
+  const foreignDoc = new Y.Doc()
+  const integrated = foreignDoc.get('integrated')
+  const integratedIdentity = delta.create().insert('must not partially apply').insert([integrated])
+  assertNamedFailure(() => type.reserveDeltaMutation(integratedIdentity), 'DeltaMutationPreparationError')
+  const preliminary = new Y.Type('preliminary')
+  const repeatedIdentity = /** @type {delta.DeltaBuilder<any>} */ (delta.create())
+  repeatedIdentity.insert('must not partially apply').insert(/** @type {any[]} */ ([preliminary, preliminary]))
+  assertNamedFailure(
+    () => type.reserveDeltaMutation(repeatedIdentity),
+    'DeltaMutationPreparationError'
+  )
+  const embeddedDocument = /** @type {delta.DeltaBuilder<any>} */ (delta.create())
+  embeddedDocument.insert('must not partially apply').insert(/** @type {any[]} */ ([new Y.Doc()]))
+  assertNamedFailure(
+    () => type.reserveDeltaMutation(embeddedDocument),
+    'DeltaMutationPreparationError'
+  )
+  const unsupportedAttribute = /** @type {delta.DeltaBuilder<any>} */ (delta.create())
+  unsupportedAttribute.insert('must not partially apply').setAttr('unsupported', /** @type {any} */ (new Map()))
+  assertNamedFailure(
+    () => type.reserveDeltaMutation(unsupportedAttribute),
+    'DeltaMutationPreparationError'
+  )
+  t.assert(updates === 0 && type.toDeltaDeep().isEmpty(), 'all malformed and unsafe identities fail before executor writes')
+
+  const sourceChild = new Y.Type('p')
+  sourceChild.applyDelta(delta.create().insert('owned child').done())
+  assertNamedFailure(
+    () => type.reserveDeltaMutation(delta.create().insert(/** @type {any[]} */ ([sourceChild])).done()),
+    'DeltaMutationPreparationError'
+  )
+  t.assert(updates === 0 && type.toDeltaDeep().isEmpty(), 'raw preliminary identities are rejected without writes')
+  const nestedSource = delta.create('p').insert('owned child')
+  const nestedSyntax = /** @type {delta.DeltaBuilder<any>} */ (delta.create())
+  nestedSyntax.insert(/** @type {any[]} */ ([nestedSource]))
+  const ownedNested = type.reserveDeltaMutation(nestedSyntax)
+  nestedSource.insert('later source mutation')
+  ownedNested.apply()
+  t.assert(/** @type {Y.Type} */ (type.get(0)).toString() === '<p>owned child</p>', 'nested delta syntax is privately owned')
+  type.applyDelta(delta.create().delete(1).done())
+  updates = 0
+
+  const tombstoneDoc = new Y.Doc({ gc: false })
+  const tombstoneType = tombstoneDoc.get('content')
+  tombstoneType.setAttr('gone', new Y.Type())
+  tombstoneType.deleteAttr('gone')
+  let tombstoneUpdates = 0
+  tombstoneDoc.on('update', () => { tombstoneUpdates++ })
+  const invisibleModify = delta.create().insert('must not partially apply').modifyAttr('gone', delta.create().insert('x'))
+  assertNamedFailure(() => tombstoneType.reserveDeltaMutation(invisibleModify), 'DeltaMutationPreparationError')
+  t.assert(tombstoneUpdates === 0 && tombstoneType.toDeltaDeep().children.len === 0, 'invisible modifyAttr tombstones fail before executor writes')
 
   const malicious = delta.create().insert('reserved')
   Object.defineProperty(malicious, 'isEmpty', {

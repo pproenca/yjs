@@ -259,6 +259,8 @@ const scanDeltaMutation = (type, mutation, renderer, scan) => {
       if (formatting) scan.allocates = true
       advanceStructuralCursor(cursor, 1, renderer, scan, false, formatting)
       if (formatting) collectTrailingFormatHazards(cursor, renderer, scan)
+    } else {
+      throw new DeltaMutationPreparationError('Delta contains an unsupported child operation')
     }
   }
   for (const op of mutation.attrs) {
@@ -274,11 +276,17 @@ const scanDeltaMutation = (type, mutation, renderer, scan) => {
         scan.deletes.add(item.id.client, item.id.clock, item.length)
         addDeletedTypeContents(item, scan)
       }
-    } else {
-      if (item === undefined || item.content.constructor !== ContentType) {
+    } else if (delta.$modifyAttrOp.check(op)) {
+      if (
+        item === undefined ||
+        item.content.constructor !== ContentType ||
+        (item.deleted && rendererContentLength(renderer, item) === 0)
+      ) {
         throw new DeltaMutationPreparationError('Delta modifyAttr target is not a structural child type')
       }
       scanDeltaMutation(/** @type {ContentType} */ (item.content).type, op.value, renderer, scan)
+    } else {
+      throw new DeltaMutationPreparationError('Delta contains an unsupported attribute operation')
     }
   }
 }
@@ -405,34 +413,122 @@ class PreparedDeltaMutationCapability {
   }
 }
 
+/** @param {any} value */
+const assertPositiveLength = value => {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new DeltaMutationPreparationError('Delta contains an invalid operation length')
+  }
+}
+
 /**
- * Detach all mutable values the canonical interpreter can consume while preserving embedded Yjs
- * types/documents as identity-bearing integration inputs.
+ * Validate the original op graph before `cloneDeep`, whose fallback branches assume every op is
+ * canonical and would otherwise turn a forged attribute op into a delete.
+ *
+ * @param {delta.DeltaAny} mutation
+ */
+const validateDeltaMutation = mutation => {
+  /** @type {Set<delta.DeltaAny>} */
+  const validating = new Set()
+  /** @type {Set<delta.DeltaAny>} */
+  const validated = new Set()
+  /** @param {delta.DeltaAny} current */
+  const validate = current => {
+    if (!delta.$deltaAny.check(current)) throw new DeltaMutationPreparationError('Delta contains an invalid nested delta')
+    if (validating.has(current)) throw new DeltaMutationPreparationError('Delta contains a cyclic nested delta')
+    if (validated.has(current)) return
+    validating.add(current)
+    for (const op of current.children) {
+      if (delta.$textOp.check(op)) {
+        if (typeof op.insert !== 'string') throw new DeltaMutationPreparationError('Delta contains invalid text content')
+        assertPositiveLength(op.length)
+      } else if (delta.$insertOp.check(op)) {
+        if (!Array.isArray(op.insert)) throw new DeltaMutationPreparationError('Delta contains invalid inserted content')
+        assertPositiveLength(op.length)
+        for (const value of op.insert) {
+          if (delta.$deltaAny.check(value)) validate(value)
+        }
+      } else if (delta.$retainOp.check(op)) {
+        assertPositiveLength(op.retain)
+      } else if (delta.$deleteOp.check(op)) {
+        assertPositiveLength(op.delete)
+      } else if (delta.$modifyOp.check(op)) {
+        validate(op.value)
+      } else {
+        throw new DeltaMutationPreparationError('Delta contains an unsupported child operation')
+      }
+    }
+    for (const op of current.attrs) {
+      if (delta.$setAttrOp.check(op)) {
+        if (delta.$deltaAny.check(op.value)) {
+          throw new DeltaMutationPreparationError('Delta attributes cannot be set to a nested delta')
+        }
+      } else if (delta.$deleteAttrOp.check(op)) {
+        // no value to validate
+      } else if (delta.$modifyAttrOp.check(op)) {
+        validate(op.value)
+      } else {
+        throw new DeltaMutationPreparationError('Delta contains an unsupported attribute operation')
+      }
+    }
+    validating.delete(current)
+    validated.add(current)
+  }
+  validate(mutation)
+}
+
+/**
+ * Detach every mutable input the canonical interpreter can consume. Raw shared types and subdocs
+ * are rejected because preparation cannot privately own them without mutating preliminary content
+ * or cloning a document; callers can express nested shared types with owned delta syntax instead.
  *
  * @param {delta.DeltaAny} mutation
  * @param {YType<any>} target
  * @param {Doc} doc
  */
 const ownDeltaMutation = (mutation, target, doc) => {
+  validateDeltaMutation(mutation)
   /** @type {Map<object, any>} */
   const values = new Map()
   /** @type {Set<object>} */
   const visiting = new Set()
   /** @type {Set<delta.DeltaAny>} */
   const visitedDeltas = new Set()
-  /** @param {any} value */
-  const cloneValue = value => {
+  /**
+   * @param {delta.DeltaAny} source
+   * @return {delta.DeltaAny}
+   */
+  function cloneDelta (source) {
+    validateDeltaMutation(source)
+    const owned = /** @type {delta.DeltaAny} */ (/** @type {any} */ (delta.cloneDeep)(source))
+    ownDelta(owned)
+    return owned
+  }
+  /**
+   * @param {any} value
+   * @param {'child'|'attr'|'data'} context
+   */
+  const cloneValue = (value, context) => {
     if (value === null || (typeof value !== 'object' && typeof value !== 'function')) {
       if (typeof value === 'symbol') throw new DeltaMutationPreparationError('Delta contains an unsupported symbol value')
       return value
     }
-    if (value instanceof target.constructor || value instanceof doc.constructor) return value
+    if (value instanceof target.constructor) {
+      throw new DeltaMutationPreparationError('Raw shared types are unsupported; use nested delta syntax')
+    }
+    if (value instanceof doc.constructor) {
+      throw new DeltaMutationPreparationError('Embedded documents are unsupported by reserved delta mutation')
+    }
     if (delta.$deltaAny.check(value)) {
-      const owned = /** @type {delta.DeltaAny} */ (/** @type {any} */ (delta.cloneDeep)(value))
-      ownDelta(owned)
-      return owned
+      if (context !== 'child') throw new DeltaMutationPreparationError('Nested deltas are only valid as direct child content')
+      return cloneDelta(value)
     }
     if (typeof value === 'function') throw new DeltaMutationPreparationError('Delta contains an unsupported function value')
+    if (context === 'attr') {
+      const constructor = value.constructor
+      if (constructor !== Object && constructor !== Array && constructor !== Date && constructor !== Uint8Array) {
+        throw new DeltaMutationPreparationError('Delta attribute contains an unsupported value')
+      }
+    }
     const existing = values.get(value)
     if (existing !== undefined) {
       if (visiting.has(value)) throw new DeltaMutationPreparationError('Delta contains a cyclic value')
@@ -448,41 +544,13 @@ const ownDeltaMutation = (mutation, target, doc) => {
       values.set(value, owned)
       return owned
     }
-    if (value instanceof RegExp) {
-      const owned = new RegExp(value.source, value.flags)
-      owned.lastIndex = value.lastIndex
-      values.set(value, owned)
-      return owned
-    }
-    if (value instanceof Map) {
-      const owned = new Map()
-      values.set(value, owned)
-      visiting.add(value)
-      try {
-        value.forEach((entry, key) => owned.set(cloneValue(key), cloneValue(entry)))
-      } finally {
-        visiting.delete(value)
-      }
-      return owned
-    }
-    if (value instanceof Set) {
-      const owned = new Set()
-      values.set(value, owned)
-      visiting.add(value)
-      try {
-        value.forEach(entry => owned.add(cloneValue(entry)))
-      } finally {
-        visiting.delete(value)
-      }
-      return owned
-    }
     if (Array.isArray(value)) {
       const owned = new Array(value.length)
       values.set(value, owned)
       visiting.add(value)
       try {
         for (let index = 0; index < value.length; index++) {
-          if (Object.prototype.hasOwnProperty.call(value, index)) owned[index] = cloneValue(value[index])
+          if (Object.prototype.hasOwnProperty.call(value, index)) owned[index] = cloneValue(value[index], 'data')
         }
       } finally {
         visiting.delete(value)
@@ -501,7 +569,7 @@ const ownDeltaMutation = (mutation, target, doc) => {
         Object.defineProperty(owned, key, {
           configurable: true,
           enumerable: true,
-          value: cloneValue(value[key]),
+          value: cloneValue(value[key], 'data'),
           writable: true
         })
       })
@@ -516,25 +584,23 @@ const ownDeltaMutation = (mutation, target, doc) => {
     visitedDeltas.add(owned)
     for (const op of owned.children) {
       if (delta.$insertOp.check(op)) {
-        for (let index = 0; index < op.insert.length; index++) op.insert[index] = cloneValue(op.insert[index])
+        for (let index = 0; index < op.insert.length; index++) op.insert[index] = cloneValue(op.insert[index], 'child')
       } else if (delta.$modifyOp.check(op)) {
         ownDelta(op.value)
       }
-      if ('format' in op) /** @type {any} */ (op).format = cloneValue(op.format)
-      if ('attribution' in op) /** @type {any} */ (op).attribution = cloneValue(op.attribution)
+      if ('format' in op) /** @type {any} */ (op).format = cloneValue(op.format, 'data')
+      if ('attribution' in op) /** @type {any} */ (op).attribution = cloneValue(op.attribution, 'data')
     }
     for (const op of owned.attrs) {
       if (delta.$setAttrOp.check(op)) {
-        /** @type {any} */ (op).value = cloneValue(op.value)
+        /** @type {any} */ (op).value = cloneValue(op.value, 'attr')
       } else if (delta.$modifyAttrOp.check(op)) {
         ownDelta(op.value)
       }
-      if ('attribution' in op) /** @type {any} */ (op).attribution = cloneValue(op.attribution)
+      if ('attribution' in op) /** @type {any} */ (op).attribution = cloneValue(op.attribution, 'data')
     }
   }
-  const owned = /** @type {delta.DeltaAny} */ (/** @type {any} */ (delta.cloneDeep)(mutation))
-  ownDelta(owned)
-  return owned
+  return cloneDelta(mutation)
 }
 
 /**
@@ -587,6 +653,9 @@ export const createPreparedDeltaMutation = (type, mutation, origin, renderer, ex
   let rangeCountUpperBound
   try {
     ownedMutation = ownDeltaMutation(mutation, type, doc)
+    if (ownedMutation.isEmpty()) {
+      throw new DeltaMutationPreparationError('Cannot reserve an empty delta mutation')
+    }
     rangeCountUpperBound = reserveRangeCount(type, ownedMutation, renderer)
   } catch (cause) {
     assertPreparationFresh()
