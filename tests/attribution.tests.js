@@ -271,6 +271,8 @@ export const testRendererLifecycleRevision = () => {
   const destroyed = mustReadRendererLifecycle(renderer)
   t.assert(destroyed !== deletionChanged && destroyed.revision > deletionChanged.revision, 'destroy invalidates snapshots')
   t.assert(!destroyed.active, 'destroyed renderers stay inactive')
+  renderer.destroy()
+  t.assert(mustReadRendererLifecycle(renderer) === destroyed, 'repeated destroy keeps the terminal snapshot stable')
 
   next.get('text').insert(0, 'x')
   t.assert(mustReadRendererLifecycle(renderer) === destroyed, 'destroy removes projection listeners')
@@ -278,6 +280,256 @@ export const testRendererLifecycleRevision = () => {
   other.destroy()
   otherBase.destroy()
   otherNext.destroy()
+  base.destroy()
+  next.destroy()
+}
+
+export const testRendererLifecycleProjectionIsolation = () => {
+  const base = new Y.Doc()
+  base.clientID = 1
+  base.get('text').insert(0, 'ab')
+  const next = Y.cloneDoc(base)
+  next.clientID = 2
+  /** @type {Uint8Array?} */
+  let change = null
+  next.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) change = update
+  })
+  next.transact(() => {
+    next.get('text').delete(1, 1)
+    next.get('text').insert(1, 'c')
+  })
+  const ids = Y.createContentIdsFromUpdate(/** @type {Uint8Array} */ (/** @type {unknown} */ (change)))
+  const shared = new SharedArrayBuffer(1)
+  const sharedBytes = new Uint8Array(shared)
+  sharedBytes[0] = 1
+  const actor = { name: 'alice', profile: { team: 'review' }, bytes: sharedBytes }
+  const actorAttribute = Y.createContentAttribute('reviewer', actor)
+  const attrs = new Y.Attributions()
+  Y.insertIntoIdMap(attrs.inserts, Y.createIdMapFromIdSet(ids.inserts, [actorAttribute]))
+  Y.insertIntoIdMap(attrs.deletes, Y.createIdMapFromIdSet(ids.deletes, [actorAttribute]))
+  const renderer = Y.createDiffRenderer(base, next, { attrs })
+  const lifecycle = mustReadRendererLifecycle(renderer)
+  const before = next.get('text').toDelta({ renderer })
+  const beforeJson = JSON.stringify(before.toJSON())
+
+  /** @param {Y.IdSet|Y.IdMap<any>} idSet */
+  const removeAll = idSet => {
+    /** @type {Array<{client:number,clock:number,len:number}>} */
+    const ranges = []
+    idSet.forEach((range, client) => ranges.push({ client, clock: range.clock, len: range.len }))
+    ranges.forEach(range => idSet.delete(range.client, range.clock, range.len))
+  }
+  removeAll(renderer.inserts)
+  removeAll(renderer.deletes)
+  removeAll(renderer.attributed)
+  /** @type {any} */
+  let snapshotActor = null
+  renderer.inserts.forEach(range => {
+    const reviewer = range.attrs.find(attr => attr.name === 'reviewer')
+    if (reviewer != null) snapshotActor = reviewer.val
+  })
+  /** @type {any} */
+  let emittedActor = null
+  for (const child of before.children) {
+    const attribution = /** @type {any} */ (child).attribution
+    if (attribution?.reviewer != null) emittedActor = attribution.reviewer
+  }
+  sharedBytes[0] = 2
+  snapshotActor.bytes[0] = 3
+  emittedActor.bytes[0] = 4
+  actor.name = 'mallory'
+  actor.profile.team = 'outside'
+  actorAttribute.val = { name: 'eve', profile: { team: 'outside' }, bytes: new Uint8Array(new SharedArrayBuffer(1)) }
+
+  t.assert(JSON.stringify(next.get('text').toDelta({ renderer }).toJSON()) === beforeJson)
+  t.assert(beforeJson.includes('alice') && beforeJson.includes('review'))
+  t.assert(mustReadRendererLifecycle(renderer) === lifecycle, 'detached mutations do not invalidate an unchanged live projection')
+
+  renderer.destroy()
+  base.destroy()
+  next.destroy()
+}
+
+export const testRendererLifecycleInsertDeleteCancellation = () => {
+  const base = new Y.Doc()
+  base.get('text').insert(0, 'a')
+  const next = Y.cloneDoc(base)
+  const renderer = Y.createDiffRenderer(base, next)
+
+  next.get('text').insert(1, 'b')
+  const inserted = mustReadRendererLifecycle(renderer)
+  t.compare(next.get('text').toDelta({ renderer }), delta.create().insert('a').insert('b', null, { insert: [] }).done())
+
+  next.get('text').delete(1, 1)
+  const cancelled = mustReadRendererLifecycle(renderer)
+  t.assert(cancelled !== inserted && cancelled.revision > inserted.revision, 'deleting a pending insertion invalidates the rendered projection')
+  t.compare(next.get('text').toDelta({ renderer }), delta.create().insert('a').done())
+
+  renderer.destroy()
+  base.destroy()
+  next.destroy()
+}
+
+export const testRendererLifecycleFutureAttributionSource = () => {
+  const base = new Y.Doc()
+  base.clientID = 1
+  base.get('text').insert(0, 'a')
+  const next = Y.cloneDoc(base)
+  const sender = Y.cloneDoc(base)
+  sender.clientID = 2
+  const attrs = new Y.Attributions()
+  const renderer = Y.createDiffRenderer(base, next, { attrs })
+  const initial = mustReadRendererLifecycle(renderer)
+  /** @type {Uint8Array?} */
+  let update = null
+  sender.on('update', (value, _origin, _doc, tr) => {
+    if (tr.local) update = value
+  })
+  sender.get('text').insert(1, 'b')
+  const remoteUpdate = /** @type {Uint8Array} */ (/** @type {unknown} */ (update))
+  const ids = Y.createContentIdsFromUpdate(remoteUpdate)
+  const actor = { name: 'alice' }
+  const attribute = Y.createContentAttribute('reviewer', actor)
+  Y.insertIntoIdMap(attrs.inserts, Y.createIdMapFromIdSet(ids.inserts, [attribute]))
+
+  Y.applyUpdate(next, remoteUpdate)
+  const changed = mustReadRendererLifecycle(renderer)
+  const rendered = next.get('text').toDelta({ renderer })
+  const renderedJson = JSON.stringify(rendered.toJSON())
+  t.assert(changed !== initial && changed.revision > initial.revision)
+  t.assert(renderedJson.includes('alice'), 'future transactions consult the live attribution source')
+
+  actor.name = 'mallory'
+  attribute.val = { name: 'eve' }
+  t.compare(next.get('text').toDelta({ renderer }), rendered)
+  t.assert(JSON.stringify(next.get('text').toDelta({ renderer }).toJSON()) === renderedJson)
+
+  renderer.destroy()
+  base.destroy()
+  next.destroy()
+  sender.destroy()
+}
+
+export const testRendererLifecyclePoisonedAttributionRetiresRenderer = () => {
+  const base = new Y.Doc()
+  base.get('text').insert(0, 'a')
+  const next = Y.cloneDoc(base)
+  const sender = Y.cloneDoc(base)
+  sender.clientID = 2
+  const attrs = new Y.Attributions()
+  const renderer = Y.createDiffRenderer(base, next, { attrs })
+  /** @type {Uint8Array?} */
+  let update = null
+  sender.on('update', value => { update = value })
+  sender.get('text').insert(1, 'b')
+  const firstUpdate = /** @type {Uint8Array} */ (/** @type {unknown} */ (update))
+  const ids = Y.createContentIdsFromUpdate(firstUpdate)
+  const attribute = Y.createContentAttribute('reviewer', /** @type {any} */ ({ name: 'alice' }))
+  Y.insertIntoIdMap(attrs.inserts, Y.createIdMapFromIdSet(ids.inserts, [attribute]))
+  attribute.val = new Proxy({}, { ownKeys () { throw new Error('poison') } })
+  let observed = 0
+  next.get('text').observe(() => { observed++ })
+
+  Y.applyUpdate(next, firstUpdate)
+  const retired = mustReadRendererLifecycle(renderer)
+  t.assert(next.get('text').toString() === 'ab' && observed === 1, 'projection failure does not abort document observers')
+  t.assert(!retired.active, 'projection failure retires the renderer')
+
+  sender.get('text').insert(2, 'c')
+  Y.applyUpdate(next, /** @type {Uint8Array} */ (/** @type {unknown} */ (update)))
+  t.assert(next.get('text').toString() === 'abc' && observed === 2)
+  t.assert(mustReadRendererLifecycle(renderer) === retired, 'retired renderers detach projection listeners')
+
+  base.destroy()
+  next.destroy()
+  sender.destroy()
+}
+
+export const testRendererLifecycleAttributionValueFidelity = () => {
+  const base = new Y.Doc()
+  base.get('text').insert(0, 'a')
+  const next = Y.cloneDoc(base)
+  /** @type {Uint8Array?} */
+  let update = null
+  next.on('update', (value, _origin, _doc, tr) => {
+    if (tr.local) update = value
+  })
+  next.get('text').insert(1, 'b')
+  const ids = Y.createContentIdsFromUpdate(/** @type {Uint8Array} */ (/** @type {unknown} */ (update)))
+  const date = new Date('2026-08-02T00:00:00.000Z')
+  const map = new Map([['actor', { name: 'alice' }]])
+  const prototypeKey = JSON.parse('{"__proto__":{"safe":true}}')
+  const accessor = { get name () { return 'alice' } }
+  const shared = new SharedArrayBuffer(4)
+  const whole = new Uint8Array(shared)
+  const left = new Uint8Array(shared, 0, 2)
+  whole[0] = 7
+  const value = { big: 2n ** 80n, negativeZero: -0, date, map, prototypeKey, accessor, whole, left }
+  const attrs = new Y.Attributions()
+  Y.insertIntoIdMap(attrs.inserts, Y.createIdMapFromIdSet(ids.inserts, [Y.createContentAttribute('fidelity', value)]))
+  const renderer = Y.createDiffRenderer(base, next, { attrs })
+
+  const readValue = () => {
+    /** @type {any} */
+    let result = null
+    renderer.inserts.forEach(range => {
+      const fidelity = range.attrs.find(attr => attr.name === 'fidelity')
+      if (fidelity != null) result = fidelity.val
+    })
+    return result
+  }
+  const first = readValue()
+  t.assert(first.big === 2n ** 80n)
+  t.assert(Object.is(first.negativeZero, -0))
+  t.assert(first.date instanceof Date && first.date.getTime() === date.getTime())
+  t.assert(first.map instanceof Map && first.map.get('actor').name === 'alice')
+  const prototypeDescriptor = Object.getOwnPropertyDescriptor(first.prototypeKey, '__proto__')
+  t.assert(Object.prototype.hasOwnProperty.call(first.prototypeKey, '__proto__') && prototypeDescriptor?.value.safe === true)
+  t.assert(first.accessor.name === 'alice')
+  t.assert(first.whole.buffer === first.left.buffer, 'overlapping views preserve their shared backing relationship')
+  first.left[0] = 9
+  t.assert(first.whole[0] === 9 && whole[0] === 7, 'snapshot views alias each other but not caller memory')
+
+  date.setUTCFullYear(2030)
+  const sourceActor = map.get('actor')
+  if (sourceActor === undefined) throw new Error('Expected source actor')
+  sourceActor.name = 'mallory'
+  first.date.setUTCFullYear(2040)
+  first.map.get('actor').name = 'eve'
+  const second = readValue()
+  t.assert(second.date.getUTCFullYear() === 2026)
+  t.assert(second.map.get('actor').name === 'alice')
+  t.assert(second.whole[0] === 7 && second.whole.buffer === second.left.buffer)
+
+  renderer.destroy()
+  base.destroy()
+  next.destroy()
+}
+
+export const testRendererChangeEventIsolation = () => {
+  const base = new Y.Doc()
+  base.get('text').insert(0, 'a')
+  const next = Y.cloneDoc(base)
+  next.get('text').insert(1, 'b')
+  const renderer = Y.createDiffRenderer(base, next)
+  let changes = 0
+  let updates = 0
+  base.on('update', () => { updates++ })
+  renderer.on('change', ids => {
+    changes++
+    ids.forEach(range => {
+      range.clock = 999
+      range.len = 0
+    })
+  })
+
+  Y.applyUpdate(base, Y.encodeStateAsUpdate(next))
+  t.assert(base.get('text').toString() === 'ab')
+  t.assert(next.get('text').toString() === 'ab')
+  t.assert(changes === 1 && updates === 1)
+
+  renderer.destroy()
   base.destroy()
   next.destroy()
 }
