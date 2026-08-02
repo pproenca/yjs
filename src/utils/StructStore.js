@@ -7,7 +7,8 @@ import { findIndexSS } from './transaction-helpers.js'
 export class StructStore {
   constructor () {
     /**
-     * @type {Map<number,Array<GC|Item|Skip|CausalHole>>}
+     * Causal holes are an internal sparse extension hidden from the ordinary StructStore contract.
+     * @type {Map<number,Array<GC|Item|Skip>>}
      */
     this.clients = new Map()
     // this.ds = new IdSet()
@@ -32,10 +33,10 @@ export class StructStore {
    * @function
    */
   add (struct) {
-    let structs = this.clients.get(struct.id.client)
+    let structs = /** @type {Array<GC|Item|Skip|CausalHole>|undefined} */ (/** @type {unknown} */ (this.clients.get(struct.id.client)))
     if (structs === undefined) {
       structs = []
-      this.clients.set(struct.id.client, structs)
+      this.clients.set(struct.id.client, /** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ (structs)))
     } else {
       const lastStruct = structs[structs.length - 1]
       if (lastStruct.id.clock + lastStruct.length !== struct.id.clock) {
@@ -44,6 +45,17 @@ export class StructStore {
       }
     }
     structs.push(struct)
+  }
+
+  /**
+   * Install a decoded struct without transaction semantics.
+   *
+   * @param {GC|Item|Skip|CausalHole} struct
+   */
+  addUpdateStruct (struct) {
+    this.add(struct)
+    if (struct.constructor === Skip) this.skips.add(struct.id.client, struct.id.clock, struct.length)
+    if (struct.constructor === CausalHole) this.causalHoles.add(struct.id.client, struct.id.clock, struct.length)
   }
 
   /**
@@ -61,7 +73,7 @@ export class StructStore {
   _replaceSparseRange (structs, struct) {
     const start = struct.id.clock
     const end = start + struct.length
-    let startIndex = findIndexSS(structs, start)
+    const startIndex = findIndexSS(/** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ (structs)), start)
     let endIndex = startIndex
     while (endIndex < structs.length && structs[endIndex].id.clock < end) endIndex++
     const replaced = structs.slice(startIndex, endIndex)
@@ -85,10 +97,10 @@ export class StructStore {
     const last = replaced[replaced.length - 1]
     /** @type {Array<GC|Item|Skip|CausalHole>} */
     const replacement = []
-    if (first.id.clock < start) replacement.push(this._sliceSparse(first, first.id.clock, start - first.id.clock))
+    if (first.id.clock < start) replacement.push(this._sliceSparse(/** @type {Skip|CausalHole} */ (first), first.id.clock, start - first.id.clock))
     replacement.push(struct)
     const lastEnd = last.id.clock + last.length
-    if (lastEnd > end) replacement.push(this._sliceSparse(last, end, lastEnd - end))
+    if (lastEnd > end) replacement.push(this._sliceSparse(/** @type {Skip|CausalHole} */ (last), end, lastEnd - end))
     structs.splice(startIndex, endIndex - startIndex, ...replacement)
     this.skips.delete(struct.id.client, start, struct.length)
     this.causalHoles.delete(struct.id.client, start, struct.length)
@@ -113,8 +125,18 @@ export class StructStore {
     if (!this.causalHoles.hasId(id)) return null
     const structs = this.clients.get(id.client)
     if (structs === undefined) return null
-    const struct = structs[findIndexSS(structs, id.clock)]
+    const struct = /** @type {GC|Item|Skip|CausalHole} */ (structs[findIndexSS(structs, id.clock)])
     return struct.constructor === CausalHole ? /** @type {CausalHole} */ (struct) : null
+  }
+
+  /**
+   * @param {ID} id
+   * @return {GC|Item|Skip|CausalHole|null}
+   */
+  getStruct (id) {
+    const structs = this.clients.get(id.client)
+    if (structs === undefined || structs.length === 0 || id.clock < structs[0].id.clock || id.clock >= this.getClock(id.client)) return null
+    return /** @type {GC|Item|Skip|CausalHole} */ (structs[findIndexSS(structs, id.clock)])
   }
 
   /**

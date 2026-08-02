@@ -31,7 +31,7 @@ import { readBlockSet, writeBlockSet } from './BlockSet.js'
 import { Skip } from '../structs/Skip.js'
 import { Item } from '../structs/Item.js'
 import { GC } from '../structs/GC.js'
-import { CausalHole } from '../structs/CausalHole.js'
+import { CausalHole, sameCausalHoleMetadata } from '../structs/CausalHole.js'
 import { Doc } from './Doc.js'
 import { writeStructs } from './encoding-helpers.js'
 
@@ -160,13 +160,13 @@ const integrateStructs = (transaction, store, clientsStructRefs) => {
       if (inapplicableItems) {
         // decrement because we weren't able to apply previous operation
         inapplicableItems.i--
-        restStructs.clients.set(client, inapplicableItems.refs.slice(inapplicableItems.i))
+        restStructs.clients.set(client, /** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ (inapplicableItems.refs.slice(inapplicableItems.i))))
         clientsStructRefs.clients.delete(client)
         inapplicableItems.i = 0
         inapplicableItems.refs = []
       } else {
         // item was the last item on clientsStructRefs and the field was already cleared. Add item to restStructs and continue
-        restStructs.clients.set(client, [item])
+        restStructs.clients.set(client, /** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ ([item])))
       }
       // remove client from clientsStructRefsIds to prevent users from applying the same update again
       clientsStructRefsIds = clientsStructRefsIds.filter(c => c !== client)
@@ -253,6 +253,7 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     const store = doc.store
     // let start = performance.now()
     const ss = readBlockSet(structDecoder)
+    validateCausalHoleEnvelope(ss, store)
     const knownState = createIdSet()
     ss.clients.forEach((_, client) => {
       const storeStructs = store.clients.get(client)
@@ -329,6 +330,92 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
       applyUpdateV2(transaction.doc, update)
     }
   }, transactionOrigin, false)
+
+/**
+ * @param {BlockSet} blockSet
+ * @param {StructStore} store
+ */
+const validateCausalHoleEnvelope = (blockSet, store) => {
+  /** @type {Array<CausalHole>} */
+  const incomingHoles = []
+  blockSet.clients.forEach(range => {
+    range.refs.forEach(struct => {
+      if (struct.constructor === CausalHole) incomingHoles.push(/** @type {CausalHole} */ (struct))
+    })
+  })
+  if (incomingHoles.length === 0) return
+  /**
+   * @param {ID} id
+   */
+  const incomingAt = id => {
+    const refs = blockSet.clients.get(id.client)?.refs
+    if (refs === undefined) return null
+    for (const struct of refs) {
+      if (struct.id.clock <= id.clock && id.clock < struct.id.clock + struct.length) return struct
+    }
+    return null
+  }
+  /**
+   * @param {ID} id
+   */
+  const resolve = id => {
+    const incoming = incomingAt(id)
+    const existing = store.getStruct(id)
+    if (incoming?.constructor === Item) return incoming
+    if (existing?.constructor === Item) return existing
+    if (incoming?.constructor === CausalHole) return incoming
+    if (existing?.constructor === CausalHole) return existing
+    return null
+  }
+  /**
+   * @param {CausalHole} hole
+   */
+  const coveredByRealStore = hole => {
+    let clock = hole.id.clock
+    const end = clock + hole.length
+    while (clock < end) {
+      const struct = store.getStruct(createID(hole.id.client, clock))
+      if (struct?.constructor !== Item) return false
+      clock = Math.min(end, struct.id.clock + struct.length)
+    }
+    return true
+  }
+  for (const hole of incomingHoles) {
+    if (coveredByRealStore(hole)) continue
+    const existingStructs = store.clients.get(hole.id.client) ?? []
+    for (const existing of existingStructs) {
+      const start = Math.max(hole.id.clock, existing.id.clock)
+      const end = Math.min(hole.id.clock + hole.length, existing.id.clock + existing.length)
+      if (start >= end || existing.constructor !== CausalHole) continue
+      if (!sameCausalHoleMetadata(hole.slice(start, end - start), /** @type {CausalHole} */ (existing).slice(start, end - start))) {
+        throw new Error('Conflicting causal hole metadata')
+      }
+    }
+  }
+  /**
+   * @param {CausalHole} hole
+   * @param {Set<string>} path
+   */
+  const visit = (hole, path) => {
+    const key = `${hole.id.client}:${hole.id.clock}`
+    if (path.has(key)) throw new Error('Cyclic causal hole metadata')
+    const nextPath = new Set(path)
+    nextPath.add(key)
+    for (const anchor of [hole.origin, hole.rightOrigin]) {
+      if (anchor === null) continue
+      const dependency = resolve(anchor)
+      if (dependency === null) throw new Error('Missing causal hole anchor')
+      if (dependency.constructor === CausalHole) visit(/** @type {CausalHole} */ (dependency), nextPath)
+    }
+    if (typeof hole.parent !== 'string') {
+      const parent = resolve(hole.parent)
+      if (parent?.constructor !== Item) throw new Error('Causal hole parent is not materialized')
+    }
+  }
+  incomingHoles.forEach(hole => {
+    if (!coveredByRealStore(hole)) visit(hole, new Set())
+  })
+}
 
 /**
  * Read and apply a document update.
@@ -637,50 +724,51 @@ const getMissing = (struct, transaction, store) => {
     return parent.client
   }
   if (struct.constructor === CausalHole) return null
+  const item = /** @type {Item} */ (struct)
   // We have all missing ids, now find the items
   const originHole = origin === null ? null : store.getCausalHole(origin)
   const rightOriginHole = rightOrigin === null ? null : store.getCausalHole(rightOrigin)
   if (origin) {
     if (originHole === null) {
-      struct.left = getItemCleanEnd(transaction, store, origin)
+      item.left = getItemCleanEnd(transaction, store, origin)
       // copy left id to so that the original id can be gc'd
-      struct.origin = struct.left.lastId
+      item.origin = item.left.lastId
     } else {
-      struct.left = resolveCausalHoleAnchor(transaction, store, originHole, true)
+      item.left = resolveCausalHoleAnchor(transaction, store, originHole, true)
     }
   }
   if (rightOrigin) {
     if (rightOriginHole === null) {
-      struct.right = getItemCleanStart(transaction, rightOrigin)
-      struct.rightOrigin = struct.right.id
+      item.right = getItemCleanStart(transaction, rightOrigin)
+      item.rightOrigin = item.right.id
     } else {
-      struct.right = resolveCausalHoleAnchor(transaction, store, rightOriginHole, false)
+      item.right = resolveCausalHoleAnchor(transaction, store, rightOriginHole, false)
     }
   }
-  if ((struct.left && struct.left.constructor === GC) || (struct.right && struct.right.constructor === GC)) {
-    struct.parent = null
+  if ((item.left && item.left.constructor === GC) || (item.right && item.right.constructor === GC)) {
+    item.parent = null
   } else if (originHole !== null || rightOriginHole !== null) {
     const hole = /** @type {CausalHole} */ (originHole ?? rightOriginHole)
-    struct.parent = resolveCausalHoleParent(transaction, store, hole)
-    struct.parentSub = hole.parentSub
+    item.parent = resolveCausalHoleParent(transaction, store, hole)
+    item.parentSub = hole.parentSub
   } else if (parent == null) {
     // only set parent if this shouldn't be garbage collected
-    if (struct.left && struct.left.constructor === Item) {
-      struct.parent = struct.left.parent
-      struct.parentSub = struct.left.parentSub
-    } else if (struct.right && struct.right.constructor === Item) {
-      struct.parent = struct.right.parent
-      struct.parentSub = struct.right.parentSub
+    if (item.left && item.left.constructor === Item) {
+      item.parent = item.left.parent
+      item.parentSub = item.left.parentSub
+    } else if (item.right && item.right.constructor === Item) {
+      item.parent = item.right.parent
+      item.parentSub = item.right.parentSub
     }
   } else if (parent.constructor === ID) {
     const parentItem = store.getItem(parent)
     if (parentItem.constructor === GC) {
-      struct.parent = null
+      item.parent = null
     } else {
-      struct.parent = /** @type {ContentType} */ (parentItem.content).type
+      item.parent = /** @type {ContentType} */ (parentItem.content).type
     }
   } else if (typeof parent === 'string') {
-    struct.parent = transaction.doc.get(parent)
+    item.parent = transaction.doc.get(parent)
   }
   return null
 }

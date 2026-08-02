@@ -1,7 +1,6 @@
 import * as binary from 'lib0/binary'
 import * as encoding from 'lib0/encoding'
 
-import { AbstractStruct } from './AbstractStruct.js'
 import { ID, compareIDs, createID, findRootTypeKey } from '../utils/ID.js'
 
 export const structCausalHoleRefNumber = 11
@@ -10,6 +9,9 @@ export const structCausalHoleRefNumber = 11
  * @param {ID|null} id
  */
 const copyID = id => id === null ? null : createID(id.client, id.clock)
+
+/** @param {ID|null} id */
+const validID = id => id === null || (Number.isSafeInteger(id.client) && id.client >= 0 && Number.isSafeInteger(id.clock) && id.clock >= 0)
 
 /**
  * @param {YType|ID|string} parent
@@ -26,7 +28,7 @@ const normalizeParent = parent => {
  * Sparse structural coverage carrying only the canonical metadata required to integrate dependent
  * items. It is never linked into a YType and never enters transaction insert/delete sets.
  */
-export class CausalHole extends AbstractStruct {
+export class CausalHole {
   /**
    * @param {ID} id
    * @param {number} length
@@ -36,10 +38,16 @@ export class CausalHole extends AbstractStruct {
    * @param {string|null} parentSub
    */
   constructor (id, length, origin, rightOrigin, parent, parentSub) {
-    super(id, length)
-    if (!Number.isSafeInteger(length) || length <= 0 || (typeof parent !== 'string' && parent.constructor !== ID)) {
+    if (
+      !validID(id) || !validID(origin) || !validID(rightOrigin) ||
+      !Number.isSafeInteger(length) || length <= 0 || !Number.isSafeInteger(id.clock + length) ||
+      (typeof parent !== 'string' && (parent.constructor !== ID || !validID(parent))) ||
+      (parentSub !== null && typeof parentSub !== 'string')
+    ) {
       throw new Error('Invalid causal hole')
     }
+    this.id = id
+    this.length = length
     this.origin = copyID(origin)
     this.rightOrigin = copyID(rightOrigin)
     this.parent = normalizeParent(parent)
@@ -175,6 +183,7 @@ export const createCausalHoleFromItem = (item, clock, length) => {
   if (offset < 0 || length <= 0 || offset + length > item.length) {
     throw new Error('Invalid causal hole source slice')
   }
+  if (item.parent === null) throw new Error('Causal hole source has no parent')
   return new CausalHole(
     createID(item.id.client, clock),
     length,

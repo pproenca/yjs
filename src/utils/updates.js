@@ -30,6 +30,8 @@ import {
 } from '../ytype.js'
 import { Skip } from '../structs/Skip.js'
 import { CausalHole, structCausalHoleRefNumber } from '../structs/CausalHole.js'
+import { StructStore } from './StructStore.js'
+import { writeStructsFromIdSetWithExistingCausalHoles } from './encoding-helpers.js'
 
 /**
  * @param {UpdateDecoderV1 | UpdateDecoderV2} decoder
@@ -546,6 +548,24 @@ export const convertUpdateFormatV2ToV1 = update => convertUpdateFormat(update, f
  */
 export const intersectUpdateWithContentIdsV2 = (update, contentIds, YDecoder = UpdateDecoderV2, YEncoder = UpdateEncoderV2) => {
   const { inserts, deletes } = contentIds
+  const probe = new LazyStructReader(new YDecoder(decoding.createDecoder(update)), false)
+  let hasCausalHoles = false
+  for (let curr = probe.curr; curr !== null; curr = probe.next()) {
+    if (curr.constructor === CausalHole) {
+      hasCausalHoles = true
+      break
+    }
+  }
+  if (hasCausalHoles) {
+    const sourceStore = new StructStore()
+    const sourceDecoder = new YDecoder(decoding.createDecoder(update))
+    const sourceReader = new LazyStructReader(sourceDecoder, false)
+    for (let curr = sourceReader.curr; curr !== null; curr = sourceReader.next()) sourceStore.addUpdateStruct(curr)
+    const encoder = new YEncoder()
+    writeStructsFromIdSetWithExistingCausalHoles(encoder, sourceStore, inserts)
+    writeIdSet(encoder, intersectSets(readIdSet(sourceDecoder), deletes))
+    return encoder.toUint8Array()
+  }
   const encoder = new YEncoder()
   const lazyStructWriter = new LazyStructWriter(encoder)
   const decoder = new YDecoder(decoding.createDecoder(update))

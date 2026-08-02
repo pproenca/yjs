@@ -31,9 +31,9 @@ export const writeStructs = (encoder, structs, client, idranges) => {
     const endClock = math.min(idrange.clock + idrange.len, lastPossibleClock)
     if (startClock >= endClock) return // structs for this range do not exist
     // inclusive start
-    const start = findIndexSS(structs, startClock)
+    const start = findIndexSS(/** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ (structs)), startClock)
     // exclusive end
-    const end = findIndexSS(structs, endClock - 1) + 1
+    const end = findIndexSS(/** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ (structs)), endClock - 1) + 1
     structsToWrite += end - start
     indexRanges.push({
       start,
@@ -83,7 +83,7 @@ export const writeStructsFromIdSet = (encoder, store, idset) => {
   // This heavily improves the conflict algorithm.
   array.from(idset.clients.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, ids]) => {
     const idRanges = ids.getIds()
-    const structs = /** @type {Array<GC|Item|Skip|CausalHole>} */ (store.clients.get(client))
+    const structs = /** @type {Array<GC|Item|Skip|CausalHole>} */ (/** @type {unknown} */ (store.clients.get(client)))
     writeStructs(encoder, structs, client, idRanges)
   })
 }
@@ -102,6 +102,18 @@ export const writeStructsFromIdSetWithCausalHoles = (encoder, sourceStore, selec
 }
 
 /**
+ * Preserve an already-present causal envelope without synthesizing omitted real payload metadata.
+ *
+ * @param {UpdateEncoderV1|UpdateEncoderV2} encoder
+ * @param {StructStore} sourceStore
+ * @param {IdSet} selected
+ */
+export const writeStructsFromIdSetWithExistingCausalHoles = (encoder, sourceStore, selected) => {
+  const holes = collectCausalHoles(sourceStore, selected, [], false)
+  writeSparseSelection(encoder, sourceStore, selected, holes)
+}
+
+/**
  * @param {StructStore} sourceStore
  * @param {IdSet} selected
  * @param {Array<StructStore>} knownStores
@@ -115,11 +127,11 @@ const collectCausalHoles = (sourceStore, selected, knownStores, synthesize) => {
    */
   const isKnown = id => knownStores.length > 0 && knownStores.every(store => {
     if (id.clock >= store.getClock(id.client) || store.skips.hasId(id) || store.causalHoles.hasId(id)) return false
-    return store.get(id).constructor === Item
+    return store.getStruct(id)?.constructor === Item
   })
   /** @param {ID} id */
   const isSourceMaterialized = id => id.clock < sourceStore.getClock(id.client) &&
-    !sourceStore.skips.hasId(id) && !sourceStore.causalHoles.hasId(id) && sourceStore.get(id).constructor === Item
+    !sourceStore.skips.hasId(id) && !sourceStore.causalHoles.hasId(id) && sourceStore.getStruct(id)?.constructor === Item
   /**
    * @param {ID|string} parent
    */
@@ -135,7 +147,8 @@ const collectCausalHoles = (sourceStore, selected, knownStores, synthesize) => {
     if (id === null || selected.hasId(id) || isKnown(id)) return
     const key = `${id.client}:${id.clock}`
     if (path.has(key)) throw new Error('Cyclic causal hole metadata')
-    const source = id.clock < sourceStore.getClock(id.client) ? sourceStore.get(id) : null
+    const source = sourceStore.getStruct(id)
+    if (!synthesize && (source === null || source.constructor === Skip)) return
     if (source === null || source.constructor === Skip) {
       throw new Error('Missing causal anchor')
     }
@@ -189,6 +202,11 @@ const collectCausalHoles = (sourceStore, selected, knownStores, synthesize) => {
 const writeSparseSelection = (encoder, sourceStore, selected, holes) => {
   /** @type {Map<number,Array<{struct:Item|CausalHole,start:number,end:number}>>} */
   const blocks = new Map()
+  /**
+   * @param {Item|CausalHole} struct
+   * @param {number} start
+   * @param {number} end
+   */
   const add = (struct, start, end) => {
     let clientBlocks = blocks.get(struct.id.client)
     if (clientBlocks === undefined) {
@@ -198,8 +216,8 @@ const writeSparseSelection = (encoder, sourceStore, selected, holes) => {
     clientBlocks.push({ struct, start, end })
   }
   selected.forEach((range, client) => {
-    const structs = /** @type {Array<GC|Item|Skip|CausalHole>} */ (sourceStore.clients.get(client))
-    let index = findIndexSS(structs, range.clock)
+    const structs = /** @type {Array<GC|Item|Skip|CausalHole>} */ (/** @type {unknown} */ (sourceStore.clients.get(client)))
+    let index = findIndexSS(/** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ (structs)), range.clock)
     const end = range.clock + range.len
     let clock = range.clock
     while (clock < end) {
@@ -212,8 +230,20 @@ const writeSparseSelection = (encoder, sourceStore, selected, holes) => {
   })
   holes.forEach(hole => add(hole, hole.id.clock, hole.id.clock + hole.length))
   encoding.writeVarUint(encoder.restEncoder, blocks.size)
-  array.from(blocks.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, clientBlocks]) => {
-    clientBlocks.sort((a, b) => a.start - b.start)
+  array.from(blocks.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, unsortedBlocks]) => {
+    const clientBlocks = unsortedBlocks.sort((a, b) => a.start - b.start).reduce((result, block) => {
+      const previous = result[result.length - 1]
+      if (
+        previous !== undefined && previous.end === block.start &&
+        previous.struct.constructor === CausalHole && block.struct.constructor === CausalHole &&
+        /** @type {CausalHole} */ (previous.struct).mergeWith(/** @type {CausalHole} */ (block.struct))
+      ) {
+        previous.end = block.end
+      } else {
+        result.push(block)
+      }
+      return result
+    }, /** @type {Array<{struct:Item|CausalHole,start:number,end:number}>} */ ([]))
     let count = clientBlocks.length
     let clock = clientBlocks[0].start
     for (let i = 1; i < clientBlocks.length; i++) {

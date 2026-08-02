@@ -170,12 +170,12 @@ export class BlockSet {
         let startIndex = 0
         if (range.clock >= lastStruct.id.clock + lastStruct.length) continue
         if (range.clock > firstStruct.id.clock) {
-          startIndex = findIndexCleanStart(null, structs, range.clock)
+          startIndex = findIndexCleanStart(null, /** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ (structs)), range.clock)
         }
         let endIndex = structs.length // must be set here, after structs is modified
         if (range.clock + range.len <= firstStruct.id.clock) continue
         if (range.clock + range.len < lastStruct.id.clock + lastStruct.length) {
-          endIndex = findIndexCleanStart(null, structs, range.clock + range.len)
+          endIndex = findIndexCleanStart(null, /** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ (structs)), range.clock + range.len)
         }
         if (startIndex < endIndex) {
           structs[startIndex] = new Skip(new ID(client, range.clock), range.len)
@@ -202,8 +202,8 @@ export class BlockSet {
           return
         }
         const localIsLeft = ranges.refs[0].id.clock < newranges.refs[0].id.clock
-        const leftRanges = (localIsLeft ? ranges : newranges).refs
-        const rightRanges = (localIsLeft ? newranges : ranges).refs
+        const leftRanges = /** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ ((localIsLeft ? ranges : newranges).refs))
+        const rightRanges = /** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ ((localIsLeft ? newranges : ranges).refs))
         const lastBlockLeft = array.last(leftRanges)
         const firstBlockRight = rightRanges[0]
         const gapSize = firstBlockRight.id.clock - lastBlockLeft.id.clock - lastBlockLeft.length
@@ -249,7 +249,7 @@ export class BlockSet {
             }
             // left: trim first op
             if (lblock !== undefined && lblock.id.clock < nextExpectedClock && lblock.id.clock + lblock.length > nextExpectedClock) {
-              lblock = sliceStruct(lblock, lblock.id.clock + lblock.length - nextExpectedClock)
+              lblock = /** @type {GC|Item|Skip} */ (sliceStruct(lblock, lblock.id.clock + lblock.length - nextExpectedClock))
             }
             // left: add to result
             while (lblock !== undefined && lblock.id.clock === nextExpectedClock && lblock.constructor !== Skip) {
@@ -264,7 +264,7 @@ export class BlockSet {
             }
             // right: trim first op
             if (rblock !== undefined && rblock.id.clock < nextExpectedClock && rblock.id.clock + rblock.length > nextExpectedClock) {
-              rblock = sliceStruct(rblock, rblock.id.clock + rblock.length - nextExpectedClock)
+              rblock = /** @type {GC|Item|Skip} */ (sliceStruct(rblock, rblock.id.clock + rblock.length - nextExpectedClock))
             }
             // right: add to result
             while (rblock !== undefined && rblock.id.clock === nextExpectedClock && rblock.constructor !== Skip) {
@@ -373,7 +373,15 @@ const mergeSparseRefs = (left, right) => {
     if (chosen === null) continue
     const sliced = sliceBlock(chosen, clock, length)
     const previous = result[result.length - 1]
-    if (previous === undefined || !previous.mergeWith(sliced)) result.push(sliced)
+    let merged = false
+    if (previous?.constructor === CausalHole && sliced.constructor === CausalHole) {
+      merged = /** @type {CausalHole} */ (previous).mergeWith(/** @type {CausalHole} */ (sliced))
+    } else if (previous?.constructor === Skip && sliced.constructor === Skip) {
+      merged = /** @type {Skip} */ (previous).mergeWith(/** @type {Skip} */ (sliced))
+    } else if (previous?.constructor === GC && sliced.constructor === GC) {
+      merged = /** @type {GC} */ (previous).mergeWith(/** @type {GC} */ (sliced))
+    }
+    if (!merged) result.push(sliced)
   }
   return result
 }

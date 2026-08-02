@@ -628,6 +628,12 @@ export class DiffRenderer extends ObservableV2 {
       throw new Error('ContentIds are unknown or outside this renderer')
     }
     if (projection.prevDoc.store !== projection.prevDocStore) throw new Error('Canonical base store mismatch')
+    if (
+      projection.prevDoc.store.pendingStructs !== null || projection.prevDoc.store.pendingDs !== null ||
+      projection.nextDoc.store.pendingStructs !== null || projection.nextDoc.store.pendingDs !== null
+    ) {
+      throw new Error('Diff resolution requires complete document stores')
+    }
 
     const inserts = diffIdSet(actionable.inserts, actionable.deletes)
     const deletes = diffIdSet(actionable.deletes, actionable.inserts)
@@ -648,8 +654,6 @@ export class DiffRenderer extends ObservableV2 {
       update = prepareRejectUpdate(this, actionable)
     }
 
-    insertIntoIdSet(receipt.inserts, actionable.inserts)
-    insertIntoIdSet(receipt.deletes, actionable.deletes)
     if (disposition === 'accept') {
       applyUpdate(projection.prevDoc, update, origin)
     } else {
@@ -662,6 +666,14 @@ export class DiffRenderer extends ObservableV2 {
         tr.local = true
       }, origin)
     }
+    if (
+      projection.prevDoc.store.pendingStructs !== null || projection.prevDoc.store.pendingDs !== null ||
+      projection.nextDoc.store.pendingStructs !== null || projection.nextDoc.store.pendingDs !== null
+    ) {
+      throw new Error('Diff resolution produced incomplete document stores')
+    }
+    insertIntoIdSet(receipt.inserts, actionable.inserts)
+    insertIntoIdSet(receipt.deletes, actionable.deletes)
   }
 
   /**

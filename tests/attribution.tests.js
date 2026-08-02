@@ -13,6 +13,7 @@ import * as math from 'lib0/math'
 import { bind, $rdt } from 'lib0/delta/rdt'
 import { init } from './testHelper.js' // eslint-disable-line
 import { readRendererLifecycle } from '../src/utils/renderer-helpers.js'
+import { CausalHole } from '../src/structs/CausalHole.js'
 
 /**
  * @param {object} renderer
@@ -2548,6 +2549,257 @@ export const testAttributionResolveContentIdsLaterAdjacentAccept = () => {
   t.assert(base.get('text').toString() === 'aY', 'later adjacent suggestion accepts independently')
   t.assert(suggestion.get('text').toString() === 'aXY', 'earlier adjacent suggestion stays pending')
   t.assert(!Y.intersectSets(changes[0].inserts, renderer.inserts).isEmpty(), 'earlier attribution remains pending')
+}
+
+export const testAttributionResolveContentIdsLaterAdjacentReject = () => {
+  const base = new Y.Doc({ gc: false })
+  base.clientID = 1
+  base.get('text').insert(0, 'a')
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Array<Y.ContentIds>} */
+  const changes = []
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) changes.push(Y.createContentIdsFromUpdate(update))
+  })
+  suggestion.get('text').insert(1, 'X')
+  suggestion.get('text').insert(2, 'Y')
+
+  /** @type {Array<Uint8Array<ArrayBuffer>>} */
+  const updates = []
+  /** @type {Array<Y.IdSet>} */
+  const events = []
+  base.on('update', update => updates.push(update))
+  renderer.on('change', ids => events.push(ids))
+  renderer.resolveContentIds(changes[1], 'reject', {})
+
+  t.assert(base.get('text').toString() === 'a', 'rejecting the later insert leaves base visible content unchanged')
+  t.assert(suggestion.get('text').toString() === 'aX', 'earlier insert stays pending')
+  t.assert(!Y.intersectSets(changes[0].inserts, renderer.inserts).isEmpty(), 'earlier attribution remains pending')
+  t.assert(updates.length === 1 && events.length === 1)
+  const updateIds = Y.createContentIdsFromUpdate(updates[0])
+  const selected = Y.mergeIdSets([changes[1].inserts, changes[1].deletes])
+  t.assert(Y.equalIdSets(Y.mergeIdSets([updateIds.inserts, updateIds.deletes]), selected), 'transport holes stay out of update content ids')
+  t.assert(Y.diffIdSet(events[0], selected).isEmpty(), 'renderer event exposes no transport ids')
+  t.assert(Y.decodeUpdate(updates[0]).structs.some(struct => struct.constructor === CausalHole), 'later-first update carries a causal hole')
+}
+
+export const testAttributionResolveContentIdsLaterThenEarlierConverges = () => {
+  const base = new Y.Doc({ gc: false })
+  base.clientID = 1
+  base.get('text').insert(0, 'a')
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Array<Y.ContentIds>} */
+  const changes = []
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) changes.push(Y.createContentIdsFromUpdate(update))
+  })
+  suggestion.get('text').insert(1, 'X')
+  suggestion.get('text').insert(2, 'Y')
+
+  renderer.resolveContentIds(changes[1], 'accept', {})
+  renderer.resolveContentIds(changes[0], 'accept', {})
+
+  t.assert(base.get('text').toString() === 'aXY')
+  t.assert(suggestion.get('text').toString() === 'aXY')
+  t.assert(renderer.inserts.isEmpty() && renderer.deletes.isEmpty())
+  t.assert(base.store.causalHoles.isEmpty(), 'materialized content replaces the hole')
+  t.assert(Y.decodeStateVector(Y.encodeStateVector(base)).get(2) === 2)
+}
+
+export const testAttributionResolveContentIdsSameStructPartialSlice = () => {
+  const base = new Y.Doc({ gc: false })
+  base.clientID = 1
+  base.get('text').insert(0, 'a')
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Y.ContentIds?} */
+  let combined = null
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) combined = Y.createContentIdsFromUpdate(update)
+  })
+  suggestion.get('text').insert(1, 'XY')
+  const ids = /** @type {Y.ContentIds} */ (/** @type {unknown} */ (combined))
+  const first = Y.createIdSet()
+  const second = Y.createIdSet()
+  ids.inserts.forEach((range, client) => {
+    t.assert(range.len === 2)
+    first.add(client, range.clock, 1)
+    second.add(client, range.clock + 1, 1)
+  })
+
+  renderer.resolveContentIds(Y.createContentIds(second), 'accept', {})
+  t.assert(base.get('text').toString() === 'aY')
+  t.assert(suggestion.get('text').toString() === 'aXY')
+  renderer.resolveContentIds(Y.createContentIds(first), 'accept', {})
+
+  t.assert(base.get('text').toString() === 'aXY')
+  t.assert(renderer.inserts.isEmpty())
+  t.assert(base.store.causalHoles.isEmpty())
+}
+
+export const testAttributionResolveContentIdsLaterReplacementAccept = () => {
+  const base = new Y.Doc({ gc: false })
+  base.clientID = 1
+  base.get('text').insert(0, 'ab')
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Array<Y.ContentIds>} */
+  const changes = []
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) changes.push(Y.createContentIdsFromUpdate(update))
+  })
+  suggestion.transact(() => {
+    suggestion.get('text').delete(0, 1)
+    suggestion.get('text').insert(0, 'X')
+  })
+  suggestion.transact(() => {
+    suggestion.get('text').delete(1, 1)
+    suggestion.get('text').insert(1, 'Y')
+  })
+
+  renderer.resolveContentIds(changes[1], 'accept', {})
+
+  t.assert(base.get('text').toString() === 'aY')
+  t.assert(suggestion.get('text').toString() === 'XY')
+  t.assert(!Y.intersectSets(changes[0].inserts, renderer.inserts).isEmpty())
+  t.assert(!Y.intersectSets(changes[0].deletes, renderer.deletes).isEmpty())
+}
+
+export const testAttributionResolveContentIdsLaterReplacementReject = () => {
+  const base = new Y.Doc({ gc: false })
+  base.clientID = 1
+  base.get('text').insert(0, 'ab')
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Array<Y.ContentIds>} */
+  const changes = []
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) changes.push(Y.createContentIdsFromUpdate(update))
+  })
+  suggestion.transact(() => {
+    suggestion.get('text').delete(0, 1)
+    suggestion.get('text').insert(0, 'X')
+  })
+  suggestion.transact(() => {
+    suggestion.get('text').delete(1, 1)
+    suggestion.get('text').insert(1, 'Y')
+  })
+
+  renderer.resolveContentIds(changes[1], 'reject', {})
+
+  t.assert(base.get('text').toString() === 'ab')
+  t.assert(suggestion.get('text').toString() === 'Xb')
+  t.assert(!Y.intersectSets(changes[0].inserts, renderer.inserts).isEmpty())
+  t.assert(!Y.intersectSets(changes[0].deletes, renderer.deletes).isEmpty())
+}
+
+export const testAttributionResolveContentIdsLaterDelete = () => {
+  const base = new Y.Doc({ gc: false })
+  base.clientID = 1
+  base.get('text').insert(0, 'abc')
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Array<Y.ContentIds>} */
+  const changes = []
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) changes.push(Y.createContentIdsFromUpdate(update))
+  })
+  suggestion.get('text').delete(1, 1)
+  suggestion.get('text').delete(1, 1)
+
+  renderer.resolveContentIds(changes[1], 'accept', {})
+
+  t.assert(base.get('text').toString() === 'ab')
+  t.assert(suggestion.get('text').toString() === 'a')
+  t.assert(!Y.intersectSets(changes[0].deletes, renderer.deletes).isEmpty())
+}
+
+export const testAttributionResolveContentIdsLaterFormat = () => {
+  const base = new Y.Doc({ gc: false })
+  base.clientID = 1
+  base.get('text').insert(0, 'ab')
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Array<Y.ContentIds>} */
+  const changes = []
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) changes.push(Y.createContentIdsFromUpdate(update))
+  })
+  suggestion.get('text').applyDelta(delta.create().retain(1, { strong: {} }).done())
+  suggestion.get('text').applyDelta(delta.create().retain(1).retain(1, { em: {} }).done())
+
+  renderer.resolveContentIds(changes[1], 'accept', {})
+
+  t.assert(base.get('text').toDelta().equals(delta.create().insert('a').insert('b', { em: {} }).done()))
+  t.assert(suggestion.get('text').toDelta().equals(delta.create().insert('a', { strong: {} }).insert('b', { em: {} }).done()))
+  t.assert(!Y.intersectSets(changes[0].inserts, renderer.inserts).isEmpty())
+}
+
+export const testAttributionResolveContentIdsNestedSiblingLaterFirst = () => {
+  const base = new Y.Doc({ gc: false })
+  base.clientID = 1
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Array<Y.ContentIds>} */
+  const changes = []
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) changes.push(Y.createContentIdsFromUpdate(update))
+  })
+  suggestion.get('root').applyDelta(delta.create().insert([delta.create('paragraph', {}, 'X')]).done())
+  suggestion.get('root').applyDelta(delta.create().retain(1).insert([delta.create('paragraph', {}, 'Y')]).done())
+
+  renderer.resolveContentIds(changes[1], 'accept', {})
+  t.assert(base.get('root').toDeltaDeep().equals(delta.create().insert([delta.create('paragraph', {}, 'Y')]).done()))
+  t.assert(suggestion.get('root').toDeltaDeep().equals(delta.create().insert([delta.create('paragraph', {}, 'X'), delta.create('paragraph', {}, 'Y')]).done()))
+  renderer.resolveContentIds(changes[0], 'accept', {})
+
+  t.assert(base.get('root').toDeltaDeep().equals(suggestion.get('root').toDeltaDeep()))
+  t.assert(renderer.inserts.isEmpty())
+}
+
+export const testAttributionResolveContentIdsRequiresStructuralParent = () => {
+  const base = new Y.Doc({ gc: false })
+  base.clientID = 1
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Array<Y.ContentIds>} */
+  const changes = []
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) changes.push(Y.createContentIdsFromUpdate(update))
+  })
+  suggestion.get('root').applyDelta(delta.create().insert([delta.create('paragraph').done()]).done())
+  suggestion.get('root').applyDelta(delta.create().retain(1).insert([delta.create('paragraph', {}, 'unrelated')]).done())
+  const child = /** @type {Y.Type} */ (suggestion.get('root').get(0))
+  child.insert(0, 'child')
+  const counts = { base: 0, suggestion: 0, change: 0 }
+  base.on('update', () => { counts.base++ })
+  suggestion.on('update', () => { counts.suggestion++ })
+  renderer.on('change', () => { counts.change++ })
+
+  t.fails(() => renderer.resolveContentIds(changes[2], 'accept', {}))
+  t.compare(counts, { base: 0, suggestion: 0, change: 0 })
+  t.assert(base.get('root').length === 0)
+
+  const parentAndChild = Y.createContentIds(
+    Y.mergeIdSets([changes[0].inserts, changes[2].inserts]),
+    Y.mergeIdSets([changes[0].deletes, changes[2].deletes])
+  )
+  renderer.resolveContentIds(parentAndChild, 'accept', {})
+
+  t.assert(base.get('root').toDeltaDeep().equals(delta.create().insert([delta.create('paragraph', {}, 'child')]).done()))
+  t.assert(suggestion.get('root').toDeltaDeep().equals(delta.create().insert([delta.create('paragraph', {}, 'child'), delta.create('paragraph', {}, 'unrelated')]).done()))
+  t.assert(!Y.intersectSets(changes[1].inserts, renderer.inserts).isEmpty(), 'unselected sibling remains pending')
 }
 
 export const testAttributionResolveContentIdsExactReject = () => {
