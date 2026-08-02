@@ -91,12 +91,13 @@ export const writeClientsStructs = (encoder, store, _sm) => {
  * @param {StructStore} store
  * @param {BlockSet} clientsStructRefs
  * @param {ReturnType<typeof createSparseIntegrationPlan>} sparsePlan
+ * @param {IdSet} terminalGc
  * @return { null | { update: Uint8Array<ArrayBuffer>, missing: Map<number,number> } }
  *
  * @private
  * @function
  */
-const integrateStructs = (transaction, store, clientsStructRefs, sparsePlan) => {
+const integrateStructs = (transaction, store, clientsStructRefs, sparsePlan, terminalGc) => {
   /**
    * @type {Array<Item | GC | Skip | CausalHole>}
    */
@@ -203,7 +204,13 @@ const integrateStructs = (transaction, store, clientsStructRefs, sparsePlan) => 
           const skip = new Skip(createID(stackHead.id.client, localClock), -offset)
           skip.integrate(transaction, 0)
         }
-        stackHead.integrate(transaction, 0)
+        if (stackHead.constructor === GC && terminalGc.has(stackHead.id.client, stackHead.id.clock)) {
+          store.installTerminalGc(transaction, /** @type {GC} */ (stackHead))
+        } else if (stackHead.constructor === CausalHole && sparsePlan?.isTerminalHole(/** @type {CausalHole} */ (stackHead))) {
+          store.installTerminalGc(transaction, new GC(createID(stackHead.id.client, stackHead.id.clock), stackHead.length))
+        } else {
+          stackHead.integrate(transaction, 0)
+        }
         state.set(stackHead.id.client, math.max(stackHead.id.clock + stackHead.length, localClock))
       }
     }
@@ -256,6 +263,7 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     const ss = readBlockSet(structDecoder)
     const ranges = array.from(ss.clients.values())
     const hasIncomingHoles = ranges.some(range => range.refs.some(struct => struct.constructor === CausalHole))
+    const hasIncomingGc = ranges.some(range => range.refs.some(struct => struct.constructor === GC))
     if (hasIncomingHoles) normalizeIncomingCausalHoles(ss, store)
     const hasSparseCausality = hasIncomingHoles || (!store.causalHoles.isEmpty() && ranges.some(range => range.refs.some(struct =>
       struct.constructor === Item && (
@@ -264,7 +272,8 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
         store.causalHoles.intersects(struct.id.client, struct.id.clock, struct.length)
       )
     )))
-    const sparseDeleteSet = hasSparseCausality ? readIdSet(structDecoder) : null
+    const sparseDeleteSet = hasSparseCausality || hasIncomingGc ? readIdSet(structDecoder) : null
+    const terminalGc = sparseDeleteSet === null ? createIdSet() : normalizeIncomingTerminalGc(ss, sparseDeleteSet)
     const sparseValidation = validateCausalHoleEnvelope(ss, store)
     const sparsePlan = sparseValidation === null ? null : createSparseIntegrationPlan(ss, store, doc, sparseValidation)
     sparsePlan?.applySplits()
@@ -289,7 +298,7 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     // start = performance.now()
     // console.log('time to merge: ', performance.now() - start) // @todo remove
     // start = performance.now()
-    const restStructs = integrateStructs(transaction, store, ss, sparsePlan)
+    const restStructs = integrateStructs(transaction, store, ss, sparsePlan, terminalGc)
     const pending = store.pendingStructs
     if (pending) {
       // check if we can apply something
@@ -359,6 +368,34 @@ const applyDecodedDeleteSet = (deleteSet, transaction, store) => {
   const decoder = new UpdateDecoderV2(decoding.createDecoder(encoder.toUint8Array()))
   decoding.readVarUint(decoder.restDecoder)
   return readAndApplyDeleteSet(decoder, transaction, store)
+}
+
+/**
+ * A GC range without a matching delete-set commitment is sparse terminal coverage. Split mixed
+ * ranges once so integration can keep ordinary GC semantics and transport GC semantics disjoint.
+ *
+ * @param {BlockSet} blockSet
+ * @param {IdSet} deleteSet
+ */
+const normalizeIncomingTerminalGc = (blockSet, deleteSet) => {
+  const terminalGc = createIdSet()
+  blockSet.clients.forEach(range => {
+    /** @type {Array<GC|Item|Skip|CausalHole>} */
+    const normalized = []
+    for (const struct of range.refs) {
+      if (struct.constructor !== GC) {
+        normalized.push(struct)
+        continue
+      }
+      for (const slice of deleteSet.slice(struct.id.client, struct.id.clock, struct.length)) {
+        const gc = new GC(createID(struct.id.client, slice.clock), slice.len)
+        normalized.push(gc)
+        if (!slice.exists) terminalGc.add(gc.id.client, gc.id.clock, gc.length)
+      }
+    }
+    range.refs = normalized
+  })
+  return terminalGc
 }
 
 /**
@@ -497,60 +534,86 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
   const effectiveIncomingHoles = []
   for (const hole of incomingHoles) {
     if (coveredByRealStore(hole) || coveredByStoredHole(hole)) continue
-    liveIncomingHoles.add(hole)
     effectiveIncomingHoles.push(hole)
   }
 
-  /** @param {number} client @param {number} clock @param {number} length */
-  const getHoleOverlaps = (client, clock, length) => store.getCausalHoleOverlaps(client, clock, length).concat(liveIncomingHoles.getOverlaps(client, clock, length))
+  /** @type {Map<Item|CausalHole,Item>} */
+  const structuralParentDependencies = new Map()
+  /** @type {Set<CausalHole>} */
+  const terminalHoles = new Set()
+  /** @param {CausalHole} hole */
+  const classifyHoleStructuralParent = hole => {
+    const parent = hole.parent
+    if (typeof parent === 'string') return true
+    const existing = store.getStruct(parent)
+    if (existing !== null && existing.constructor !== Skip && existing.constructor !== CausalHole) {
+      if (existing.constructor === Item && /** @type {Item} */ (existing).content instanceof ContentType) return true
+      if (existing.constructor === GC || (existing.constructor === Item && existing.deleted)) {
+        terminalHoles.add(hole)
+        return false
+      }
+      throw new Error('Causal hole parent is not a materialized type')
+    }
+    const incoming = incomingAt(parent)
+    if (incoming?.constructor === Item && /** @type {Item} */ (incoming).content instanceof ContentType) {
+      structuralParentDependencies.set(hole, /** @type {Item} */ (incoming))
+      return true
+    }
+    throw new Error('Causal hole parent is not a materialized type')
+  }
 
   /** @type {Map<string,Array<CausalHole>>} */
   const incomingHolesByParentGroup = new Map()
   for (const hole of effectiveIncomingHoles) {
+    if (!classifyHoleStructuralParent(hole)) continue
+    liveIncomingHoles.add(hole)
     const key = sparseParentKey(hole.parent, hole.parentSub)
     const holes = incomingHolesByParentGroup.get(key) ?? []
     holes.push(hole)
     incomingHolesByParentGroup.set(key, holes)
   }
 
-  /** @type {Map<Item|CausalHole,Item>} */
-  const structuralParentDependencies = new Map()
-  /** @param {Item|CausalHole} struct @param {ID|string} parent */
-  const classifyStructuralParent = (struct, parent) => {
+  /** @param {number} client @param {number} clock @param {number} length */
+  const getHoleOverlaps = (client, clock, length) => store.getCausalHoleOverlaps(client, clock, length).concat(liveIncomingHoles.getOverlaps(client, clock, length))
+
+  /** @type {Set<Item>} */
+  const sparseConnectedItems = new Set()
+  /** @param {Item} item */
+  const registerStructuralParentDependency = item => {
+    if (item.parent === null) return
+    const parent = normalizeCausalHoleParent(item.parent)
     if (typeof parent === 'string') return
     const existing = store.getStruct(parent)
-    if (existing !== null && existing.constructor !== Skip && existing.constructor !== CausalHole) {
-      if (existing.constructor === Item && /** @type {Item} */ (existing).content instanceof ContentType) return
-      throw new Error('Causal hole parent is not a materialized type')
-    }
+    if (existing?.constructor !== CausalHole && existing?.constructor !== Skip && existing !== null) return
     const incoming = incomingAt(parent)
-    if (incoming?.constructor === Item && /** @type {Item} */ (incoming).content instanceof ContentType) {
-      if (incoming !== struct) structuralParentDependencies.set(struct, /** @type {Item} */ (incoming))
-      return
+    if (incoming?.constructor === Item && /** @type {Item} */ (incoming).content instanceof ContentType && incoming !== item) {
+      structuralParentDependencies.set(item, /** @type {Item} */ (incoming))
     }
-    throw new Error('Causal hole parent is not a materialized type')
-  }
-
-  /** @param {CausalHole} hole */
-  const validateStructuralParent = hole => {
-    classifyStructuralParent(hole, hole.parent)
-  }
-
-  for (const item of incomingItems) {
-    if (item.parent !== null) classifyStructuralParent(item, normalizeCausalHoleParent(item.parent))
   }
 
   /** @type {Array<CausalHole>} */
-  const roots = effectiveIncomingHoles.slice()
+  const roots = effectiveIncomingHoles.filter(hole => !terminalHoles.has(hole))
   for (const item of incomingItems) {
-    getHoleOverlaps(item.id.client, item.id.clock, item.length).forEach(hole => roots.push(hole))
+    const overlaps = getHoleOverlaps(item.id.client, item.id.clock, item.length)
+    if (overlaps.length > 0) sparseConnectedItems.add(item)
+    overlaps.forEach(hole => roots.push(hole))
     for (const anchor of [item.origin, item.rightOrigin]) {
       if (anchor === null) continue
       const dependency = resolve(anchor)
-      if (dependency?.constructor === CausalHole) roots.push(/** @type {CausalHole} */ (dependency))
+      if (dependency?.constructor === CausalHole) {
+        sparseConnectedItems.add(item)
+        roots.push(/** @type {CausalHole} */ (dependency))
+      }
+    }
+    if (item.parent !== null) {
+      const parent = normalizeCausalHoleParent(item.parent)
+      if (typeof parent !== 'string' && store.getStruct(parent)?.constructor === CausalHole && incomingAt(parent)?.constructor === Item) {
+        sparseConnectedItems.add(item)
+      }
     }
   }
-  if (roots.length === 0) return null
+  sparseConnectedItems.forEach(registerStructuralParentDependency)
+  if (roots.length === 0 && terminalHoles.size === 0 && structuralParentDependencies.size === 0) return null
 
   /** @type {Map<CausalHole,0|1|2>} */
   const colors = new Map()
@@ -563,7 +626,11 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
     while (stack.length > 0) {
       const frame = stack[stack.length - 1]
       reachable.add(frame.hole)
-      if (frame.next === 0) validateStructuralParent(frame.hole)
+      if (frame.next === 0 && !classifyHoleStructuralParent(frame.hole)) {
+        colors.set(frame.hole, 2)
+        stack.pop()
+        continue
+      }
       const anchors = [frame.hole.origin, frame.hole.rightOrigin]
       if (frame.next >= anchors.length) {
         colors.set(frame.hole, 2)
@@ -717,7 +784,8 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
     getHoleOverlaps,
     getHolesForParentGroup: (/** @type {ID|string} */ parent, /** @type {string|null} */ parentSub) =>
       Array.from(store.getCausalHolesForParentGroup(parent, parentSub)).concat(incomingHolesByParentGroup.get(sparseParentKey(parent, parentSub)) ?? []),
-    structuralParentDependencies
+    structuralParentDependencies,
+    terminalHoles
   }
 }
 
@@ -744,7 +812,7 @@ const createSparseIntegrationPlan = (blockSet, store, doc, validation) => {
     (item.origin !== null && validation.resolve(item.origin)?.constructor === CausalHole) ||
     (item.rightOrigin !== null && validation.resolve(item.rightOrigin)?.constructor === CausalHole)
   ))
-  if (sparseItems.size === 0 && validation.structuralParentDependencies.size === 0) return null
+  if (sparseItems.size === 0 && validation.structuralParentDependencies.size === 0 && validation.terminalHoles.size === 0) return null
 
   /** @type {Map<string,{parent:ID|string,parentSub:string|null,items:Array<Item>,itemSet:Set<Item>}>} */
   const groups = new Map()
@@ -1138,6 +1206,7 @@ const createSparseIntegrationPlan = (blockSet, store, doc, validation) => {
   })
 
   return {
+    isTerminalHole: (/** @type {CausalHole} */ hole) => validation.terminalHoles.has(hole),
     getStructuralParentDependency: (/** @type {Item|CausalHole} */ struct) => validation.structuralParentDependencies.get(struct) ?? null,
     applySplits: () => {
       blockSet.clients.forEach(range => {
@@ -1462,6 +1531,7 @@ export const encodeStateVector = doc => encodeStateVectorV2(doc, new IdSetEncode
  */
 const getMissing = (struct, transaction, store, sparsePlan) => {
   if (struct.constructor !== Item && struct.constructor !== CausalHole) return null
+  if (struct.constructor === CausalHole && sparsePlan?.isTerminalHole(/** @type {CausalHole} */ (struct))) return null
   // we may not access these variables anymore after they have been written!
   const origin = struct.origin
   const rightOrigin = struct.rightOrigin

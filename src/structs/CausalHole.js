@@ -2,10 +2,9 @@ import * as binary from 'lib0/binary'
 import * as encoding from 'lib0/encoding'
 
 import { ID, compareIDs, createID, findRootTypeKey } from '../utils/ID.js'
+import { recordLiveCausalHoles } from '../utils/sparse-transport.js'
 
 export const structCausalHoleRefNumber = 11
-
-const transactionCausalHoles = Symbol('causal-hole-transport')
 
 /**
  * @param {ID|null} id
@@ -110,7 +109,7 @@ export class CausalHole {
       this.origin = sliced.origin
     }
     const store = transaction.doc.store
-    recordInstalledCausalHoles(transaction, store.installCausalHole(this))
+    recordLiveCausalHoles(transaction, store.installCausalHole(this))
   }
 
   /**
@@ -181,21 +180,22 @@ export const sameCausalHoleMetadata = (left, right) =>
  * @param {Item} item
  * @param {number} clock
  * @param {number} length
+ * @param {{parent:ID|string,parentSub:string|null}|null} [inferredParent]
  */
-export const sameCausalHoleItemMetadata = (hole, item, clock, length) => {
+export const sameCausalHoleItemMetadata = (hole, item, clock, length, inferredParent = null) => {
   if (
     item.id.client !== hole.id.client ||
     clock < item.id.clock || clock < hole.id.clock ||
     clock + length > item.id.clock + item.length ||
     clock + length > hole.id.clock + hole.length
   ) return false
-  const expected = hole.slice(clock, length)
+  const expectedOrigin = clock === hole.id.clock ? hole.origin : createID(hole.id.client, clock - 1)
   const origin = clock === item.id.clock ? item.origin : createID(item.id.client, clock - 1)
-  if (!compareIDs(origin, expected.origin) || !compareIDs(item.rightOrigin, expected.rightOrigin)) return false
-  if (item.parent !== null) {
-    return sameCausalHoleParent(normalizeCausalHoleParent(item.parent), expected.parent) && item.parentSub === expected.parentSub
-  }
-  return true
+  if (!compareIDs(origin, expectedOrigin) || !compareIDs(item.rightOrigin, hole.rightOrigin)) return false
+  const metadata = item.parent === null
+    ? inferredParent
+    : { parent: normalizeCausalHoleParent(item.parent), parentSub: item.parentSub }
+  return metadata !== null && sameCausalHoleParent(metadata.parent, hole.parent) && metadata.parentSub === hole.parentSub
 }
 
 /**
@@ -317,17 +317,3 @@ export class CausalHoleIndex {
     return holes
   }
 }
-
-/** @param {Transaction} transaction @param {Array<CausalHole>} holes */
-const recordInstalledCausalHoles = (transaction, holes) => {
-  if (holes.length === 0) return
-  let index = /** @type {CausalHoleIndex|undefined} */ (transaction.meta.get(transactionCausalHoles))
-  if (index === undefined) {
-    index = new CausalHoleIndex()
-    transaction.meta.set(transactionCausalHoles, index)
-  }
-  holes.forEach(hole => index.add(hole))
-}
-
-/** @param {Transaction} transaction @return {CausalHoleIndex|null} */
-export const getTransactionCausalHoles = transaction => /** @type {CausalHoleIndex|null} */ (transaction.meta.get(transactionCausalHoles) ?? null)

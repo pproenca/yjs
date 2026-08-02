@@ -14,6 +14,7 @@ import { writeUpdateMessageFromTransaction } from './encoding-helpers.js'
 import { UpdateEncoderV1, UpdateEncoderV2 } from './UpdateEncoder.js'
 import { findIndexSS, updateCurrentFormats, cleanupFormattingGap, tryGcDeleteSet, tryMerge, tryToMergeWithLefts, cleanupContextlessFormattingGap } from './transaction-helpers.js'
 import * as random from 'lib0/random'
+import { hasSparseTransportClient } from './sparse-transport.js'
 
 export const generateNewClientId = random.uint53
 
@@ -307,7 +308,7 @@ const cleanupTransactions = (transactionCleanups, i) => {
           tryToMergeWithLefts(structs, replacedStructPos)
         }
       }
-      if (!transaction.local && transaction.insertSet.clients.has(doc.clientID)) {
+      if (!transaction.local && (transaction.insertSet.clients.has(doc.clientID) || hasSparseTransportClient(transaction, doc.clientID))) {
         logging.print(logging.ORANGE, logging.BOLD, '[yjs] ', logging.UNBOLD, logging.RED, 'Changed the client-id because another client seems to be using it.')
         doc.clientID = generateNewClientId()
       }

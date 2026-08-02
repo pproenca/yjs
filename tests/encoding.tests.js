@@ -68,6 +68,17 @@ const encodeStructGroups = (groups, Encoder) => {
  */
 const encodeCausalHoles = (holes, Encoder) => encodeStructs(holes, Encoder)
 
+/**
+ * @param {Y.IdSet} deleteSet
+ * @param {typeof Y.UpdateEncoderV1|typeof Y.UpdateEncoderV2} Encoder
+ */
+const encodeDeleteSet = (deleteSet, Encoder) => {
+  const encoder = new Encoder()
+  encoding.writeVarUint(encoder.restEncoder, 0)
+  Y.writeIdSet(encoder, deleteSet)
+  return encoder.toUint8Array()
+}
+
 const createCausalHoleBase = () => {
   const doc = new Y.Doc({ gc: false })
   doc.clientID = 1
@@ -124,51 +135,55 @@ export const testCausalHoleTransportOnlyUpdateRoundtrip = () => {
       Encoder: Y.UpdateEncoderV1,
       apply: Y.applyUpdate,
       encode: Y.encodeStateAsUpdate,
-      decode: Y.decodeUpdate,
-      contentIds: Y.createContentIdsFromUpdate,
-      event: 'update'
+      decode: Y.decodeUpdate
     },
     {
       Encoder: Y.UpdateEncoderV2,
       apply: Y.applyUpdateV2,
       encode: Y.encodeStateAsUpdateV2,
-      decode: Y.decodeUpdateV2,
-      contentIds: Y.createContentIdsFromUpdateV2,
-      event: 'updateV2'
+      decode: Y.decodeUpdateV2
     }
-  ].forEach(({ Encoder, apply, encode, decode, contentIds, event }) => {
+  ].forEach(({ Encoder, apply, encode }) => {
     const doc = createCausalHoleBase()
     const prior = encode(doc)
     /** @type {Array<Uint8Array<ArrayBuffer>>} */
-    const updates = []
+    const updatesV1 = []
+    /** @type {Array<Uint8Array<ArrayBuffer>>} */
+    const updatesV2 = []
     /** @type {Y.Transaction|null} */
     let transaction = null
     let semanticEvents = 0
     doc.get('text').observe(() => { semanticEvents++ })
     doc.on('afterTransaction', tr => { transaction = tr })
-    doc.on(/** @type {'update'|'updateV2'} */ (event), update => updates.push(update))
+    doc.on('beforeObserverCalls', tr => { tr.meta.clear() })
+    doc.on('update', update => updatesV1.push(update))
+    doc.on('updateV2', update => updatesV2.push(update))
 
     apply(doc, encodeCausalHoles([
       new CausalHole(Y.createID(2, 0), 2, Y.createID(1, 0), null, 'text', null)
     ], Encoder))
 
-    t.assert(updates.length === 1 && semanticEvents === 0, `${Encoder.name} emits transport without a type event`)
-    const ids = contentIds(updates[0])
-    t.assert(ids.inserts.isEmpty() && ids.deletes.isEmpty(), `${Encoder.name} transport update has no semantic ids`)
+    t.assert(updatesV1.length === 1 && updatesV2.length === 1 && semanticEvents === 0, `${Encoder.name} emits both transports after meta.clear`)
     t.assert(
       transaction !== null &&
       /** @type {Y.Transaction} */ (transaction).insertSet.isEmpty() &&
       /** @type {Y.Transaction} */ (transaction).deleteSet.isEmpty(),
       `${Encoder.name} transaction sets stay semantic`
     )
-    t.assert(decode(updates[0]).structs.some(struct => struct.constructor === CausalHole), `${Encoder.name} emitted update carries the hole`)
-
-    const replay = new Y.Doc({ gc: false })
-    apply(replay, prior)
-    apply(replay, updates[0])
-    const replayHole = replay.store.getCausalHole(Y.createID(2, 0))
-    t.assert(replay.get('text').toString() === doc.get('text').toString())
-    t.assert(replayHole !== null && replayHole.length === 2, `${Encoder.name} prior plus emitted update reconstructs post-state`)
+    ;[
+      { update: updatesV1[0], decode: Y.decodeUpdate, contentIds: Y.createContentIdsFromUpdate, replayApply: Y.applyUpdate },
+      { update: updatesV2[0], decode: Y.decodeUpdateV2, contentIds: Y.createContentIdsFromUpdateV2, replayApply: Y.applyUpdateV2 }
+    ].forEach(({ update, decode, contentIds, replayApply }) => {
+      const ids = contentIds(update)
+      t.assert(ids.inserts.isEmpty() && ids.deletes.isEmpty(), `${Encoder.name} transport update has no semantic ids`)
+      t.assert(decode(update).structs.some(struct => struct.constructor === CausalHole), `${Encoder.name} emitted update carries the hole`)
+      const replay = new Y.Doc({ gc: false })
+      apply(replay, prior)
+      replayApply(replay, update)
+      const replayHole = replay.store.getCausalHole(Y.createID(2, 0))
+      t.assert(replay.get('text').toString() === doc.get('text').toString())
+      t.assert(replayHole !== null && replayHole.length === 2, `${Encoder.name} prior plus emitted update reconstructs post-state`)
+    })
   })
 }
 
@@ -513,32 +528,101 @@ export const testCausalHoleForgedDuplicateParentFailsAtomically = () => {
   })
 }
 
+export const testUnrelatedCausalHoleDoesNotChangeLateChildUnderGc = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, event: 'update' },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, event: 'updateV2' }
+  ].forEach(({ Encoder, apply, event }) => {
+    const parentGc = encodeStructs([new Y.GC(Y.createID(1, 0), 1)], Encoder)
+    const unrelatedHole = encodeCausalHoles([
+      new CausalHole(Y.createID(2, 0), 1, null, null, 'unrelated', null)
+    ], Encoder)
+    const lateChild = encodeStructs([
+      new Y.Item(Y.createID(3, 0), null, null, null, null, Y.createID(1, 0), null, new Y.ContentString('x'))
+    ], Encoder)
+
+    const plain = new Y.Doc({ gc: false })
+    plain.clientID = 99
+    apply(plain, parentGc)
+    /** @type {Uint8Array<ArrayBuffer>|null} */
+    let plainEvent = null
+    plain.on(/** @type {'update'|'updateV2'} */ (event), update => { plainEvent = update })
+    apply(plain, lateChild)
+
+    const sparse = new Y.Doc({ gc: false })
+    sparse.clientID = 99
+    apply(sparse, parentGc)
+    apply(sparse, unrelatedHole)
+    /** @type {Uint8Array<ArrayBuffer>|null} */
+    let sparseEvent = null
+    sparse.on(/** @type {'update'|'updateV2'} */ (event), update => { sparseEvent = update })
+    apply(sparse, lateChild)
+
+    t.assert(plain.store.getStruct(Y.createID(3, 0))?.constructor === Y.GC)
+    t.assert(sparse.store.getStruct(Y.createID(3, 0))?.constructor === Y.GC, `${Encoder.name} unrelated hole preserves ordinary GC-parent behavior`)
+    t.assert(sparse.store.causalHoles.has(2, 0), `${Encoder.name} unrelated hole stays live`)
+    t.compareArrays(
+      Array.from(/** @type {Uint8Array<ArrayBuffer>} */ (/** @type {unknown} */ (sparseEvent))),
+      Array.from(/** @type {Uint8Array<ArrayBuffer>} */ (/** @type {unknown} */ (plainEvent))),
+      `${Encoder.name} unrelated sparse state leaves ordinary event bytes exact`
+    )
+    t.assert(sparse.store.pendingStructs === null && sparse.store.pendingDs === null)
+  })
+}
+
+export const testCausalHoleTransportRotatesDuplicateClientBeforeLocalAllocation = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, decode: Y.decodeUpdate, event: 'update' },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, decode: Y.decodeUpdateV2, event: 'updateV2' }
+  ].forEach(({ Encoder, apply, decode, event }) => {
+    const live = new Y.Doc({ gc: false })
+    live.clientID = 2
+    apply(live, encodeCausalHoles([
+      new CausalHole(Y.createID(2, 0), 1, null, null, 'text', null)
+    ], Encoder))
+    const liveClient = live.clientID
+    t.assert(liveClient !== 2, `${Encoder.name} live sparse transport rotates a duplicate client`)
+    /** @type {Uint8Array<ArrayBuffer>|null} */
+    let liveLocalEvent = null
+    live.on(/** @type {'update'|'updateV2'} */ (event), update => { liveLocalEvent = update })
+    live.get('text').insert(0, 'L')
+    const liveLocalStruct = decode(/** @type {Uint8Array<ArrayBuffer>} */ (/** @type {unknown} */ (liveLocalEvent))).structs.find(struct => struct.constructor === Y.Item)
+    t.assert(liveLocalStruct?.id.client === liveClient, `${Encoder.name} next local allocation uses rotated client`)
+    apply(live, encodeStructs([
+      new Y.Item(Y.createID(2, 0), null, null, null, null, 'text', null, new Y.ContentString('X'))
+    ], Encoder))
+    t.assert(live.store.getStruct(Y.createID(2, 0))?.constructor === Y.Item)
+    t.assert(live.get('text').toString().includes('L') && live.get('text').toString().includes('X'))
+    t.assert(live.store.causalHoles.isEmpty() && live.store.pendingStructs === null && live.store.pendingDs === null)
+
+    const terminal = new Y.Doc({ gc: false })
+    apply(terminal, encodeStructs([new Y.GC(Y.createID(1, 0), 1)], Encoder))
+    terminal.clientID = 2
+    apply(terminal, encodeCausalHoles([
+      new CausalHole(Y.createID(2, 0), 1, null, null, Y.createID(1, 0), null)
+    ], Encoder))
+    const terminalClient = terminal.clientID
+    t.assert(terminalClient !== 2, `${Encoder.name} terminal sparse transport rotates a duplicate client`)
+    /** @type {Uint8Array<ArrayBuffer>|null} */
+    let terminalLocalEvent = null
+    terminal.on(/** @type {'update'|'updateV2'} */ (event), update => { terminalLocalEvent = update })
+    terminal.get('local').insert(0, 'T')
+    const terminalLocalStruct = decode(/** @type {Uint8Array<ArrayBuffer>} */ (/** @type {unknown} */ (terminalLocalEvent))).structs.find(struct => struct.constructor === Y.Item)
+    t.assert(terminalLocalStruct?.id.client === terminalClient, `${Encoder.name} terminal rotation precedes local allocation`)
+    apply(terminal, encodeStructs([
+      new Y.Item(Y.createID(2, 0), null, null, null, null, Y.createID(1, 0), null, new Y.ContentString('late'))
+    ], Encoder))
+    t.assert(terminal.store.getStruct(Y.createID(2, 0))?.constructor === Y.GC)
+    t.assert(terminal.get('local').toString() === 'T')
+    t.assert(terminal.store.pendingStructs === null && terminal.store.pendingDs === null)
+  })
+}
+
 export const testCausalHoleStructuralParentDominanceAndDependency = () => {
   ;[
     { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },
     { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, event: 'updateV2' }
-  ].forEach(({ Encoder, apply, encode, event }) => {
-    const gcTarget = new Y.Doc({ gc: false })
-    apply(gcTarget, encodeStructs([new Y.GC(Y.createID(1, 0), 1)], Encoder))
-    const duplicateParent = new Y.Item(
-      Y.createID(1, 0), null, null, null, null, 'fake', null, new Y.ContentType(new Y.Type())
-    )
-    const childHole = new CausalHole(Y.createID(2, 0), 1, null, null, Y.createID(1, 0), null)
-    const unrelated = new Y.Item(
-      Y.createID(9, 0), null, null, null, null, 'other', null, new Y.ContentString('must-not-commit')
-    )
-    const malformed = encodeStructGroups([[duplicateParent], [childHole], [unrelated]], Encoder)
-    const before = encode(gcTarget)
-    const clients = new Map(gcTarget.store.clients)
-    let updates = 0
-    gcTarget.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
-
-    t.fails(() => apply(gcTarget, malformed))
-    t.compareArrays(Array.from(encode(gcTarget)), Array.from(before))
-    t.assert([...clients].every(([client, structs]) => gcTarget.store.clients.get(client) === structs))
-    t.assert(gcTarget.store.getStruct(Y.createID(1, 0))?.constructor === Y.GC, `${Encoder.name} stored GC dominates the duplicate type`)
-    t.assert(!gcTarget.store.clients.has(2) && !gcTarget.store.clients.has(9) && updates === 0, `${Encoder.name} parent failure is zero-write`)
-
+  ].forEach(({ Encoder, apply }) => {
     const target = new Y.Doc({ gc: false })
     apply(target, encodeCausalHoles([
       new CausalHole(Y.createID(1, 0), 1, null, null, 'root', null)
@@ -886,6 +970,105 @@ export const testCausalHoleNestedParentGcFinalizationMatrix = () => {
   })
 }
 
+export const testCausalHoleTerminalGcTransportOrdering = () => {
+  ;[
+    {
+      Encoder: Y.UpdateEncoderV1,
+      apply: Y.applyUpdate,
+      encode: Y.encodeStateAsUpdate,
+      merge: Y.mergeUpdates,
+      decode: Y.decodeUpdate,
+      contentIds: Y.createContentIdsFromUpdate,
+      event: 'update'
+    },
+    {
+      Encoder: Y.UpdateEncoderV2,
+      apply: Y.applyUpdateV2,
+      encode: Y.encodeStateAsUpdateV2,
+      merge: Y.mergeUpdatesV2,
+      decode: Y.decodeUpdateV2,
+      contentIds: Y.createContentIdsFromUpdateV2,
+      event: 'updateV2'
+    }
+  ].forEach(({ Encoder, apply, encode, merge, decode, contentIds, event }) => {
+    const parents = encodeStructs([
+      new Y.Item(Y.createID(1, 0), null, null, null, null, 'root', null, new Y.ContentType(new Y.Type())),
+      new Y.Item(Y.createID(1, 1), null, null, null, null, Y.createID(1, 0), null, new Y.ContentType(new Y.Type()))
+    ], Encoder)
+    const hole = encodeCausalHoles([
+      new CausalHole(Y.createID(2, 0), 2, null, null, Y.createID(1, 1), null)
+    ], Encoder)
+    const deleteSet = Y.createIdSet()
+    deleteSet.add(1, 0, 1)
+    const deletion = encodeDeleteSet(deleteSet, Encoder)
+
+    /** @param {Y.Doc} doc */
+    const terminalSignature = doc => (doc.store.clients.get(2) ?? []).map(struct => [struct.constructor.name, struct.id.clock, struct.length])
+    /** @param {Y.Doc} expected @param {Uint8Array<ArrayBuffer>} prior @param {Uint8Array<ArrayBuffer>} update @param {string} label */
+    const assertReplay = (expected, prior, update, label) => {
+      const replay = new Y.Doc({ gc: true })
+      apply(replay, prior)
+      apply(replay, update)
+      t.compare(terminalSignature(replay), terminalSignature(expected), `${Encoder.name} ${label} replay coverage`)
+      t.compareArrays(Array.from(Y.encodeStateVector(replay)), Array.from(Y.encodeStateVector(expected)))
+      t.assert(replay.store.pendingStructs === null && replay.store.pendingDs === null)
+    }
+
+    const holeThenDelete = new Y.Doc({ gc: true })
+    apply(holeThenDelete, parents)
+    apply(holeThenDelete, hole)
+    const holeThenDeletePrior = encode(holeThenDelete)
+    /** @type {Uint8Array<ArrayBuffer>|null} */
+    let holeThenDeleteEvent = null
+    holeThenDelete.on(/** @type {'update'|'updateV2'} */ (event), update => { holeThenDeleteEvent = update })
+    apply(holeThenDelete, deletion)
+    const firstEvent = /** @type {Uint8Array<ArrayBuffer>} */ (/** @type {unknown} */ (holeThenDeleteEvent))
+    t.compare(terminalSignature(holeThenDelete), [['GC', 0, 2]], `${Encoder.name} parent-hole-delete terminalizes coverage`)
+    t.assert(decode(firstEvent).structs.some(struct => struct.constructor === Y.GC && struct.id.client === 2))
+    t.assert(!contentIds(firstEvent).inserts.has(2, 0), `${Encoder.name} retired terminal GC is not a semantic insert`)
+    assertReplay(holeThenDelete, holeThenDeletePrior, firstEvent, 'parent-hole-delete')
+
+    const deleteThenHole = new Y.Doc({ gc: true })
+    apply(deleteThenHole, parents)
+    apply(deleteThenHole, deletion)
+    const deleteThenHolePrior = encode(deleteThenHole)
+    /** @type {Uint8Array<ArrayBuffer>|null} */
+    let deleteThenHoleEvent = null
+    /** @type {Y.Transaction|null} */
+    let deleteThenHoleTransaction = null
+    deleteThenHole.on('afterTransaction', transaction => { deleteThenHoleTransaction = transaction })
+    deleteThenHole.on(/** @type {'update'|'updateV2'} */ (event), update => { deleteThenHoleEvent = update })
+    apply(deleteThenHole, hole)
+    const secondEvent = /** @type {Uint8Array<ArrayBuffer>} */ (/** @type {unknown} */ (deleteThenHoleEvent))
+    t.compare(terminalSignature(deleteThenHole), [['GC', 0, 2]], `${Encoder.name} parent-delete-hole canonicalizes to terminal GC`)
+    const secondIds = contentIds(secondEvent)
+    t.assert(secondIds.inserts.isEmpty() && secondIds.deletes.isEmpty(), `${Encoder.name} terminal-only event has empty semantic ids`)
+    t.assert(
+      deleteThenHoleTransaction !== null &&
+      /** @type {Y.Transaction} */ (deleteThenHoleTransaction).insertSet.isEmpty() &&
+      /** @type {Y.Transaction} */ (deleteThenHoleTransaction).deleteSet.isEmpty(),
+      `${Encoder.name} terminal-only transaction sets stay empty`
+    )
+    assertReplay(deleteThenHole, deleteThenHolePrior, secondEvent, 'parent-delete-hole')
+
+    const combined = new Y.Doc({ gc: true })
+    apply(combined, parents)
+    const combinedPrior = encode(combined)
+    /** @type {Uint8Array<ArrayBuffer>|null} */
+    let combinedEvent = null
+    combined.on(/** @type {'update'|'updateV2'} */ (event), update => { combinedEvent = update })
+    apply(combined, merge([hole, deletion]))
+    const thirdEvent = /** @type {Uint8Array<ArrayBuffer>} */ (/** @type {unknown} */ (combinedEvent))
+    t.compare(terminalSignature(combined), [['GC', 0, 2]], `${Encoder.name} combined hole-delete terminalizes coverage`)
+    t.assert(decode(thirdEvent).structs.some(struct => struct.constructor === Y.GC && struct.id.client === 2))
+    t.assert(!contentIds(thirdEvent).inserts.has(2, 0), `${Encoder.name} combined terminal GC is not a semantic insert`)
+    assertReplay(combined, combinedPrior, thirdEvent, 'combined')
+
+    t.compare(terminalSignature(holeThenDelete), terminalSignature(deleteThenHole))
+    t.compare(terminalSignature(deleteThenHole), terminalSignature(combined))
+  })
+}
+
 export const testCausalHoleSparseMergeGaps = () => {
   ;[
     { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, merge: Y.mergeUpdates, decode: Y.decodeUpdate },
@@ -913,7 +1096,7 @@ export const testCausalHoleSparseMergeGaps = () => {
   })
 }
 
-export const testCausalHoleSparseMergeValidatesMaterializedMetadata = () => {
+export const testCausalHoleSparseMergeRequiresProvableParentMetadata = () => {
   ;[
     { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, merge: Y.mergeUpdates, encode: Y.encodeStateAsUpdate },
     { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, merge: Y.mergeUpdatesV2, encode: Y.encodeStateAsUpdateV2 }
@@ -948,10 +1131,81 @@ export const testCausalHoleSparseMergeValidatesMaterializedMetadata = () => {
     t.fails(() => merge([forgedHoleUpdate, honestItemUpdate]))
     t.fails(() => merge([honestItemUpdate, forgedHoleUpdate]))
 
-    const merged = merge([canonicalHoleUpdate, honestItemUpdate])
-    const accepted = createCausalHoleBase()
-    apply(accepted, merged)
-    t.assert(accepted.get('text').toString() === 'aX' && accepted.store.causalHoles.isEmpty(), `${Encoder.name} matching materialized metadata keeps Item precedence`)
+    // The matching parent is not encoded on honestItem; without its external anchor merge cannot prove it.
+    t.fails(() => merge([canonicalHoleUpdate, honestItemUpdate]))
+    t.fails(() => merge([honestItemUpdate, canonicalHoleUpdate]))
+
+    const explicitHoleUpdate = encodeCausalHoles([
+      new CausalHole(Y.createID(5, 0), 1, null, null, 'explicit', null)
+    ], Encoder)
+    const explicitItemUpdate = encodeStructs([
+      new Y.Item(Y.createID(5, 0), null, null, null, null, 'explicit', null, new Y.ContentString('E'))
+    ], Encoder)
+    const explicit = new Y.Doc({ gc: false })
+    apply(explicit, merge([explicitHoleUpdate, explicitItemUpdate]))
+    t.assert(explicit.get('explicit').toString() === 'E' && explicit.store.causalHoles.isEmpty(), `${Encoder.name} explicit matching parent merges`)
+
+    const baseline = encode(createCausalHoleBase())
+    ;[
+      merge([baseline, canonicalHoleUpdate, honestItemUpdate]),
+      merge([baseline, honestItemUpdate, canonicalHoleUpdate])
+    ].forEach(merged => {
+      const accepted = new Y.Doc({ gc: false })
+      apply(accepted, merged)
+      t.assert(accepted.get('text').toString() === 'aX' && accepted.store.causalHoles.isEmpty(), `${Encoder.name} merge-input anchor proves copied parent`)
+    })
+  })
+}
+
+export const testCausalHoleSparseMergeKeepsDominantItemWhole = () => {
+  const length = 256
+  ;[
+    { Encoder: Y.UpdateEncoderV1, merge: Y.mergeUpdates, decode: Y.decodeUpdate, apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, merge: Y.mergeUpdatesV2, decode: Y.decodeUpdateV2, apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, merge, decode, apply }) => {
+    const item = encodeStructs([
+      new Y.Item(Y.createID(7, 0), null, null, null, null, 'text', null, new Y.ContentString('x'.repeat(length)))
+    ], Encoder)
+    const holes = Array.from({ length }, (_, clock) => encodeCausalHoles([
+      new CausalHole(
+        Y.createID(7, clock),
+        1,
+        clock === 0 ? null : Y.createID(7, clock - 1),
+        null,
+        'text',
+        null
+      )
+    ], Encoder))
+    const originalCopy = Y.ContentString.prototype.copy
+    const originalSplice = Y.ContentString.prototype.splice
+    let copies = 0
+    let splices = 0
+    Y.ContentString.prototype.copy = function () {
+      copies++
+      return originalCopy.call(this)
+    }
+    Y.ContentString.prototype.splice = function (/** @type {number} */ offset) {
+      splices++
+      return originalSplice.call(this, offset)
+    }
+    /** @type {Uint8Array<ArrayBuffer>} */
+    let merged = item
+    try {
+      holes.forEach((hole, index) => {
+        merged = index % 2 === 0 ? merge([merged, hole]) : merge([hole, merged])
+      })
+    } finally {
+      Y.ContentString.prototype.copy = originalCopy
+      Y.ContentString.prototype.splice = originalSplice
+    }
+
+    const materialized = decode(merged).structs.filter(struct => struct.constructor === Y.Item)
+    t.assert(materialized.length === 1 && materialized[0].id.clock === 0 && materialized[0].length === length, `${Encoder.name} dominant Item stays one range`)
+    t.assert(copies === 0 && splices === 0, `${Encoder.name} lower-rank one-clock folds make no Item content copies`)
+    const doc = new Y.Doc({ gc: false })
+    apply(doc, merged)
+    t.assert(doc.get('text').toString() === 'x'.repeat(length))
+    t.assert(doc.store.causalHoles.isEmpty() && doc.store.pendingStructs === null && doc.store.pendingDs === null)
   })
 }
 

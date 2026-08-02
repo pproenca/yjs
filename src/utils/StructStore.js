@@ -4,6 +4,7 @@ import { GC } from '../structs/GC.js'
 import { createID } from './ID.js'
 import { createDeleteSetFromStructStore, createIdSet } from './ids.js'
 import { findIndexSS } from './transaction-helpers.js'
+import { recordTerminalGc } from './sparse-transport.js'
 
 /** @param {ID|string} parent @param {string|null} parentSub */
 const causalHoleParentGroupKey = (parent, parentSub) => typeof parent === 'string'
@@ -92,6 +93,15 @@ export class StructStore {
       }
     }
     return installed
+  }
+
+  /** @param {Transaction} transaction @param {GC} gc */
+  installTerminalGc (transaction, gc) {
+    this.add(gc)
+    if (this.getStruct(gc.id) === gc) {
+      recordTerminalGc(transaction, gc.id.client, gc.id.clock, gc.length)
+      transaction._mergeStructs.push(gc)
+    }
   }
 
   /**
@@ -254,6 +264,7 @@ export class StructStore {
       this._unindexCausalHole(hole)
       structs[index] = gc
       this.causalHoles.delete(hole.id.client, hole.id.clock, hole.length)
+      recordTerminalGc(transaction, gc.id.client, gc.id.clock, gc.length)
       transaction._mergeStructs.push(gc)
     }
   }

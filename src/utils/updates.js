@@ -257,28 +257,18 @@ export const createContentIdsFromUpdateV2 = (update, YDecoder = UpdateDecoderV2)
   const updateDecoder = new YDecoder(decoding.createDecoder(update))
   const lazyDecoder = new LazyStructReader(updateDecoder, true)
   const inserts = createIdSet()
-  let lastClientId = -1
-  let lastClock = 0
-  let lastLen = 0
+  const gc = createIdSet()
   for (let curr = lazyDecoder.curr; curr !== null; curr = lazyDecoder.next()) {
     if (curr.constructor === CausalHole) continue
-    const currId = curr.id
-    if (lastClientId === currId.client && lastClock + lastLen === currId.clock) {
-      // default case: extend prev entry
-      lastLen += curr.length
-    } else {
-      if (lastClientId >= 0) {
-        inserts.add(lastClientId, lastClock, lastLen)
-      }
-      lastClientId = currId.client
-      lastClock = currId.clock
-      lastLen = curr.length
-    }
-  }
-  if (lastClientId >= 0) {
-    inserts.add(lastClientId, lastClock, lastLen)
+    const target = curr.constructor === GC ? gc : inserts
+    target.add(curr.id.client, curr.id.clock, curr.length)
   }
   const deletes = readIdSet(updateDecoder)
+  gc.forEach((range, client) => {
+    deletes.slice(client, range.clock, range.len).forEach(slice => {
+      if (slice.exists) inserts.add(client, slice.clock, slice.len)
+    })
+  })
   return { inserts, deletes }
 }
 
