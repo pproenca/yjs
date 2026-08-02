@@ -10,6 +10,8 @@ import * as map from 'lib0/map'
 import { iterateStructs, findIndexSS, iterateStructsWithoutSplits, tryGc } from './transaction-helpers.js'
 import { UpdateEncoderV2, IdSetEncoderV2 } from './UpdateEncoder.js'
 import { IdSetDecoderV2 } from './UpdateDecoder.js'
+import { Skip } from '../structs/Skip.js'
+import { CausalHole } from '../structs/CausalHole.js'
 
 /**
  * @typedef {{ inserts: IdSet, deletes: IdSet }} ContentIds
@@ -718,20 +720,25 @@ export const _createInsertSliceFromStructs = (structs, filterDeleted) => {
    * @type {Array<IdRange>}
    */
   const iditems = []
-  for (let i = 0; i < structs.length; i++) {
-    const struct = structs[i]
-    if (!(filterDeleted && struct.deleted)) {
-      const clock = struct.id.clock
-      let len = struct.length
-      if (i + 1 < structs.length) {
-        // eslint-disable-next-line
-        for (let next = structs[i + 1]; i + 1 < structs.length && !(filterDeleted && next.deleted); next = structs[++i + 1]) {
-          len += next.length
-        }
-      }
+  let clock = 0
+  let len = 0
+  for (const struct of structs) {
+    const sparse = struct.constructor === Skip || struct.constructor === CausalHole
+    if (sparse || (filterDeleted && struct.deleted)) {
+      if (len > 0) iditems.push(new IdRange(clock, len))
+      len = 0
+    } else if (len === 0) {
+      clock = struct.id.clock
+      len = struct.length
+    } else if (clock + len === struct.id.clock) {
+      len += struct.length
+    } else {
       iditems.push(new IdRange(clock, len))
+      clock = struct.id.clock
+      len = struct.length
     }
   }
+  if (len > 0) iditems.push(new IdRange(clock, len))
   return iditems
 }
 

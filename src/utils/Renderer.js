@@ -5,7 +5,7 @@ import { getItemCleanStart } from './transaction-helpers.js'
 import { diffIdSet, createInsertSetFromStructStore, createDeleteSetFromStructStore, insertIntoIdSet, mergeIdSets, intersectSets, createIdSet, createIdSetFromIdMap, writeIdSet, createIdMapFromIdSet, insertIntoIdMap, diffIdMap, createIdMap, mergeIdMaps, intersectMaps, createMaybeAttrRange, createContentAttribute } from './ids.js'
 import { ContentDeleted, ContentFormat } from '../structs/Item.js'
 import { createID } from './ID.js'
-import { writeStructsFromIdSet } from './encoding-helpers.js'
+import { writeStructsFromIdSet, writeStructsFromIdSetWithCausalHoles } from './encoding-helpers.js'
 import { applyUpdate, encodeStateAsUpdate } from './encoding.js'
 import { UpdateEncoderV1 } from './UpdateEncoder.js'
 import { transact } from './Transaction.js'
@@ -351,7 +351,8 @@ const prepareRejectUpdate = (renderer, ids) => {
     assertStructCoverage(scratch.store, deletes, struct => struct.isItem && /** @type {Item} */ (struct).redone != null, 'ContentIds delete could not be rejected')
 
     const encoder = new UpdateEncoderV1()
-    writeStructsFromIdSet(encoder, scratch.store, mergeIdSets([ids.inserts, tr.insertSet]))
+    const projection = getDiffRendererProjection(renderer)
+    writeStructsFromIdSetWithCausalHoles(encoder, scratch.store, mergeIdSets([ids.inserts, tr.insertSet]), [projection.prevDoc.store, projection.nextDoc.store])
     writeIdSet(encoder, mergeIdSets([ids.inserts, ids.deletes]))
     return encoder.toUint8Array()
   } finally {
@@ -640,7 +641,7 @@ export class DiffRenderer extends ObservableV2 {
     const encoder = new UpdateEncoderV1()
     let update
     if (disposition === 'accept') {
-      writeStructsFromIdSet(encoder, projection.nextDoc.store, actionable.inserts)
+      writeStructsFromIdSetWithCausalHoles(encoder, projection.nextDoc.store, actionable.inserts, [projection.prevDoc.store])
       writeIdSet(encoder, actionable.deletes)
       update = encoder.toUint8Array()
     } else {

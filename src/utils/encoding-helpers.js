@@ -4,12 +4,14 @@ import * as array from 'lib0/array'
 
 import { findIndexSS } from './transaction-helpers.js'
 import { Skip } from '../structs/Skip.js'
+import { Item } from '../structs/Item.js'
+import { CausalHole, createCausalHoleFromItem, sameCausalHoleMetadata } from '../structs/CausalHole.js'
 import { createID } from './ID.js'
 import { writeIdSet } from './ids.js'
 
 /**
  * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
- * @param {Array<GC|Item|Skip>} structs All structs by `client`
+ * @param {Array<GC|Item|Skip|CausalHole>} structs All structs by `client`
  * @param {number} client
  * @param {Array<IdRange>} idranges
  *
@@ -81,8 +83,153 @@ export const writeStructsFromIdSet = (encoder, store, idset) => {
   // This heavily improves the conflict algorithm.
   array.from(idset.clients.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, ids]) => {
     const idRanges = ids.getIds()
-    const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
+    const structs = /** @type {Array<GC|Item|Skip|CausalHole>} */ (store.clients.get(client))
     writeStructs(encoder, structs, client, idRanges)
+  })
+}
+
+/**
+ * Write selected semantic structs plus metadata-only causal coverage for unavailable anchors.
+ *
+ * @param {UpdateEncoderV1|UpdateEncoderV2} encoder
+ * @param {StructStore} sourceStore
+ * @param {IdSet} selected
+ * @param {Array<StructStore>} knownStores
+ */
+export const writeStructsFromIdSetWithCausalHoles = (encoder, sourceStore, selected, knownStores) => {
+  const holes = collectCausalHoles(sourceStore, selected, knownStores, true)
+  writeSparseSelection(encoder, sourceStore, selected, holes)
+}
+
+/**
+ * @param {StructStore} sourceStore
+ * @param {IdSet} selected
+ * @param {Array<StructStore>} knownStores
+ * @param {boolean} synthesize
+ */
+const collectCausalHoles = (sourceStore, selected, knownStores, synthesize) => {
+  /** @type {Map<string,CausalHole>} */
+  const holes = new Map()
+  /**
+   * @param {ID} id
+   */
+  const isKnown = id => knownStores.length > 0 && knownStores.every(store => {
+    if (id.clock >= store.getClock(id.client) || store.skips.hasId(id) || store.causalHoles.hasId(id)) return false
+    return store.get(id).constructor === Item
+  })
+  /** @param {ID} id */
+  const isSourceMaterialized = id => id.clock < sourceStore.getClock(id.client) &&
+    !sourceStore.skips.hasId(id) && !sourceStore.causalHoles.hasId(id) && sourceStore.get(id).constructor === Item
+  /**
+   * @param {ID|string} parent
+   */
+  const requireParent = parent => {
+    if (typeof parent === 'string' || selected.hasId(parent) || isKnown(parent) || (!synthesize && isSourceMaterialized(parent))) return
+    throw new Error('Selected content has an unavailable structural parent')
+  }
+  /**
+   * @param {ID|null} id
+   * @param {Set<string>} path
+   */
+  const visitAnchor = (id, path) => {
+    if (id === null || selected.hasId(id) || isKnown(id)) return
+    const key = `${id.client}:${id.clock}`
+    if (path.has(key)) throw new Error('Cyclic causal hole metadata')
+    const source = id.clock < sourceStore.getClock(id.client) ? sourceStore.get(id) : null
+    if (source === null || source.constructor === Skip) {
+      throw new Error('Missing causal anchor')
+    }
+    if (!synthesize && source.constructor !== CausalHole) return
+    let hole
+    if (source.constructor === CausalHole) {
+      hole = /** @type {CausalHole} */ (source).slice(id.clock, 1)
+    } else if (source.constructor === Item) {
+      hole = createCausalHoleFromItem(/** @type {Item} */ (source), id.clock, 1)
+    } else {
+      throw new Error('Missing causal anchor')
+    }
+    const previous = holes.get(key)
+    if (previous !== undefined && !sameCausalHoleMetadata(previous, hole)) throw new Error('Conflicting causal hole metadata')
+    if (previous !== undefined) return
+    holes.set(key, hole)
+    requireParent(hole.parent)
+    const nextPath = new Set(path)
+    nextPath.add(key)
+    visitAnchor(hole.origin, nextPath)
+    visitAnchor(hole.rightOrigin, nextPath)
+  }
+  selected.forEach((range, client) => {
+    const structs = sourceStore.clients.get(client)
+    if (structs === undefined) throw new Error('Selected content is missing')
+    let index = findIndexSS(structs, range.clock)
+    const end = range.clock + range.len
+    let clock = range.clock
+    while (clock < end) {
+      const struct = structs[index++]
+      if (struct === undefined || struct.id.clock > clock || struct.constructor !== Item) {
+        throw new Error('Selected content is not materialized')
+      }
+      const sliceEnd = Math.min(end, struct.id.clock + struct.length)
+      const metadata = createCausalHoleFromItem(/** @type {Item} */ (struct), clock, sliceEnd - clock)
+      requireParent(metadata.parent)
+      visitAnchor(metadata.origin, new Set())
+      visitAnchor(metadata.rightOrigin, new Set())
+      clock = sliceEnd
+    }
+  })
+  return holes
+}
+
+/**
+ * @param {UpdateEncoderV1|UpdateEncoderV2} encoder
+ * @param {StructStore} sourceStore
+ * @param {IdSet} selected
+ * @param {Map<string,CausalHole>} holes
+ */
+const writeSparseSelection = (encoder, sourceStore, selected, holes) => {
+  /** @type {Map<number,Array<{struct:Item|CausalHole,start:number,end:number}>>} */
+  const blocks = new Map()
+  const add = (struct, start, end) => {
+    let clientBlocks = blocks.get(struct.id.client)
+    if (clientBlocks === undefined) {
+      clientBlocks = []
+      blocks.set(struct.id.client, clientBlocks)
+    }
+    clientBlocks.push({ struct, start, end })
+  }
+  selected.forEach((range, client) => {
+    const structs = /** @type {Array<GC|Item|Skip|CausalHole>} */ (sourceStore.clients.get(client))
+    let index = findIndexSS(structs, range.clock)
+    const end = range.clock + range.len
+    let clock = range.clock
+    while (clock < end) {
+      const struct = structs[index++]
+      if (struct === undefined || struct.constructor !== Item || struct.id.clock > clock) throw new Error('Selected content is not materialized')
+      const sliceEnd = Math.min(end, struct.id.clock + struct.length)
+      add(/** @type {Item} */ (struct), clock, sliceEnd)
+      clock = sliceEnd
+    }
+  })
+  holes.forEach(hole => add(hole, hole.id.clock, hole.id.clock + hole.length))
+  encoding.writeVarUint(encoder.restEncoder, blocks.size)
+  array.from(blocks.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, clientBlocks]) => {
+    clientBlocks.sort((a, b) => a.start - b.start)
+    let count = clientBlocks.length
+    let clock = clientBlocks[0].start
+    for (let i = 1; i < clientBlocks.length; i++) {
+      if (clientBlocks[i].start > clientBlocks[i - 1].end) count++
+    }
+    encoding.writeVarUint(encoder.restEncoder, count)
+    encoder.writeClient(client)
+    encoding.writeVarUint(encoder.restEncoder, clock)
+    for (const block of clientBlocks) {
+      if (block.start > clock) {
+        new Skip(createID(client, clock), block.start - clock).write(encoder, 0)
+        clock = block.start
+      }
+      block.struct.write(encoder, block.start - block.struct.id.clock, block.struct.id.clock + block.struct.length - block.end)
+      clock = block.end
+    }
   })
 }
 
@@ -93,7 +240,15 @@ export const writeStructsFromIdSet = (encoder, store, idset) => {
  * @private
  * @function
  */
-export const writeStructsFromTransaction = (encoder, transaction) => writeStructsFromIdSet(encoder, transaction.doc.store, transaction.insertSet)
+export const writeStructsFromTransaction = (encoder, transaction) => {
+  const store = transaction.doc.store
+  if (store.causalHoles.clients.size === 0) {
+    writeStructsFromIdSet(encoder, store, transaction.insertSet)
+  } else {
+    const holes = collectCausalHoles(store, transaction.insertSet, [], false)
+    writeSparseSelection(encoder, store, transaction.insertSet, holes)
+  }
+}
 
 /**
  * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder

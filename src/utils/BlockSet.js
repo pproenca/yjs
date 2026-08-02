@@ -14,6 +14,7 @@ import { Skip } from '../structs/Skip.js'
 import { createIdSet, IdRange } from './ids.js'
 import { sliceStruct } from './updates.js'
 import { GC } from '../structs/GC.js'
+import { CausalHole, sameCausalHoleMetadata } from '../structs/CausalHole.js'
 import { writeStructs } from './encoding-helpers.js'
 
 /**
@@ -29,7 +30,7 @@ export const readBlockSet = (decoder) => {
   for (let i = 0; i < numOfStateUpdates; i++) {
     const numberOfBlocks = decoding.readVarUint(decoder.restDecoder)
     /**
-     * @type {Array<GC|Item|Skip>}
+     * @type {Array<GC|Item|Skip|CausalHole>}
      */
     const refs = new Array(numberOfBlocks)
     const client = decoder.readClient()
@@ -48,6 +49,19 @@ export const readBlockSet = (decoder) => {
           // @todo we could reduce the amount of checks by adding Skip block to clientRefs so we know that something is missing.
           const len = decoding.readVarUint(decoder.restDecoder)
           refs[i] = new Skip(createID(client, clock), len)
+          clock += len
+          break
+        }
+        case 11: {
+          const len = decoding.readVarUint(decoder.restDecoder)
+          refs[i] = new CausalHole(
+            createID(client, clock),
+            len,
+            (info & binary.BIT8) === binary.BIT8 ? decoder.readLeftID() : null,
+            (info & binary.BIT7) === binary.BIT7 ? decoder.readRightID() : null,
+            decoder.readParentInfo() ? decoder.readString() : decoder.readLeftID(),
+            (info & binary.BIT6) === binary.BIT6 ? decoder.readString() : null
+          )
           clock += len
           break
         }
@@ -97,12 +111,12 @@ export const writeBlockSet = (encoder, blocks) => {
 
 class BlockRange {
   /**
-   * @param {Array<Item|GC|Skip>} refs
+   * @param {Array<Item|GC|Skip|CausalHole>} refs
    */
   constructor (refs) {
     this.i = 0
     /**
-     * @type {Array<Item | GC | Skip>}
+     * @type {Array<Item | GC | Skip | CausalHole>}
      */
     this.refs = refs
   }
@@ -122,7 +136,7 @@ export class BlockSet {
       let lastClock = 0
       let lastLen = 0
       ranges.refs.forEach(block => {
-        if (block instanceof Skip) return
+        if (block instanceof Skip || block instanceof CausalHole) return
         if (lastClock + lastLen === block.id.clock) {
           // default case: extend prev entry
           lastLen += block.length
@@ -183,6 +197,10 @@ export class BlockSet {
       if (ranges == null) {
         this.clients.set(clientid, newranges)
       } else {
+        if (ranges.refs.some(block => block.constructor === CausalHole) || newranges.refs.some(block => block.constructor === CausalHole)) {
+          ranges.refs = mergeSparseRefs(ranges.refs, newranges.refs)
+          return
+        }
         const localIsLeft = ranges.refs[0].id.clock < newranges.refs[0].id.clock
         const leftRanges = (localIsLeft ? ranges : newranges).refs
         const rightRanges = (localIsLeft ? newranges : ranges).refs
@@ -288,4 +306,74 @@ export class BlockSet {
     })
     inserts.clients.clear()
   }
+}
+
+/**
+ * @param {Item|GC|Skip|CausalHole} block
+ * @param {number} clock
+ * @param {number} length
+ * @return {Item|GC|Skip|CausalHole}
+ */
+const sliceBlock = (block, clock, length) => {
+  if (block.constructor === Skip) return new Skip(createID(block.id.client, clock), length)
+  if (block.constructor === CausalHole) return /** @type {CausalHole} */ (block).slice(clock, length)
+  if (block.constructor === GC) return new GC(createID(block.id.client, clock), length)
+  const item = /** @type {Item} */ (block)
+  const offset = clock - item.id.clock
+  let content = item.content.copy()
+  if (offset > 0) content = content.splice(offset)
+  if (length < content.getLength()) content.splice(length)
+  return new Item(
+    createID(item.id.client, clock),
+    null,
+    offset === 0 ? item.origin : createID(item.id.client, clock - 1),
+    null,
+    item.rightOrigin,
+    item.parent,
+    item.parentSub,
+    content
+  )
+}
+
+/**
+ * Merge ranges containing causal holes. Materialized structs win; conflicting overlapping hole
+ * metadata fails closed. The ordinary no-hole path above remains byte-for-byte unchanged.
+ *
+ * @param {Array<Item|GC|Skip|CausalHole>} left
+ * @param {Array<Item|GC|Skip|CausalHole>} right
+ */
+const mergeSparseRefs = (left, right) => {
+  const boundaries = new Set()
+  for (const block of left.concat(right)) {
+    boundaries.add(block.id.clock)
+    boundaries.add(block.id.clock + block.length)
+  }
+  const clocks = Array.from(boundaries).sort((a, b) => a - b)
+  /** @type {Array<Item|GC|Skip|CausalHole>} */
+  const result = []
+  let li = 0
+  let ri = 0
+  for (let i = 0; i + 1 < clocks.length; i++) {
+    const clock = clocks[i]
+    const length = clocks[i + 1] - clock
+    if (length === 0) continue
+    while (li < left.length && left[li].id.clock + left[li].length <= clock) li++
+    while (ri < right.length && right[ri].id.clock + right[ri].length <= clock) ri++
+    const l = left[li]?.id.clock <= clock && clock < left[li].id.clock + left[li].length ? left[li] : null
+    const r = right[ri]?.id.clock <= clock && clock < right[ri].id.clock + right[ri].length ? right[ri] : null
+    const lrank = l === null || l.constructor === Skip ? 0 : l.constructor === CausalHole ? 1 : 2
+    const rrank = r === null || r.constructor === Skip ? 0 : r.constructor === CausalHole ? 1 : 2
+    if (lrank === 0 && rrank === 0 && l === null && r === null) continue
+    if (lrank === 1 && rrank === 1) {
+      const ls = /** @type {CausalHole} */ (l).slice(clock, length)
+      const rs = /** @type {CausalHole} */ (r).slice(clock, length)
+      if (!sameCausalHoleMetadata(ls, rs)) throw new Error('Conflicting causal hole metadata')
+    }
+    const chosen = rrank > lrank ? r : l ?? r
+    if (chosen === null) continue
+    const sliced = sliceBlock(chosen, clock, length)
+    const previous = result[result.length - 1]
+    if (previous === undefined || !previous.mergeWith(sliced)) result.push(sliced)
+  }
+  return result
 }

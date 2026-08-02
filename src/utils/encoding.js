@@ -31,6 +31,7 @@ import { readBlockSet, writeBlockSet } from './BlockSet.js'
 import { Skip } from '../structs/Skip.js'
 import { Item } from '../structs/Item.js'
 import { GC } from '../structs/GC.js'
+import { CausalHole } from '../structs/CausalHole.js'
 import { Doc } from './Doc.js'
 import { writeStructs } from './encoding-helpers.js'
 
@@ -61,7 +62,7 @@ export const writeClientsStructs = (encoder, store, _sm) => {
   // Write items with higher client ids first
   // This heavily improves the conflict algorithm.
   array.from(sm.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, clock]) => {
-    const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
+    const structs = /** @type {Array<GC|Item|Skip|CausalHole>} */ (store.clients.get(client))
     const lastStruct = structs[structs.length - 1]
     writeStructs(encoder, structs, client, [new IdRange(clock, lastStruct.id.clock + lastStruct.length - clock)])
   })
@@ -96,7 +97,7 @@ export const writeClientsStructs = (encoder, store, _sm) => {
  */
 const integrateStructs = (transaction, store, clientsStructRefs) => {
   /**
-   * @type {Array<Item | GC | Skip>}
+   * @type {Array<Item | GC | Skip | CausalHole>}
    */
   const stack = []
   // sort them so that we take the higher id first, in case of conflicts the lower id will probably not conflict with the id from the higher user.
@@ -140,7 +141,7 @@ const integrateStructs = (transaction, store, clientsStructRefs) => {
     }
   }
   /**
-   * @type {GC|Item|Skip}
+   * @type {GC|Item|Skip|CausalHole}
    */
   let stackHead = /** @type {any} */ (curStructsTarget).refs[/** @type {any} */ (curStructsTarget).i++]
   // caching the state because it is used very often
@@ -183,7 +184,7 @@ const integrateStructs = (transaction, store, clientsStructRefs) => {
         stack.push(stackHead)
         // get the struct reader that has the missing struct
         /**
-         * @type {{ refs: Array<GC|Item|Skip>, i: number }}
+         * @type {{ refs: Array<GC|Item|Skip|CausalHole>, i: number }}
          */
         const structRefs = clientsStructRefs.clients.get(/** @type {number} */ (missing)) || { refs: [], i: 0 }
         if (structRefs.refs.length === structRefs.i || missing === stackHead.id.client || stack.some(s => s.id.client === missing)) { // @todo this could be optimized!
@@ -207,16 +208,16 @@ const integrateStructs = (transaction, store, clientsStructRefs) => {
     }
     // iterate to next stackHead
     if (stack.length > 0) {
-      stackHead = /** @type {GC|Item} */ (stack.pop())
+      stackHead = /** @type {GC|Item|CausalHole} */ (stack.pop())
     } else if (curStructsTarget !== null && curStructsTarget.i < curStructsTarget.refs.length) {
-      stackHead = /** @type {GC|Item} */ (curStructsTarget.refs[curStructsTarget.i++])
+      stackHead = /** @type {GC|Item|CausalHole} */ (curStructsTarget.refs[curStructsTarget.i++])
     } else {
       curStructsTarget = getNextStructTarget()
       if (curStructsTarget === null) {
         // we are done!
         break
       } else {
-        stackHead = /** @type {GC|Item} */ (curStructsTarget.refs[curStructsTarget.i++])
+        stackHead = /** @type {GC|Item|CausalHole} */ (curStructsTarget.refs[curStructsTarget.i++])
       }
     }
   }
@@ -260,6 +261,9 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
         knownState.add(client, 0, last.id.clock + last.length)
         // remove known items from ss
         store.skips.clients.get(client)?.getIds().forEach(idrange => {
+          knownState.delete(client, idrange.clock, idrange.len)
+        })
+        store.causalHoles.clients.get(client)?.getIds().forEach(idrange => {
           knownState.delete(client, idrange.clock, idrange.len)
         })
       }
@@ -612,13 +616,13 @@ export const encodeStateVector = doc => encodeStateVectorV2(doc, new IdSetEncode
 /**
  * Return the creator clientID of the missing op or define missing items and return null.
  *
- * @param {Item} struct
+ * @param {Item|CausalHole} struct
  * @param {Transaction} transaction
  * @param {StructStore} store
  * @return {null | number}
  */
 const getMissing = (struct, transaction, store) => {
-  if (struct.constructor !== Item) return null
+  if (struct.constructor !== Item && struct.constructor !== CausalHole) return null
   // we may not access these variables anymore after they have been written!
   const origin = struct.origin
   const rightOrigin = struct.rightOrigin
@@ -632,18 +636,33 @@ const getMissing = (struct, transaction, store) => {
   if (parent && parent.constructor === ID && (parent.clock >= store.getClock(parent.client) || store.skips.hasId(parent))) {
     return parent.client
   }
+  if (struct.constructor === CausalHole) return null
   // We have all missing ids, now find the items
+  const originHole = origin === null ? null : store.getCausalHole(origin)
+  const rightOriginHole = rightOrigin === null ? null : store.getCausalHole(rightOrigin)
   if (origin) {
-    struct.left = getItemCleanEnd(transaction, store, origin)
-    // copy left id to so that the original id can be gc'd
-    struct.origin = struct.left.lastId
+    if (originHole === null) {
+      struct.left = getItemCleanEnd(transaction, store, origin)
+      // copy left id to so that the original id can be gc'd
+      struct.origin = struct.left.lastId
+    } else {
+      struct.left = resolveCausalHoleAnchor(transaction, store, originHole, true)
+    }
   }
   if (rightOrigin) {
-    struct.right = getItemCleanStart(transaction, rightOrigin)
-    struct.rightOrigin = struct.right.id
+    if (rightOriginHole === null) {
+      struct.right = getItemCleanStart(transaction, rightOrigin)
+      struct.rightOrigin = struct.right.id
+    } else {
+      struct.right = resolveCausalHoleAnchor(transaction, store, rightOriginHole, false)
+    }
   }
   if ((struct.left && struct.left.constructor === GC) || (struct.right && struct.right.constructor === GC)) {
     struct.parent = null
+  } else if (originHole !== null || rightOriginHole !== null) {
+    const hole = /** @type {CausalHole} */ (originHole ?? rightOriginHole)
+    struct.parent = resolveCausalHoleParent(transaction, store, hole)
+    struct.parentSub = hole.parentSub
   } else if (parent == null) {
     // only set parent if this shouldn't be garbage collected
     if (struct.left && struct.left.constructor === Item) {
@@ -664,6 +683,38 @@ const getMissing = (struct, transaction, store) => {
     struct.parent = transaction.doc.get(parent)
   }
   return null
+}
+
+/**
+ * @param {Transaction} transaction
+ * @param {StructStore} store
+ * @param {CausalHole} hole
+ * @param {boolean} left
+ * @param {Set<CausalHole>} [seen]
+ * @return {Item|null}
+ */
+const resolveCausalHoleAnchor = (transaction, store, hole, left, seen = new Set()) => {
+  if (seen.has(hole)) throw new Error('Cyclic causal hole metadata')
+  seen.add(hole)
+  const anchor = left ? hole.origin : hole.rightOrigin
+  if (anchor === null) return null
+  const nested = store.getCausalHole(anchor)
+  if (nested !== null) return resolveCausalHoleAnchor(transaction, store, nested, left, seen)
+  return left ? getItemCleanEnd(transaction, store, anchor) : getItemCleanStart(transaction, anchor)
+}
+
+/**
+ * @param {Transaction} transaction
+ * @param {StructStore} store
+ * @param {CausalHole} hole
+ * @return {YType}
+ */
+const resolveCausalHoleParent = (transaction, store, hole) => {
+  if (typeof hole.parent === 'string') return transaction.doc.get(hole.parent)
+  if (store.getCausalHole(hole.parent) !== null) throw new Error('Causal hole parent is not materialized')
+  const parentItem = store.getItem(hole.parent)
+  if (parentItem.constructor !== Item) throw new Error('Causal hole parent is not materialized')
+  return /** @type {ContentType} */ (parentItem.content).type
 }
 
 /**
