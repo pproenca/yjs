@@ -107,7 +107,14 @@ export class CausalHole {
       this.length = sliced.length
       this.origin = sliced.origin
     }
-    transaction.doc.store.installCausalHole(this)
+    const store = transaction.doc.store
+    if (this.origin !== null && store.getCausalHole(this.origin) !== null) {
+      store.addCausalHoleConsumer(this.origin, this, 'origin')
+    }
+    if (this.rightOrigin !== null && store.getCausalHole(this.rightOrigin) !== null) {
+      store.addCausalHoleConsumer(this.rightOrigin, this, 'rightOrigin')
+    }
+    store.installCausalHole(this)
   }
 
   /**
@@ -220,6 +227,23 @@ export class CausalHoleIndex {
       else return hole
     }
     return null
+  }
+
+  /** @param {number} client @param {number} clock @param {number} length */
+  getOverlaps (client, clock, length) {
+    const holes = this.clients.get(client)
+    if (holes === undefined || length <= 0) return []
+    const end = clock + length
+    let left = 0
+    let right = holes.length
+    while (left < right) {
+      const middle = (left + right) >>> 1
+      if (holes[middle].id.clock + holes[middle].length <= clock) left = middle + 1
+      else right = middle
+    }
+    const overlaps = []
+    while (left < holes.length && holes[left].id.clock < end) overlaps.push(holes[left++])
+    return overlaps
   }
 
   /** @param {CausalHole} hole */

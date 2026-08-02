@@ -17,6 +17,42 @@ import {
 const isDevMode = env.getVariable('node_env') === 'development'
 
 /**
+ * Find the canonical left insertion neighbor for an unlinked item-like struct.
+ *
+ * @template {{id:ID,origin:ID|null,rightOrigin:ID|null,left:T|null,right:T|null}} T
+ * @param {T} item
+ * @param {T|null} scan
+ * @param {{getItem:(id:ID)=>T}} store
+ * @return {T|null}
+ */
+export const findItemInsertionLeft = (item, scan, store) => {
+  let left = item.left
+  const conflictingItems = new Set()
+  const itemsBeforeOrigin = new Set()
+  while (scan !== null && scan !== item.right) {
+    itemsBeforeOrigin.add(scan)
+    conflictingItems.add(scan)
+    if (compareIDs(item.origin, scan.origin)) {
+      if (scan.id.client < item.id.client) {
+        left = scan
+        conflictingItems.clear()
+      } else if (compareIDs(item.rightOrigin, scan.rightOrigin)) {
+        break
+      }
+    } else if (scan.origin !== null && itemsBeforeOrigin.has(store.getItem(scan.origin))) {
+      if (!conflictingItems.has(store.getItem(scan.origin))) {
+        left = scan
+        conflictingItems.clear()
+      }
+    } else {
+      break
+    }
+    scan = scan.right
+  }
+  return left
+}
+
+/**
  * @todo This should return several items
  *
  * @param {StructStore} store
@@ -179,15 +215,10 @@ export class Item extends AbstractStruct {
         /**
          * @type {Item|null}
          */
-        let left = this.left
-
-        /**
-         * @type {Item|null}
-         */
         let o
         // set o to the first conflicting item
-        if (left !== null) {
-          o = left.right
+        if (this.left !== null) {
+          o = this.left.right
         } else if (this.parentSub !== null) {
           o = /** @type {YType} */ (this.parent)._map.get(this.parentSub) || null
           while (o !== null && o.left !== null) {
@@ -196,44 +227,7 @@ export class Item extends AbstractStruct {
         } else {
           o = /** @type {YType} */ (this.parent)._start
         }
-        // TODO: use something like DeleteSet here (a tree implementation would be best)
-        // @todo use global set definitions
-        /**
-         * @type {Set<Item>}
-         */
-        const conflictingItems = new Set()
-        /**
-         * @type {Set<Item>}
-         */
-        const itemsBeforeOrigin = new Set()
-        // Let c in conflictingItems, b in itemsBeforeOrigin
-        // ***{origin}bbbb{this}{c,b}{c,b}{o}***
-        // Note that conflictingItems is a subset of itemsBeforeOrigin
-        while (o !== null && o !== this.right) {
-          itemsBeforeOrigin.add(o)
-          conflictingItems.add(o)
-          if (compareIDs(this.origin, o.origin)) {
-            // case 1
-            if (o.id.client < this.id.client) {
-              left = o
-              conflictingItems.clear()
-            } else if (compareIDs(this.rightOrigin, o.rightOrigin)) {
-              // this and o are conflicting and point to the same integration points. The id decides which item comes first.
-              // Since this is to the left of o, we can break here
-              break
-            } // else, o might be integrated before an item that this conflicts with. If so, we will find it in the next iterations
-          } else if (o.origin !== null && itemsBeforeOrigin.has(transaction.doc.store.getItem(o.origin))) { // use getItem instead of getItemCleanEnd because we don't want / need to split items.
-            // case 2
-            if (!conflictingItems.has(transaction.doc.store.getItem(o.origin))) {
-              left = o
-              conflictingItems.clear()
-            }
-          } else {
-            break
-          }
-          o = o.right
-        }
-        this.left = left
+        this.left = findItemInsertionLeft(this, o, transaction.doc.store)
       }
       // reconnect left/right + update parent map/start if necessary
       if (this.left !== null) {
@@ -385,7 +379,9 @@ export class Item extends AbstractStruct {
     if (!this.deleted) {
       throw error.unexpectedCase()
     }
+    const contentWasType = this.content instanceof ContentType
     this.content.gc(tr)
+    if (contentWasType) tr.doc.store.retireCausalHolesForParent(tr, this.id)
     if (parentGCd) {
       replaceStruct(tr, this, new GC(this.id, this.length))
     } else {
