@@ -5,6 +5,8 @@ import { ID, compareIDs, createID, findRootTypeKey } from '../utils/ID.js'
 
 export const structCausalHoleRefNumber = 11
 
+const transactionCausalHoles = Symbol('causal-hole-transport')
+
 /**
  * @param {ID|null} id
  */
@@ -108,7 +110,7 @@ export class CausalHole {
       this.origin = sliced.origin
     }
     const store = transaction.doc.store
-    store.installCausalHole(this)
+    recordInstalledCausalHoles(transaction, store.installCausalHole(this))
   }
 
   /**
@@ -173,6 +175,28 @@ export const sameCausalHoleMetadata = (left, right) =>
   compareIDs(left.rightOrigin, right.rightOrigin) &&
   sameCausalHoleParent(left.parent, right.parent) &&
   left.parentSub === right.parentSub
+
+/**
+ * @param {CausalHole} hole
+ * @param {Item} item
+ * @param {number} clock
+ * @param {number} length
+ */
+export const sameCausalHoleItemMetadata = (hole, item, clock, length) => {
+  if (
+    item.id.client !== hole.id.client ||
+    clock < item.id.clock || clock < hole.id.clock ||
+    clock + length > item.id.clock + item.length ||
+    clock + length > hole.id.clock + hole.length
+  ) return false
+  const expected = hole.slice(clock, length)
+  const origin = clock === item.id.clock ? item.origin : createID(item.id.client, clock - 1)
+  if (!compareIDs(origin, expected.origin) || !compareIDs(item.rightOrigin, expected.rightOrigin)) return false
+  if (item.parent !== null) {
+    return sameCausalHoleParent(normalizeCausalHoleParent(item.parent), expected.parent) && item.parentSub === expected.parentSub
+  }
+  return true
+}
 
 /**
  * @param {Item} item
@@ -293,3 +317,17 @@ export class CausalHoleIndex {
     return holes
   }
 }
+
+/** @param {Transaction} transaction @param {Array<CausalHole>} holes */
+const recordInstalledCausalHoles = (transaction, holes) => {
+  if (holes.length === 0) return
+  let index = /** @type {CausalHoleIndex|undefined} */ (transaction.meta.get(transactionCausalHoles))
+  if (index === undefined) {
+    index = new CausalHoleIndex()
+    transaction.meta.set(transactionCausalHoles, index)
+  }
+  holes.forEach(hole => index.add(hole))
+}
+
+/** @param {Transaction} transaction @return {CausalHoleIndex|null} */
+export const getTransactionCausalHoles = transaction => /** @type {CausalHoleIndex|null} */ (transaction.meta.get(transactionCausalHoles) ?? null)

@@ -14,7 +14,7 @@ import { Skip } from '../structs/Skip.js'
 import { createIdSet, IdRange } from './ids.js'
 import { sliceStruct } from './updates.js'
 import { GC } from '../structs/GC.js'
-import { CausalHole, sameCausalHoleMetadata } from '../structs/CausalHole.js'
+import { CausalHole, sameCausalHoleItemMetadata, sameCausalHoleMetadata } from '../structs/CausalHole.js'
 import { writeStructs } from './encoding-helpers.js'
 
 /**
@@ -374,6 +374,12 @@ const mergeSparseRefs = (left, right) => {
       const ls = /** @type {CausalHole} */ (l).slice(clock, length)
       const rs = /** @type {CausalHole} */ (r).slice(clock, length)
       if (!sameCausalHoleMetadata(ls, rs)) throw new Error('Conflicting causal hole metadata')
+    }
+    if (l?.constructor === CausalHole && r?.constructor === Item && !sameCausalHoleItemMetadata(/** @type {CausalHole} */ (l), /** @type {Item} */ (r), clock, length)) {
+      throw new Error('Conflicting causal hole replacement metadata')
+    }
+    if (r?.constructor === CausalHole && l?.constructor === Item && !sameCausalHoleItemMetadata(/** @type {CausalHole} */ (r), /** @type {Item} */ (l), clock, length)) {
+      throw new Error('Conflicting causal hole replacement metadata')
     }
     const chosen = rrank > lrank ? r : l ?? r
     if (chosen === null) continue

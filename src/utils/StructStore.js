@@ -5,6 +5,11 @@ import { createID } from './ID.js'
 import { createDeleteSetFromStructStore, createIdSet } from './ids.js'
 import { findIndexSS } from './transaction-helpers.js'
 
+/** @param {ID|string} parent @param {string|null} parentSub */
+const causalHoleParentGroupKey = (parent, parentSub) => typeof parent === 'string'
+  ? `root:${JSON.stringify(parent)}:${JSON.stringify(parentSub)}`
+  : `item:${parent.client}:${parent.clock}:${JSON.stringify(parentSub)}`
+
 export class StructStore {
   constructor () {
     /**
@@ -25,6 +30,8 @@ export class StructStore {
     this.causalHoles = createIdSet()
     /** @type {Map<string,Set<CausalHole>>} */
     this.causalHolesByParent = new Map()
+    /** @type {Map<string,Set<CausalHole>>} */
+    this.causalHolesByParentGroup = new Map()
   }
 
   get ds () {
@@ -59,15 +66,32 @@ export class StructStore {
   addUpdateStruct (struct) {
     this.add(struct)
     if (struct.constructor === Skip) this.skips.add(struct.id.client, struct.id.clock, struct.length)
-    if (struct.constructor === CausalHole) this.causalHoles.add(struct.id.client, struct.id.clock, struct.length)
+    if (struct.constructor === CausalHole) {
+      this.getCausalHoleOverlaps(struct.id.client, struct.id.clock, struct.length).forEach(hole => {
+        this.causalHoles.add(hole.id.client, hole.id.clock, hole.length)
+      })
+    }
   }
 
   /**
    * @param {CausalHole} hole
    */
   installCausalHole (hole) {
+    const missing = this.causalHoles.slice(hole.id.client, hole.id.clock, hole.length).filter(range => !range.exists)
     this.add(hole)
-    this.causalHoles.add(hole.id.client, hole.id.clock, hole.length)
+    const overlaps = this.getCausalHoleOverlaps(hole.id.client, hole.id.clock, hole.length)
+    overlaps.forEach(current => this.causalHoles.add(current.id.client, current.id.clock, current.length))
+    /** @type {Array<CausalHole>} */
+    const installed = []
+    for (const range of missing) {
+      const rangeEnd = range.clock + range.len
+      for (const current of overlaps) {
+        const clock = Math.max(range.clock, current.id.clock)
+        const end = Math.min(rangeEnd, current.id.clock + current.length)
+        if (clock < end) installed.push(current.slice(clock, end - clock))
+      }
+    }
+    return installed
   }
 
   /**
@@ -129,24 +153,65 @@ export class StructStore {
 
   /** @param {CausalHole} hole */
   _indexCausalHole (hole) {
-    if (typeof hole.parent === 'string') return
-    const key = `${hole.parent.client}:${hole.parent.clock}`
-    let holes = this.causalHolesByParent.get(key)
-    if (holes === undefined) {
-      holes = new Set()
-      this.causalHolesByParent.set(key, holes)
+    if (typeof hole.parent !== 'string') {
+      const key = `${hole.parent.client}:${hole.parent.clock}`
+      let holes = this.causalHolesByParent.get(key)
+      if (holes === undefined) {
+        holes = new Set()
+        this.causalHolesByParent.set(key, holes)
+      }
+      holes.add(hole)
     }
-    holes.add(hole)
+    const groupKey = causalHoleParentGroupKey(hole.parent, hole.parentSub)
+    let group = this.causalHolesByParentGroup.get(groupKey)
+    if (group === undefined) {
+      group = new Set()
+      this.causalHolesByParentGroup.set(groupKey, group)
+    }
+    group.add(hole)
   }
 
   /** @param {CausalHole} hole */
   _unindexCausalHole (hole) {
-    if (typeof hole.parent === 'string') return
-    const key = `${hole.parent.client}:${hole.parent.clock}`
-    const holes = this.causalHolesByParent.get(key)
-    if (holes === undefined) return
-    holes.delete(hole)
-    if (holes.size === 0) this.causalHolesByParent.delete(key)
+    if (typeof hole.parent !== 'string') {
+      const key = `${hole.parent.client}:${hole.parent.clock}`
+      const holes = this.causalHolesByParent.get(key)
+      holes?.delete(hole)
+      if (holes?.size === 0) this.causalHolesByParent.delete(key)
+    }
+    const groupKey = causalHoleParentGroupKey(hole.parent, hole.parentSub)
+    const group = this.causalHolesByParentGroup.get(groupKey)
+    group?.delete(hole)
+    if (group?.size === 0) this.causalHolesByParentGroup.delete(groupKey)
+  }
+
+  /**
+   * @param {number} client
+   * @param {number} clock
+   * @param {number} length
+   * @return {Array<CausalHole>}
+   */
+  getCausalHoleOverlaps (client, clock, length) {
+    if (length <= 0) return []
+    const rawStructs = this.clients.get(client)
+    if (rawStructs === undefined || rawStructs.length === 0) return []
+    const structs = /** @type {Array<GC|Item|Skip|CausalHole>} */ (/** @type {unknown} */ (rawStructs))
+    const end = clock + length
+    const firstClock = structs[0].id.clock
+    const last = structs[structs.length - 1]
+    if (end <= firstClock || clock >= last.id.clock + last.length) return []
+    let index = findIndexSS(/** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ (structs)), Math.max(clock, structs[0].id.clock))
+    /** @type {Array<CausalHole>} */
+    const overlaps = []
+    for (let struct = structs[index]; struct !== undefined && struct.id.clock < end; struct = structs[++index]) {
+      if (struct.constructor === CausalHole && struct.id.clock + struct.length > clock) overlaps.push(/** @type {CausalHole} */ (struct))
+    }
+    return overlaps
+  }
+
+  /** @param {ID|string} parent @param {string|null} parentSub */
+  getCausalHolesForParentGroup (parent, parentSub) {
+    return this.causalHolesByParentGroup.get(causalHoleParentGroupKey(parent, parentSub)) ?? new Set()
   }
 
   /**
@@ -186,6 +251,7 @@ export class StructStore {
       const index = findIndexSS(/** @type {Array<Item|GC|Skip>} */ (/** @type {unknown} */ (structs)), hole.id.clock)
       if (structs[index] !== hole) continue
       const gc = new GC(createID(hole.id.client, hole.id.clock), hole.length)
+      this._unindexCausalHole(hole)
       structs[index] = gc
       this.causalHoles.delete(hole.id.client, hole.id.clock, hole.length)
       transaction._mergeStructs.push(gc)

@@ -91,11 +91,21 @@ export const createSnapshot = (ds, sm) => new Snapshot(ds, sm)
 
 export const emptySnapshot = createSnapshot(createIdSet(), new Map())
 
+/** @param {StructStore} store */
+const assertDenseSnapshotStore = store => {
+  if (!store.skips.isEmpty() || !store.causalHoles.isEmpty()) {
+    throw new Error('Snapshots are unavailable for sparse documents')
+  }
+}
+
 /**
  * @param {Doc} doc
  * @return {Snapshot}
  */
-export const snapshot = doc => createSnapshot(createDeleteSetFromStructStore(doc.store), getStateVector(doc.store))
+export const snapshot = doc => {
+  assertDenseSnapshotStore(doc.store)
+  return createSnapshot(createDeleteSetFromStructStore(doc.store), getStateVector(doc.store))
+}
 
 /**
  * @param {Transaction} transaction
@@ -131,11 +141,16 @@ export const splitSnapshotAffectedStructs = (transaction, snapshot) => {
  * @return {Doc}
  */
 export const createDocFromSnapshot = (originDoc, snapshot, newDoc = new Doc()) => {
+  assertDenseSnapshotStore(originDoc.store)
   if (originDoc.gc) {
     // we should not try to restore a GC-ed document, because some of the restored items might have their content deleted
     throw new Error('Garbage-collection must be disabled in `originDoc`!')
   }
   const { sv, ds } = snapshot
+  const state = getStateVector(originDoc.store)
+  for (const [client, clock] of sv) {
+    if (clock > (state.get(client) ?? 0)) throw new Error('Snapshot state exceeds document state')
+  }
 
   const encoder = new UpdateEncoderV2()
   originDoc.transact(transaction => {

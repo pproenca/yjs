@@ -5,7 +5,7 @@ import * as array from 'lib0/array'
 import { findIndexSS } from './transaction-helpers.js'
 import { Skip } from '../structs/Skip.js'
 import { Item } from '../structs/Item.js'
-import { CausalHole, CausalHoleIndex, createCausalHoleFromItem } from '../structs/CausalHole.js'
+import { CausalHole, CausalHoleIndex, createCausalHoleFromItem, getTransactionCausalHoles, sameCausalHoleMetadata } from '../structs/CausalHole.js'
 import { createID } from './ID.js'
 import { createIdSet, intersectSets, mergeIdSets, writeIdSet } from './ids.js'
 
@@ -298,6 +298,32 @@ const writeSparseSelection = (encoder, sourceStore, selected, holes) => {
 }
 
 /**
+ * @param {StructStore} store
+ * @param {Transaction} transaction
+ * @param {CausalHoleIndex} holes
+ */
+const addTransactionCausalHoles = (store, transaction, holes) => {
+  const installed = getTransactionCausalHoles(transaction)
+  if (installed === null) return
+  installed.forEach(recorded => {
+    for (const current of store.getCausalHoleOverlaps(recorded.id.client, recorded.id.clock, recorded.length)) {
+      const clock = Math.max(recorded.id.clock, current.id.clock)
+      const end = Math.min(recorded.id.clock + recorded.length, current.id.clock + current.length)
+      if (clock >= end) continue
+      const actual = current.slice(clock, end - clock)
+      if (sameCausalHoleMetadata(recorded.slice(clock, end - clock), actual)) holes.add(actual)
+    }
+  })
+}
+
+/** @param {StructStore} store @param {Transaction} transaction */
+const hasTransactionCausalHoles = (store, transaction) => {
+  const holes = new CausalHoleIndex()
+  addTransactionCausalHoles(store, transaction, holes)
+  return holes.size > 0
+}
+
+/**
  * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
  * @param {Transaction} transaction
  *
@@ -306,10 +332,13 @@ const writeSparseSelection = (encoder, sourceStore, selected, holes) => {
  */
 export const writeStructsFromTransaction = (encoder, transaction) => {
   const store = transaction.doc.store
-  if (store.causalHoles.clients.size === 0) {
+  const holes = store.causalHoles.clients.size === 0
+    ? new CausalHoleIndex()
+    : collectCausalHoles(store, transaction.insertSet, [], false)
+  addTransactionCausalHoles(store, transaction, holes)
+  if (holes.size === 0) {
     writeStructsFromIdSet(encoder, store, transaction.insertSet)
   } else {
-    const holes = collectCausalHoles(store, transaction.insertSet, [], false)
     writeSparseSelection(encoder, store, transaction.insertSet, holes)
   }
 }
@@ -320,7 +349,11 @@ export const writeStructsFromTransaction = (encoder, transaction) => {
  * @return {boolean} Whether data was written.
  */
 export const writeUpdateMessageFromTransaction = (encoder, transaction) => {
-  if (transaction.deleteSet.clients.size === 0 && transaction.insertSet.clients.size === 0) {
+  if (
+    transaction.deleteSet.clients.size === 0 &&
+    transaction.insertSet.clients.size === 0 &&
+    !hasTransactionCausalHoles(transaction.doc.store, transaction)
+  ) {
     return false
   }
   writeStructsFromTransaction(encoder, transaction)
