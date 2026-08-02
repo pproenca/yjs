@@ -28,6 +28,7 @@ import {
   createContentDocFromDoc
 } from './structs/Item.js'
 import { AttributedContent, rendererContentLength } from './utils/renderer-helpers.js'
+import { createPreparedDeltaMutation } from './utils/delta-mutation.js'
 import { removeEventHandlerListener, callEventHandlerListeners, addEventHandlerListener, createEventHandler } from './utils/EventHandler.js'
 import { createID } from './utils/ID.js'
 import { createIdSet, iterateStructsByIdSetWithoutSplits } from './utils/ids.js'
@@ -664,6 +665,108 @@ export const callTypeObservers = (type, transaction, event) => {
 }
 
 /**
+ * The single delta mutation interpreter used by ordinary and reserved application.
+ *
+ * @param {YType<any>} type
+ * @param {delta.DeltaAny} d
+ * @param {any} origin
+ * @param {AbstractRenderer?} renderer
+ * @param {Transaction?} activeTransaction
+ */
+const applyDeltaCanonical = (type, d, origin, renderer, activeTransaction) => {
+  if (d.isEmpty()) return null
+  if (type.doc == null) {
+    (type._prelim || (type._prelim = /** @type {any} */ (delta.create()))).apply(d)
+    return null
+  }
+  const titem = type._item
+  if (titem !== null && titem.deleted) {
+    if (rendererContentLength(renderer, titem) > 0) {
+      const inv = delta.inverse(d, /** @type {any} */ (type.toDeltaDeep({ renderer })))
+      return inv.isEmpty() ? null : /** @type {any} */ (inv)
+    }
+    return null
+  }
+  /** @param {Transaction} transaction */
+  const execute = transaction => {
+    /** @type {delta.DeltaBuilder<any>?} */
+    let fix = null
+    let fixLen = 0
+    let expectedIndex = 0
+    /**
+     * @param {delta.DeltaAny?} childFix
+     * @param {{ [k:string]: any }} [invFormat]
+     */
+    const appendModifyFix = (childFix, invFormat) => {
+      const f = fix ?? (fix = /** @type {any} */ (delta.create()))
+      expectedIndex > fixLen && f.retain(expectedIndex - fixLen)
+      f.modify(/** @type {any} */ (childFix ?? delta.create().done(false)), invFormat)
+      fixLen = expectedIndex + 1
+    }
+    const currPos = new ItemTextListPosition(null, type._start, 0, new Map(), renderer)
+    for (const op of d.children) {
+      if (delta.$textOp.check(op)) {
+        insertContent(transaction, type, currPos, new ContentString(op.insert), op.format || {})
+        expectedIndex += op.length
+      } else if (delta.$insertOp.check(op)) {
+        insertContentHelper(transaction, type, currPos, op.insert, op.format || {})
+        expectedIndex += op.length
+      } else if (delta.$retainOp.check(op)) {
+        currPos.formatText(transaction, type, op.retain, op.format || {})
+        expectedIndex += op.length
+      } else if (delta.$deleteOp.check(op)) {
+        deleteText(transaction, currPos, op.delete)
+      } else if (delta.$modifyOp.check(op)) {
+        let item = currPos.right
+        while (item !== null && rendererContentLength(renderer, item) === 0) { item = item.right }
+        if (item == null || item.content.constructor !== ContentType) { error.unexpectedCase() }
+        if (item.deleted) {
+          currPos.formatText(transaction, type, 1, {})
+          /** @type {{ [k:string]: any }|undefined} */
+          let invFormat
+          for (const k in op.format) {
+            (invFormat ?? (invFormat = {}))[k] = currPos.currentFormats.get(k) ?? null
+          }
+          const childFix = applyDeltaCanonical(/** @type {ContentType} */ (item.content).type, op.value, origin, renderer, transaction)
+          if (childFix !== null || invFormat !== undefined) appendModifyFix(childFix, invFormat)
+        } else {
+          const childFix = applyDeltaCanonical(/** @type {ContentType} */ (item.content).type, op.value, origin, renderer, transaction)
+          currPos.formatText(transaction, type, 1, op.format || {})
+          if (childFix !== null) appendModifyFix(childFix)
+        }
+        expectedIndex += 1
+      } else {
+        error.unexpectedCase()
+      }
+    }
+    for (const op of d.attrs) {
+      if (delta.$setAttrOp.check(op)) {
+        typeMapSet(transaction, type, /** @type {any} */ (op.key), op.value)
+      } else if (delta.$deleteAttrOp.check(op)) {
+        typeMapDelete(transaction, type, /** @type {any} */ (op.key))
+      } else {
+        const mapItem = type._map.get(/** @type {any} */ (op.key))
+        const sub = mapItem === undefined
+          ? undefined
+          : (mapItem.deleted
+              ? (mapItem.content.constructor === ContentType && rendererContentLength(renderer, mapItem) > 0
+                  ? /** @type {ContentType} */ (mapItem.content).type
+                  : undefined)
+              : mapItem.content.getContent()[mapItem.length - 1])
+        if (!(sub instanceof YType)) error.unexpectedCase()
+        const subFix = applyDeltaCanonical(sub, op.value, origin, renderer, transaction)
+        if (subFix !== null) {
+          const f = fix ?? (fix = /** @type {any} */ (delta.create()))
+          f.modifyAttr(/** @type {any} */ (op.key), /** @type {any} */ (subFix))
+        }
+      }
+    }
+    return fix !== null && !(/** @type {delta.DeltaBuilder<any>} */ (fix).done(false).isEmpty()) ? fix : null
+  }
+  return activeTransaction === null ? transact(type.doc, execute, origin) : execute(activeTransaction)
+}
+
+/**
  * Abstract Yjs Type class.
  *
  * A `YType` is a {@link https://github.com/dmonad/lib0 lib0} `RDT` ("replicated data type", see
@@ -705,6 +808,8 @@ export class YType extends ObservableV2 {
      */
     this.doc = null
     this._length = 0
+    /** @type {delta.DeltaBuilder<any>|null} */
+    this._prelim = null
     /**
      * Event handlers
      * @type {EventHandler<YEvent<DeltaToYType<DConf>>,Transaction>}
@@ -1561,6 +1666,26 @@ export class YType extends ObservableV2 {
   }
 
   /**
+   * Reserve a conservative structural-range bound for `d` without writing, then return a
+   * single-use capability that applies this exact delta through {@link YType#applyDelta}.
+   *
+   * @param {delta.DeltaAny} d
+   * @param {any} [origin]
+   * @param {Object} [opts]
+   * @param {AbstractRenderer?} [opts.renderer]
+   * @return {import('./utils/delta-mutation.js').PreparedDeltaMutation}
+   */
+  reserveDeltaMutation (d, origin = null, { renderer = this._renderer } = {}) {
+    return createPreparedDeltaMutation(
+      this,
+      d,
+      origin,
+      renderer,
+      (transaction, mutation) => applyDeltaCanonical(this, mutation, origin, renderer, transaction)
+    )
+  }
+
+  /**
    * Apply a {@link Delta} on this shared type.
    *
    * @param {delta.DeltaAny} d The changes to apply on this element.
@@ -1580,113 +1705,7 @@ export class YType extends ObservableV2 {
    * @public
    */
   applyDelta (d, origin = null, { renderer = this._renderer } = {}) {
-    if (d.isEmpty()) return null
-    if (this.doc == null) {
-      (this._prelim || (this._prelim = /** @type {any} */ (delta.create()))).apply(d)
-      return null
-    }
-    const titem = this._item
-    if (titem !== null && titem.deleted) {
-      if (rendererContentLength(renderer, titem) > 0) {
-        // deleted, but still rendered (e.g. a suggestion-deleted node): apply nothing — revert the
-        // whole change and return its inverse (against the rendered state the caller addressed)
-        const inv = delta.inverse(d, /** @type {any} */ (this.toDeltaDeep({ renderer })))
-        return inv.isEmpty() ? null : /** @type {any} */ (inv)
-      }
-      return null // invisible deleted type: the caller's view shows nothing here — silently drop
-    }
-    // @todo this was moved here from ytext. Make this more generic
-    return transact(this.doc, transaction => {
-      /**
-       * The accumulated fix. Its coordinates live in the caller's *expected* space, so they are
-       * tracked from `d`'s own ops (`expectedIndex`) — not `currPos.index`, which also counts
-       * content that a delete over attributed-deleted ranges leaves rendered.
-       *
-       * @type {delta.DeltaBuilder<any>?}
-       */
-      let fix = null
-      let fixLen = 0
-      let expectedIndex = 0
-      /**
-       * @param {delta.DeltaAny?} childFix
-       * @param {{ [k:string]: any }} [invFormat]
-       */
-      const appendModifyFix = (childFix, invFormat) => {
-        const f = fix ?? (fix = /** @type {any} */ (delta.create()))
-        expectedIndex > fixLen && f.retain(expectedIndex - fixLen)
-        f.modify(/** @type {any} */ (childFix ?? delta.create().done(false)), invFormat)
-        fixLen = expectedIndex + 1
-      }
-      const currPos = new ItemTextListPosition(null, this._start, 0, new Map(), renderer)
-      for (const op of d.children) {
-        if (delta.$textOp.check(op)) {
-          insertContent(transaction, /** @type {any} */ (this), currPos, new ContentString(op.insert), op.format || {})
-          expectedIndex += op.length
-        } else if (delta.$insertOp.check(op)) {
-          insertContentHelper(transaction, this, currPos, op.insert, op.format || {})
-          expectedIndex += op.length
-        } else if (delta.$retainOp.check(op)) {
-          currPos.formatText(transaction, /** @type {any} */ (this), op.retain, op.format || {})
-          expectedIndex += op.length
-        } else if (delta.$deleteOp.check(op)) {
-          deleteText(transaction, currPos, op.delete)
-        } else if (delta.$modifyOp.check(op)) {
-          let item = currPos.right
-          while (item !== null && rendererContentLength(renderer, item) === 0) { item = item.right }
-          if (item == null || item.content.constructor !== ContentType) { error.unexpectedCase() }
-          if (item.deleted) {
-            // deleted but rendered: revert instead of apply. Advance the cursor first (populating
-            // `currentFormats` with any markers up to the node) without applying `op.format`, then
-            // recurse — the child's deleted-guard applies nothing and returns the inverse.
-            currPos.formatText(transaction, /** @type {any} */ (this), 1, {})
-            /** @type {{ [k:string]: any }|undefined} */
-            let invFormat
-            for (const k in op.format) {
-              (invFormat ?? (invFormat = {}))[k] = currPos.currentFormats.get(k) ?? null
-            }
-            const childFix = /** @type {ContentType} */ (item.content).type.applyDelta(op.value, origin, { renderer })
-            if (childFix !== null || invFormat !== undefined) {
-              appendModifyFix(childFix, invFormat)
-            }
-          } else {
-            const childFix = /** @type {ContentType} */ (item.content).type.applyDelta(op.value, origin, { renderer })
-            currPos.formatText(transaction, /** @type {any} */ (this), 1, op.format || {})
-            if (childFix !== null) {
-              appendModifyFix(childFix)
-            }
-          }
-          expectedIndex += 1
-        } else {
-          error.unexpectedCase()
-        }
-      }
-      for (const op of d.attrs) {
-        if (delta.$setAttrOp.check(op)) {
-          typeMapSet(transaction, /** @type {any} */ (this), /** @type {any} */ (op.key), op.value)
-        } else if (delta.$deleteAttrOp.check(op)) {
-          typeMapDelete(transaction, /** @type {any} */ (this), /** @type {any} */ (op.key))
-        } else {
-          // modifyAttr — locate the target renderer-aware: a deleted map value may still be rendered
-          const mapItem = this._map.get(/** @type {any} */ (op.key))
-          const sub = mapItem === undefined
-            ? undefined
-            : (mapItem.deleted
-                ? (mapItem.content.constructor === ContentType && rendererContentLength(renderer, mapItem) > 0
-                    ? /** @type {ContentType} */ (mapItem.content).type
-                    : undefined)
-                : mapItem.content.getContent()[mapItem.length - 1])
-          if (!(sub instanceof YType)) {
-            error.unexpectedCase()
-          }
-          const subFix = sub.applyDelta(op.value, origin, { renderer })
-          if (subFix !== null) {
-            const f = fix ?? (fix = /** @type {any} */ (delta.create()))
-            f.modifyAttr(/** @type {any} */ (op.key), /** @type {any} */ (subFix))
-          }
-        }
-      }
-      return fix !== null && !(/** @type {delta.DeltaBuilder<any>} */ (fix).done(false).isEmpty()) ? fix : null
-    }, origin)
+    return applyDeltaCanonical(this, d, origin, renderer, null)
   }
 
   /**
