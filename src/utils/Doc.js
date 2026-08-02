@@ -13,6 +13,17 @@ import { transact, generateNewClientId } from './Transaction.js'
 import { YType } from '../ytype.js'
 import { $ydoc } from './schemas.js'
 
+/** @type {WeakMap<Doc,{generation:number,pendingTransactions:number}>} */
+const transactionGenerations = new WeakMap()
+
+/** @param {Doc} doc */
+export const getDocTransactionGeneration = doc => {
+  const state = transactionGenerations.get(doc)
+  return state === undefined
+    ? { generation: 0, settled: doc._transaction === null }
+    : { generation: state.generation, settled: state.pendingTransactions === 0 && doc._transaction === null }
+}
+
 /**
  * Validate fork-owned document options without changing the supplied record. Sparse capability is
  * enabled only by own data properties so decoded or inherited values cannot opt a document in.
@@ -132,6 +143,13 @@ export class Doc extends ObservableV2 {
     this.shouldLoad = shouldLoad
     this.autoLoad = autoLoad
     this.meta = meta
+    if (sparseExactResolution) {
+      const transactionGeneration = { generation: 0, pendingTransactions: 0 }
+      transactionGenerations.set(this, transactionGeneration)
+      this.on('beforeTransaction', () => { transactionGeneration.pendingTransactions++ })
+      this.on('beforeObserverCalls', () => { transactionGeneration.generation++ })
+      this.on('afterTransactionCleanup', () => { transactionGeneration.pendingTransactions-- })
+    }
     /**
      * This is set to true when the persistence provider loaded the document from the database or when the `sync` event fires.
      * Note that not all providers implement this feature. Provider authors are encouraged to fire the `load` event when the doc content is loaded from the database.

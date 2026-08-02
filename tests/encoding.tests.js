@@ -17,6 +17,7 @@ import {
 import * as Y from '../src/index.js'
 import { CausalHole, sameCausalHoleMetadata } from '../src/structs/CausalHole.js'
 import { normalizeDocOptions } from '../src/utils/Doc.js'
+import { _testOnlyGetSparsePendingProofRuns } from '../src/utils/encoding.js'
 import { writeStructsFromIdSetWithCausalHoles } from '../src/utils/encoding-helpers.js'
 
 /**
@@ -461,6 +462,74 @@ export const testSparseCombinedPendingStateRoundtrips = () => {
     t.assert(reload.store.pendingStructs === null && reload.store.pendingDs === null)
     t.assert(reload.get('later').toString() === 'ab' && reload.get('deleted').toString() === '')
   })
+}
+
+export const testSparsePendingProofCacheTracksTransactionsAndDefensiveSnapshots = () => {
+  const doc = new Y.Doc({ gc: false, sparseExactResolution: true })
+  doc.clientID = 21
+  doc.get('large').insert(0, 'x'.repeat(2_000_000))
+
+  const source = new Y.Doc({ gc: false })
+  source.clientID = 22
+  /** @type {Array<Uint8Array<ArrayBuffer>>} */
+  const sourceUpdates = []
+  source.on('update', update => sourceUpdates.push(update))
+  source.get('pending').insert(0, 'a')
+  source.get('pending').insert(1, 'b')
+  Y.applyUpdate(doc, sourceUpdates[1])
+  t.assert(doc.store.pendingStructs !== null)
+
+  const currentState = Y.encodeStateVector(doc)
+  const first = Y.encodeStateAsUpdate(doc, currentState)
+  t.assert(first.byteLength < 256 && _testOnlyGetSparsePendingProofRuns(doc) === 1)
+  for (let index = 0; index < 8; index++) {
+    const update = index % 2 === 0
+      ? Y.encodeStateAsUpdate(doc, currentState)
+      : Y.encodeStateAsUpdateV2(doc, currentState)
+    t.assert(update.byteLength < 256)
+  }
+  Y.encodeStateAsUpdateV2(doc)
+  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 1)
+
+  const pending = /** @type {NonNullable<typeof doc.store.pendingStructs>} */ (doc.store.pendingStructs)
+  const originalByte = pending.update[pending.update.byteLength - 1]
+  pending.update[pending.update.byteLength - 1] ^= 1
+  t.fails(() => Y.encodeStateAsUpdate(doc, currentState))
+  pending.update[pending.update.byteLength - 1] = originalByte
+  pending.missing.set(999, 0)
+  t.fails(() => Y.encodeStateAsUpdateV2(doc, currentState))
+  pending.missing.delete(999)
+  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 1)
+
+  const deletes = Y.createIdSet()
+  deletes.add(88, 0, 1)
+  Y.applyUpdateV2(doc, encodeDeleteSet(deletes, Y.UpdateEncoderV2))
+  t.assert(doc.store.pendingDs !== null)
+  Y.encodeStateAsUpdate(doc, currentState)
+  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 2)
+  const pendingDelete = /** @type {Uint8Array<ArrayBuffer>} */ (doc.store.pendingDs)
+  const deleteByte = pendingDelete[pendingDelete.byteLength - 1]
+  pendingDelete[pendingDelete.byteLength - 1] ^= 1
+  t.fails(() => Y.encodeStateAsUpdateV2(doc, currentState))
+  pendingDelete[pendingDelete.byteLength - 1] = deleteByte
+
+  doc.get('unrelated').insert(0, 'z')
+  Y.encodeStateAsUpdateV2(doc, currentState)
+  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 3)
+
+  doc.transact(() => {
+    Y.encodeStateAsUpdate(doc, currentState)
+    Y.encodeStateAsUpdateV2(doc, currentState)
+  })
+  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 5)
+  Y.encodeStateAsUpdate(doc, currentState)
+  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 6)
+
+  doc.clientID = 22
+  Y.applyUpdate(doc, sourceUpdates[0])
+  t.assert(doc.store.pendingStructs === null && doc.get('pending').toString() === 'ab')
+  Y.encodeStateAsUpdateV2(doc, currentState)
+  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 7)
 }
 
 export const testSparseSubdocWirePreservesCapability = () => {

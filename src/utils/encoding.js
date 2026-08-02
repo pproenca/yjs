@@ -32,7 +32,7 @@ import { Skip } from '../structs/Skip.js'
 import { ContentDoc, ContentType, Item, findItemInsertionLeft } from '../structs/Item.js'
 import { GC } from '../structs/GC.js'
 import { CausalHole, CausalHoleIndex, createCausalHoleFromItem, normalizeCausalHoleParent, sameCausalHoleMetadata, sameCausalHoleParent } from '../structs/CausalHole.js'
-import { Doc, normalizeDocOptions } from './Doc.js'
+import { Doc, getDocTransactionGeneration, normalizeDocOptions } from './Doc.js'
 import { writeStructs } from './encoding-helpers.js'
 
 /**
@@ -1389,6 +1389,44 @@ const equalBytes = (left, right) => left.byteLength === right.byteLength && left
 /** @param {Map<number,number>} left @param {Map<number,number>} right */
 const equalMissing = (left, right) => left.size === right.size && array.from(left.entries()).every(([client, clock]) => right.get(client) === clock)
 
+/**
+ * @typedef {{
+ *   update:Uint8Array<ArrayBuffer>|null,
+ *   missing:Array<[number,number]>|null,
+ *   deletes:Uint8Array<ArrayBuffer>|null
+ * }} SparsePendingSnapshot
+ */
+
+/** @type {WeakMap<Doc,{generation:number,snapshot:SparsePendingSnapshot}>} */
+const sparsePendingProofs = new WeakMap()
+
+/** @type {WeakMap<Doc,number>} */
+const sparsePendingProofRuns = new WeakMap()
+
+/** @param {Doc} doc */
+export const _testOnlyGetSparsePendingProofRuns = doc => sparsePendingProofRuns.get(doc) ?? 0
+
+/** @param {Doc} doc @return {SparsePendingSnapshot} */
+const captureSparsePendingSnapshot = doc => ({
+  update: doc.store.pendingStructs?.update.slice() ?? null,
+  missing: doc.store.pendingStructs === null
+    ? null
+    : array.from(doc.store.pendingStructs.missing.entries()).sort((left, right) => left[0] - right[0] || left[1] - right[1]),
+  deletes: doc.store.pendingDs?.slice() ?? null
+})
+
+/** @param {SparsePendingSnapshot} left @param {SparsePendingSnapshot} right */
+const equalSparsePendingSnapshots = (left, right) => {
+  if (left.update === null ? right.update !== null : right.update === null || !equalBytes(left.update, right.update)) return false
+  if (left.deletes === null ? right.deletes !== null : right.deletes === null || !equalBytes(left.deletes, right.deletes)) return false
+  if (left.missing === null || right.missing === null) return left.missing === right.missing
+  const rightMissing = right.missing
+  return left.missing.length === rightMissing.length && left.missing.every(([client, clock], index) => {
+    const candidate = rightMissing[index]
+    return candidate[0] === client && candidate[1] === clock
+  })
+}
+
 /** @param {Doc} doc */
 const encodeAuthoritativeSparseState = doc => {
   const encoder = new UpdateEncoderV2()
@@ -1403,6 +1441,15 @@ const encodeAuthoritativeSparseState = doc => {
  * @param {Doc} doc
  */
 const validateSparsePendingState = doc => {
+  const transaction = getDocTransactionGeneration(doc)
+  const snapshot = captureSparsePendingSnapshot(doc)
+  const proof = sparsePendingProofs.get(doc)
+  if (transaction.settled && proof?.generation === transaction.generation) {
+    if (!equalSparsePendingSnapshots(proof.snapshot, snapshot)) {
+      throw new Error('Sparse pending state changed outside a completed transaction')
+    }
+    return
+  }
   const authoritative = encodeAuthoritativeSparseState(doc)
   const scratch = new Doc({ guid: doc.guid, gc: false, sparseExactResolution: true })
   const occupied = new Set(doc.store.clients.keys())
@@ -1439,6 +1486,10 @@ const validateSparsePendingState = doc => {
       !pendingDeletesMatch
     ) {
       throw new Error('Sparse pending state is not authentic unresolved transport')
+    }
+    sparsePendingProofRuns.set(doc, (sparsePendingProofRuns.get(doc) ?? 0) + 1)
+    if (transaction.settled) {
+      sparsePendingProofs.set(doc, { generation: transaction.generation, snapshot })
     }
   } finally {
     scratch.destroy()
