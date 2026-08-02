@@ -29,7 +29,7 @@ import { UpdateEncoderV1, UpdateEncoderV2, IdSetEncoderV1, IdSetEncoderV2 } from
 import { convertUpdateFormatV2ToV1, LazyStructReader, LazyStructWriter, writeStructToLazyStructWriter, finishLazyStructWriting } from './updates.js'
 import { readBlockSet, writeBlockSet } from './BlockSet.js'
 import { Skip } from '../structs/Skip.js'
-import { ContentType, Item, findItemInsertionLeft } from '../structs/Item.js'
+import { ContentDeleted, ContentType, Item, findItemInsertionLeft } from '../structs/Item.js'
 import { GC } from '../structs/GC.js'
 import { CausalHole, CausalHoleIndex, createCausalHoleFromItem, normalizeCausalHoleParent, sameCausalHoleMetadata, sameCausalHoleParent } from '../structs/CausalHole.js'
 import { TerminalCausalHole, createTerminalCausalHoleFromHole } from '../structs/TerminalCausalHole.js'
@@ -535,39 +535,119 @@ const validateCausalHoleEnvelope = (blockSet, store, deleteSet) => {
   }
 
   /** @typedef {CausalHole|TerminalCausalHole} SparseCoverage */
+  /** @typedef {'live'|'staged'|'dead'} SparseParentDisposition */
+  /** @type {Map<SparseCoverage,SparseParentDisposition>} */
+  const terminalMemo = new Map()
   /** @type {Map<SparseCoverage,0|1|2>} */
   const terminalColors = new Map()
-  /** @param {SparseCoverage} sparse @return {boolean} */
-  const hasDeadStructuralParent = sparse => {
-    const color = terminalColors.get(sparse) ?? 0
-    if (color === 2) return true
-    if (color === 1) throw new Error('Cyclic terminal causal hole parent')
+  /**
+   * A bundled delete only stages sparse coverage. It becomes authoritative when the materialized
+   * ContentType is actually garbage-collected; gc:false and gcFilter-retained Items stay live.
+   *
+   * @param {SparseCoverage} sparse
+   * @return {SparseParentDisposition}
+   */
+  const classifyStructuralParentDeath = sparse => {
+    const cached = terminalMemo.get(sparse)
+    if (cached !== undefined) return cached
+    /** @type {Array<{sparse:SparseCoverage,dependency:SparseCoverage|null}>} */
+    const stack = [{ sparse, dependency: null }]
     terminalColors.set(sparse, 1)
-    const parent = sparse.parent
-    let dead = false
-    if (typeof parent !== 'string') {
-      const existing = store.getStruct(parent)
-      const incoming = incomingAt(parent)
-      if (
-        deleteSet.hasId(parent) &&
-        (existing?.constructor === Item || incoming?.constructor === Item)
-      ) {
-        dead = true
-      } else if (
-        existing?.constructor === GC || existing?.constructor === TerminalCausalHole ||
-        (existing?.constructor === Item && existing.deleted)
-      ) {
-        dead = true
-      } else if (existing?.constructor !== Item) {
-        if (incoming?.constructor === GC || (incoming?.constructor === Item && incoming.deleted)) {
-          dead = true
-        } else if (incoming?.constructor === CausalHole || incoming?.constructor === TerminalCausalHole) {
-          dead = hasDeadStructuralParent(/** @type {SparseCoverage} */ (incoming))
+    try {
+      while (stack.length > 0) {
+        const frame = stack[stack.length - 1]
+        if (frame.dependency !== null) {
+          const disposition = terminalMemo.get(frame.dependency)
+          if (disposition === undefined) throw new Error('Missing terminal causal hole parent proof')
+          terminalMemo.set(frame.sparse, disposition)
+          terminalColors.set(frame.sparse, 2)
+          stack.pop()
+          continue
         }
+        const parent = frame.sparse.parent
+        if (typeof parent === 'string') {
+          terminalMemo.set(frame.sparse, 'live')
+          terminalColors.set(frame.sparse, 2)
+          stack.pop()
+          continue
+        }
+        const existing = store.getStruct(parent)
+        const incoming = incomingAt(parent)
+        const parentStruct = existing?.constructor === Item || existing?.constructor === GC || existing?.constructor === TerminalCausalHole
+          ? existing
+          : incoming?.constructor === Item || incoming?.constructor === GC
+            ? incoming
+            : null
+        /** @type {SparseParentDisposition|null} */
+        let disposition = null
+        /** @type {SparseCoverage|null} */
+        const dependency = existing?.constructor === CausalHole
+          ? existing
+          : incoming?.constructor === CausalHole || incoming?.constructor === TerminalCausalHole
+            ? incoming
+            : null
+        if (parentStruct?.constructor === GC || parentStruct?.constructor === TerminalCausalHole) {
+          disposition = 'dead'
+        } else if (parentStruct?.constructor === Item) {
+          const parentItem = /** @type {Item} */ (parentStruct)
+          disposition = deleteSet.hasId(parent) || parentItem.deleted
+            ? parentItem.content instanceof ContentDeleted ? 'dead' : 'staged'
+            : 'live'
+        } else if (dependency === null) {
+          disposition = 'live'
+        }
+        if (disposition !== null) {
+          terminalMemo.set(frame.sparse, disposition)
+          terminalColors.set(frame.sparse, 2)
+          stack.pop()
+          continue
+        }
+        const provenDependency = /** @type {SparseCoverage} */ (dependency)
+        const dependencyDisposition = terminalMemo.get(provenDependency)
+        if (dependencyDisposition !== undefined) {
+          terminalMemo.set(frame.sparse, dependencyDisposition)
+          terminalColors.set(frame.sparse, 2)
+          stack.pop()
+          continue
+        }
+        if (terminalColors.get(provenDependency) === 1) throw new Error('Cyclic terminal causal hole parent')
+        frame.dependency = provenDependency
+        terminalColors.set(provenDependency, 1)
+        stack.push({ sparse: provenDependency, dependency: null })
       }
+    } catch (error) {
+      stack.forEach(frame => terminalColors.set(frame.sparse, 2))
+      throw error
     }
-    terminalColors.set(sparse, dead ? 2 : 0)
-    return dead
+    const result = terminalMemo.get(sparse)
+    if (result === undefined) throw new Error('Missing terminal causal hole parent proof')
+    return result
+  }
+
+  incomingHoles.forEach(classifyStructuralParentDeath)
+  incomingTerminals.forEach(classifyStructuralParentDeath)
+  /** @type {Map<TerminalCausalHole,CausalHole>} */
+  const stagedTerminals = new Map()
+  for (const terminal of incomingTerminals) {
+    const disposition = /** @type {SparseParentDisposition} */ (terminalMemo.get(terminal))
+    if (disposition === 'live') throw new Error('Terminal causal hole parent is not dead')
+    if (disposition === 'staged') {
+      stagedTerminals.set(terminal, new CausalHole(
+        createID(terminal.id.client, terminal.id.clock),
+        terminal.length,
+        terminal.origin,
+        terminal.rightOrigin,
+        terminal.parent,
+        terminal.parentSub
+      ))
+    }
+  }
+  if (stagedTerminals.size > 0) {
+    blockSet.clients.forEach(range => {
+      range.refs = range.refs.map(struct => struct.constructor === TerminalCausalHole
+        ? stagedTerminals.get(/** @type {TerminalCausalHole} */ (struct)) ?? struct
+        : struct)
+    })
   }
 
   const liveIncomingHoles = new CausalHoleIndex()
@@ -578,14 +658,21 @@ const validateCausalHoleEnvelope = (blockSet, store, deleteSet) => {
   /** @type {Set<SparseCoverage>} */
   const terminalHoles = new Set()
   for (const terminal of incomingTerminals) {
-    if (!hasDeadStructuralParent(terminal)) throw new Error('Terminal causal hole parent is not dead')
+    const staged = stagedTerminals.get(terminal)
+    if (staged !== undefined) {
+      if (coveredByStoredTerminal(staged)) continue
+      const storedHole = coveredByStoredHole(staged)
+      if (coveredByRealStore(staged) || storedHole) continue
+      effectiveIncomingHoles.push(staged)
+      continue
+    }
     if (coveredByStoredTerminal(terminal)) continue
     coveredByStoredHole(terminal)
     terminalHoles.add(terminal)
     effectiveIncomingTerminals.push(terminal)
   }
   for (const hole of incomingHoles) {
-    const terminal = hasDeadStructuralParent(hole)
+    const terminal = terminalMemo.get(hole) === 'dead'
     if (coveredByStoredTerminal(hole)) continue
     const storedHole = coveredByStoredHole(hole)
     if ((coveredByRealStore(hole) || storedHole) && !terminal) continue
@@ -601,11 +688,11 @@ const validateCausalHoleEnvelope = (blockSet, store, deleteSet) => {
     if (typeof parent === 'string') return true
     const existing = store.getStruct(parent)
     if (existing !== null && existing.constructor !== Skip && existing.constructor !== CausalHole) {
-      if (existing.constructor === Item && !existing.deleted && /** @type {Item} */ (existing).content instanceof ContentType) return true
+      if (existing.constructor === Item && /** @type {Item} */ (existing).content instanceof ContentType) return true
       throw new Error('Causal hole parent is not a materialized type')
     }
     const incoming = incomingAt(parent)
-    if (incoming?.constructor === Item && !incoming.deleted && /** @type {Item} */ (incoming).content instanceof ContentType) {
+    if (incoming?.constructor === Item && /** @type {Item} */ (incoming).content instanceof ContentType) {
       structuralParentDependencies.set(hole, /** @type {Item} */ (incoming))
       return true
     }
@@ -813,6 +900,10 @@ const validateCausalHoleEnvelope = (blockSet, store, deleteSet) => {
         terminal = /** @type {Item} */ (dependency)
         break
       }
+      if (
+        dependency?.constructor === GC &&
+        (current.constructor === TerminalCausalHole || terminalHoles.has(current))
+      ) break
       if (dependency?.constructor !== CausalHole && dependency?.constructor !== TerminalCausalHole) throw new Error('Missing causal hole anchor')
       current = /** @type {SparseCoverage} */ (dependency)
     }
@@ -1699,7 +1790,10 @@ const getMissing = (struct, transaction, store, sparsePlan) => {
     }
   } else if (parent.constructor === ID) {
     const parentItem = store.getStruct(parent)
-    if (parentItem === null || parentItem.constructor === GC || parentItem.constructor === TerminalCausalHole) {
+    if (
+      parentItem === null || parentItem.constructor === GC || parentItem.constructor === TerminalCausalHole ||
+      (parentItem.constructor === Item && !(/** @type {Item} */ (parentItem).content instanceof ContentType))
+    ) {
       item.parent = null
     } else {
       item.parent = /** @type {ContentType} */ (/** @type {Item} */ (parentItem).content).type

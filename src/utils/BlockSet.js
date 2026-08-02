@@ -412,47 +412,81 @@ const createMergeItemParentResolver = resolveMergeInput => {
   /** @typedef {{parent:ID|string,parentSub:string|null}} ParentMetadata */
   /** @type {Map<Item,ParentMetadata|null|false>} */
   const memo = new Map()
-  const visiting = new Set()
+  /** @type {Map<Item,0|1|2>} */
+  const colors = new Map()
   /** @param {ParentMetadata} left @param {ParentMetadata} right */
   const sameParent = (left, right) => sameCausalHoleParent(left.parent, right.parent) && left.parentSub === right.parentSub
+  /** @param {ParentMetadata|null} proof @param {ParentMetadata|null} candidate */
+  const mergeProof = (proof, candidate) => {
+    if (candidate === null) return proof
+    if (proof !== null && !sameParent(proof, candidate)) throw new Error('Conflicting merge item parent proofs')
+    return candidate
+  }
   /** @param {Item} item @return {ParentMetadata|null} */
   const infer = item => {
     const cached = memo.get(item)
     if (cached === false) throw new Error('Conflicting merge item parent proofs')
     if (cached !== undefined) return cached
-    if (item.parent !== null) {
-      const explicit = { parent: normalizeCausalHoleParent(item.parent), parentSub: item.parentSub }
-      memo.set(item, explicit)
-      return explicit
-    }
-    if (visiting.has(item)) {
-      memo.set(item, false)
-      throw new Error('Cyclic merge item parent proof')
-    }
-    visiting.add(item)
-    /** @type {ParentMetadata|null} */
-    let proof = null
+    /** @type {Array<{item:Item,next:number,proof:ParentMetadata|null}>} */
+    const stack = [{ item, next: 0, proof: null }]
+    colors.set(item, 1)
     try {
-      for (const anchor of [item.origin, item.rightOrigin]) {
-        if (anchor === null) continue
-        const source = resolveMergeInput(anchor)
-        if (source?.constructor !== Item) continue
-        const candidate = infer(/** @type {Item} */ (source))
-        if (candidate === null) continue
-        if (proof !== null && !sameParent(proof, candidate)) {
-          memo.set(item, false)
-          throw new Error('Conflicting merge item parent proofs')
+      while (stack.length > 0) {
+        const frame = stack[stack.length - 1]
+        if (frame.item.parent !== null) {
+          frame.proof = mergeProof(frame.proof, {
+            parent: normalizeCausalHoleParent(frame.item.parent),
+            parentSub: frame.item.parentSub
+          })
+          frame.next = 2
         }
-        proof = candidate
+        const anchors = [frame.item.origin, frame.item.rightOrigin]
+        if (frame.next >= anchors.length) {
+          memo.set(frame.item, frame.proof)
+          colors.set(frame.item, 2)
+          stack.pop()
+          continue
+        }
+        const anchor = anchors[frame.next]
+        if (anchor === null) {
+          frame.next++
+          continue
+        }
+        const source = resolveMergeInput(anchor)
+        if (source?.constructor === CausalHole || source?.constructor === TerminalCausalHole) {
+          frame.proof = mergeProof(frame.proof, {
+            parent: /** @type {CausalHole|TerminalCausalHole} */ (source).parent,
+            parentSub: /** @type {CausalHole|TerminalCausalHole} */ (source).parentSub
+          })
+          frame.next++
+          continue
+        }
+        if (source?.constructor !== Item) {
+          frame.next++
+          continue
+        }
+        const dependency = /** @type {Item} */ (source)
+        const dependencyMemo = memo.get(dependency)
+        if (dependencyMemo === false) throw new Error('Conflicting merge item parent proofs')
+        if (dependencyMemo !== undefined) {
+          frame.proof = mergeProof(frame.proof, dependencyMemo)
+          frame.next++
+          continue
+        }
+        if (colors.get(dependency) === 1) throw new Error('Cyclic merge item parent proof')
+        colors.set(dependency, 1)
+        stack.push({ item: dependency, next: 0, proof: null })
       }
-      memo.set(item, proof)
-      return proof
     } catch (error) {
-      memo.set(item, false)
+      stack.forEach(frame => {
+        memo.set(frame.item, false)
+        colors.set(frame.item, 2)
+      })
       throw error
-    } finally {
-      visiting.delete(item)
     }
+    const result = memo.get(item)
+    if (result === false || result === undefined) throw new Error('Conflicting merge item parent proofs')
+    return result
   }
   return infer
 }
@@ -510,10 +544,10 @@ const validateSparseOverlaps = (left, right, inferParent) => {
         )) throw new Error('Conflicting sparse causal metadata')
       }
       if (
-        (l.constructor === CausalHole && r.constructor === GC) ||
-        (r.constructor === CausalHole && l.constructor === GC)
+        ((l.constructor === CausalHole || l.constructor === TerminalCausalHole) && r.constructor === GC) ||
+        ((r.constructor === CausalHole || r.constructor === TerminalCausalHole) && l.constructor === GC)
       ) {
-        throw new Error('GC cannot replace live causal hole coverage')
+        throw new Error('GC cannot prove sparse causal metadata')
       }
     }
     if (lend <= rend) li++
