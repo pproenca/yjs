@@ -854,20 +854,39 @@ export const testReservedDeltaMutationSnapshotsRendererDependenciesAndPolicy = (
     const suggestion = new Y.Doc({ gc: false })
     const renderer = Y.createDiffRenderer(base, suggestion, { attrs: new Y.Attributions() })
     const origin = { trusted: true }
-    /** @type {Array<object>} */
-    const origins = [origin]
-    renderer.suggestionOrigins = origins
     const type = suggestion.get('content')
     const staleMode = type.reserveDeltaMutation(delta.create().insert('stale').done(), origin, { renderer })
     renderer.suggestionMode = false
     assertNamedFailure(() => staleMode.apply(), 'DeltaMutationStaleError')
 
     renderer.suggestionMode = true
+    const forged = { forged: true }
+    let proxyCalls = 0
+    /** @type {any[]} */
+    const originValues = [origin]
+    const origins = new Proxy(originValues, {
+      get: (target, key, receiver) => {
+        proxyCalls++
+        return Reflect.get(target, key, receiver)
+      },
+      getOwnPropertyDescriptor: (target, key) => {
+        proxyCalls++
+        return Reflect.getOwnPropertyDescriptor(target, key)
+      }
+    })
+    renderer.suggestionOrigins = origins
+    const ownedOrigins = renderer.suggestionOrigins
+    t.assert(ownedOrigins !== origins && Object.isFrozen(ownedOrigins) && ownedOrigins?.[0] === origin, 'renderer owns immutable origin policy')
+    const callsAfterSetter = proxyCalls
+    const stableOrigins = type.reserveDeltaMutation(delta.create().insert('stable origins').done(), origin, { renderer })
+    originValues[0] = forged
+    stableOrigins.apply()
+    t.assert(proxyCalls === callsAfterSetter && type.toString() === 'stable origins', 'capability never rereads caller policy')
+
     const staleOrigins = type.reserveDeltaMutation(delta.create().insert('stale origins').done(), origin, { renderer })
-    origins[0] = { forged: true }
-    t.assert(renderer.suggestionOrigins === origins && renderer.suggestionOrigins[0] === origins[0], 'origin policy remains live')
+    renderer.suggestionOrigins = [forged]
     assertNamedFailure(() => staleOrigins.apply(), 'DeltaMutationStaleError')
-    origins[0] = origin
+    renderer.suggestionOrigins = [origin]
     const prepared = type.reserveDeltaMutation(delta.create().insert('owned').done(), origin, { renderer })
     prepared.apply({
       afterMutation: () => {
@@ -875,8 +894,214 @@ export const testReservedDeltaMutationSnapshotsRendererDependenciesAndPolicy = (
         renderer.suggestionOrigins = [origin]
       }
     })
-    t.assert(type.toString() === 'owned' && base.get('content').toString() === '', 'reserved update never forwards after cleanup policy flip')
+    t.assert(type.toString() === 'ownedstable origins' && base.get('content').toString() === '', 'reserved update never forwards after cleanup policy flip')
+
+    suggestion.get('local').applyDelta(delta.create().insert('allowed').done(), origin)
+    t.assert(base.get('local').toString() === 'allowed', 'explicit owned policy remains live for ordinary local updates')
+    const remote = new Y.Doc()
+    remote.get('remote').applyDelta(delta.create().insert('remote').done())
+    Y.applyUpdate(suggestion, Y.encodeStateAsUpdate(remote), origin)
+    t.assert(base.get('remote').toString() === '' && proxyCalls === callsAfterSetter, 'remote updates and ordinary policy never dispatch caller Proxy traps')
   }
+}
+
+export const testReservedDeltaMutationAccountsCallbackGcWire = () => {
+  /** @type {Array<['update'|'updateV2',typeof Y.encodeStateAsUpdate,typeof Y.applyUpdate]>} */
+  const formats = [
+    ['update', Y.encodeStateAsUpdate, Y.applyUpdate],
+    ['updateV2', Y.encodeStateAsUpdateV2, Y.applyUpdateV2]
+  ]
+  for (let index = 0; index < formats.length; index++) {
+    const [event, encode, apply] = formats[index]
+    const source = new Y.Doc()
+    source.clientID = 77
+    const nested = new Y.Type()
+    source.get('remote').insert(0, [nested])
+    nested.insert(0, ['a', 'b', 'c', 'd'])
+    source.get('remote').delete(0, 1)
+    const callbackUpdate = encode(source)
+    const sourceStructs = /** @type {any[]} */ (source.store.clients.get(77))
+    t.assert(sourceStructs.length === 2 && sourceStructs[0].constructor.name === 'Item' && sourceStructs[1].constructor.name === 'GC')
+
+    const doc = new Y.Doc()
+    doc.clientID = 88
+    const type = doc.get('content')
+    const mirror = new Y.Doc()
+    mirror.clientID = 99
+    /** @type {Uint8Array|null} */
+    let emitted = null
+    doc.on(event, update => { emitted = update })
+    type.reserveDeltaMutation(delta.create().insert('local').done()).apply({
+      afterMutation: () => { apply(doc, callbackUpdate) }
+    })
+
+    t.assert(doc.store.getClock(77) === 5, `${event} callback integrates Item and GC locally`)
+    if (emitted === null) throw new Error(`${event} callback update was not emitted`)
+    apply(mirror, emitted)
+    t.assert(mirror.store.getClock(77) === 5, `${event} callback emits complete Item and GC wire coverage`)
+  }
+}
+
+export const testReservedDeltaMutationInitializesEmissionContextsBeforeCleanupHooks = () => {
+  /** @type {Array<[object,'update'|'updateV2',typeof Y.applyUpdate]>} */
+  const formats = [
+    [UpdateEncoderV1.prototype, 'update', Y.applyUpdate],
+    [UpdateEncoderV2.prototype, 'updateV2', Y.applyUpdateV2]
+  ]
+  for (let index = 0; index < formats.length; index++) {
+    const [prototype, event, apply] = formats[index]
+    const doc = new Y.Doc()
+    const type = doc.get('content')
+    const mirror = new Y.Doc()
+    const prepared = type.reserveDeltaMutation(delta.create().insert('wire').done())
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, 'restEncoder')
+    let setterCalls = 0
+    let failure = null
+    /** @type {Uint8Array|null} */
+    let emitted = null
+    doc.on(event, update => { emitted = update })
+    doc.on('afterTransactionCleanup', () => {
+      Object.defineProperty(prototype, 'restEncoder', {
+        configurable: true,
+        get: () => undefined,
+        set: () => { setterCalls++ }
+      })
+    })
+    try {
+      prepared.apply()
+    } catch (error) {
+      failure = error
+    } finally {
+      if (descriptor === undefined) Reflect.deleteProperty(prototype, 'restEncoder')
+      else Object.defineProperty(prototype, 'restEncoder', descriptor)
+    }
+    t.assert(failure === null && setterCalls === 0, `${event} encoder is fully initialized before cleanup hooks`)
+    t.assert(type.toString() === 'wire' && doc._transactionCleanups.length === 0, `${event} leaves committed state and a drained queue`)
+    assertNamedFailure(() => prepared.apply(), 'DeltaMutationCapabilityError')
+    if (emitted === null) throw new Error(`${event} was not emitted`)
+    apply(mirror, emitted)
+    t.assert(mirror.get('content').toString() === 'wire')
+  }
+}
+
+export const testReservedDeltaMutationCleanupUsesCapturedWeakMapKernel = () => {
+  const doc = new Y.Doc()
+  const type = doc.get('content')
+  const prepared = type.reserveDeltaMutation(delta.create().insert('wire').done())
+  const target = WeakMap.prototype
+  const descriptor = Object.getOwnPropertyDescriptor(target, 'get')
+  /** @type {Uint8Array|null} */
+  let updateV1 = null
+  /** @type {Uint8Array|null} */
+  let updateV2 = null
+  let poisonCalls = 0
+  let failure = null
+  doc.on('update', update => { updateV1 = update })
+  doc.on('updateV2', update => { updateV2 = update })
+  try {
+    prepared.apply({
+      afterMutation: () => {
+        Object.defineProperty(target, 'get', {
+          configurable: true,
+          value: () => {
+            poisonCalls++
+            throw new Error('poison weak get')
+          }
+        })
+      }
+    })
+  } catch (error) {
+    failure = error
+  } finally {
+    Object.defineProperty(target, 'get', /** @type {PropertyDescriptor} */ (descriptor))
+  }
+  t.assert(failure === null && poisonCalls === 0, 'reserved cleanup uses its captured WeakMap kernel')
+  t.assert(type.toString() === 'wire' && doc._transactionCleanups.length === 0, 'WeakMap poison leaves committed state and a drained queue')
+  assertNamedFailure(() => prepared.apply(), 'DeltaMutationCapabilityError')
+  if (updateV1 === null || updateV2 === null) throw new Error('WeakMap poison lost an update format')
+}
+
+export const testReservedDeltaMutationContentAnyUsesCapturedBinaryKernel = () => {
+  const doc = new Y.Doc()
+  const type = doc.get('content')
+  const prepared = type.reserveDeltaMutation(delta.create().setAttr('payload', { owned: true }).done())
+  const descriptor = Object.getOwnPropertyDescriptor(Uint8Array, Symbol.hasInstance)
+  /** @type {Uint8Array|null} */
+  let updateV1 = null
+  /** @type {Uint8Array|null} */
+  let updateV2 = null
+  let poisonCalls = 0
+  let failure = null
+  doc.on('update', update => { updateV1 = update })
+  doc.on('updateV2', update => { updateV2 = update })
+  try {
+    prepared.apply({
+      afterMutation: () => {
+        Object.defineProperty(Uint8Array, Symbol.hasInstance, {
+          configurable: true,
+          value: () => {
+            poisonCalls++
+            throw new Error('poison Uint8Array hasInstance')
+          }
+        })
+      }
+    })
+  } catch (error) {
+    failure = error
+  } finally {
+    if (descriptor === undefined) Reflect.deleteProperty(Uint8Array, Symbol.hasInstance)
+    else Object.defineProperty(Uint8Array, Symbol.hasInstance, descriptor)
+  }
+  t.assert(failure === null && poisonCalls === 0, 'ContentAny wire encoding uses captured binary dispatch')
+  t.assert(type.getAttr('payload').owned === true && doc._transactionCleanups.length === 0)
+  if (updateV1 === null || updateV2 === null) throw new Error('ContentAny poison lost an update format')
+}
+
+export const testReservedDeltaMutationRootNameUsesCapturedMapKernel = () => {
+  const doc = new Y.Doc()
+  const type = doc.get('content')
+  const prepared = type.reserveDeltaMutation(delta.create().insert('wire').done())
+  const target = Map.prototype
+  const descriptor = Object.getOwnPropertyDescriptor(target, 'entries')
+  /** @type {Uint8Array|null} */
+  let updateV1 = null
+  /** @type {Uint8Array|null} */
+  let updateV2 = null
+  let poisonCalls = 0
+  let failure = null
+  doc.on('update', update => { updateV1 = update })
+  doc.on('updateV2', update => { updateV2 = update })
+  try {
+    prepared.apply({
+      afterMutation: () => {
+        Object.defineProperty(target, 'entries', {
+          configurable: true,
+          value: () => {
+            poisonCalls++
+            throw new Error('poison map entries')
+          }
+        })
+      }
+    })
+  } catch (error) {
+    failure = error
+  } finally {
+    Object.defineProperty(target, 'entries', /** @type {PropertyDescriptor} */ (descriptor))
+  }
+  t.assert(failure === null && poisonCalls === 0, 'root-name lookup uses a captured Map kernel')
+  t.assert(type.toString() === 'wire' && doc._transactionCleanups.length === 0)
+  if (updateV1 === null || updateV2 === null) throw new Error('Map poison lost an update format')
+}
+
+export const testReservedDeltaMutationChargesUtf8PayloadBytes = () => {
+  const doc = new Y.Doc()
+  const type = doc.get('content')
+  const key = '€'.repeat(199990)
+  assertNamedFailure(
+    () => type.reserveDeltaMutation(delta.create().setAttr(key, true).done()),
+    'DeltaMutationPreparationError'
+  )
+  t.assert(type.toDeltaDeep().isEmpty() && doc.store.clients.size === 0, 'UTF-8 budget rejection is prewrite')
 }
 
 export const testReservedDeltaMutationNeverForwardsAttributedDeletes = () => {

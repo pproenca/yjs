@@ -1,4 +1,5 @@
 import * as delta from 'lib0/delta'
+import * as string from 'lib0/string'
 
 import { ContentFormat, ContentString, ContentType, Item, reservedMutationItemRuntime } from '../structs/Item.js'
 import { IdRanges, IdSet, reservedMutationIdSetRuntime } from './ids.js'
@@ -94,6 +95,7 @@ const mapSet = Map.prototype.set
 const weakMapDelete = WeakMap.prototype.delete
 const weakMapGet = WeakMap.prototype.get
 const weakMapSet = WeakMap.prototype.set
+const encodeUtf8 = string.encodeUtf8
 /** @param {WeakMap<any,any>} target @param {any} key */
 const weakGet = (target, key) => reflectApply(weakMapGet, target, [key])
 /** @param {WeakMap<any,any>} target @param {any} key @param {any} value */
@@ -178,6 +180,8 @@ const createReservedMutationRuntime = (integrateType, gcFilter) => {
   registerReservedMutationRuntime(runtime, {
     createIdSet: reservedMutationIdSetRuntime.create,
     addId: reservedMutationIdSetRuntime.add,
+    cloneIdSet: reservedMutationIdSetRuntime.clone,
+    differenceIdSet: reservedMutationIdSetRuntime.difference,
     writeUpdate: (encoder, transaction) => {
       const accounting = readReservedMutationAccounting(transaction, runtime)
       const inserts = reservedMutationIdSetRuntime.union([
@@ -1322,6 +1326,9 @@ const ownDeltaMutation = mutation => {
   let payloadNodeCount = 0
   let payloadUnits = 0
 
+  /** @param {string} value */
+  const encodedStringSize = value => reflectApply(encodeUtf8, undefined, [value]).byteLength
+
   /** @param {number} units */
   const chargePayload = units => {
     if (!Number.isSafeInteger(units) || units < 0) throw new DeltaMutationPreparationError('Delta payload has an invalid size')
@@ -1433,7 +1440,7 @@ const ownDeltaMutation = mutation => {
     while (occurrences.length > 0) {
       const current = reflectApply(arrayPop, occurrences, [])
       if (current === null || (typeof current !== 'object' && typeof current !== 'function')) {
-        chargePayload(typeof current === 'string' ? current.length : 1)
+        chargePayload(typeof current === 'string' ? encodedStringSize(current) : 1)
         continue
       }
       const prototype = objectGetPrototypeOf(current)
@@ -1446,7 +1453,7 @@ const ownDeltaMutation = mutation => {
         chargePayload(1)
         for (let index = keys.length - 1; index >= 0; index--) {
           const key = keys[index]
-          if (prototype !== Array.prototype) chargePayload(key.length)
+          if (prototype !== Array.prototype) chargePayload(encodedStringSize(key))
           appendDense(occurrences, readOwnData(current, key))
         }
       } else {
@@ -1534,7 +1541,7 @@ const ownDeltaMutation = mutation => {
     if (name !== null && typeof name !== 'string') {
       throw new DeltaMutationPreparationError('Delta names must be null or strings')
     }
-    if (name !== null) chargePayload(name.length)
+    if (name !== null) chargePayload(encodedStringSize(name))
     if (readOwnData(source, 'marks') !== null || readOwnData(source, 'deleteMarks') !== null) {
       throw new DeltaMutationPreparationError('Reserved delta mutation does not support marks')
     }
@@ -1563,7 +1570,7 @@ const ownDeltaMutation = mutation => {
         const insert = readOwnData(node, 'insert')
         if (typeof insert !== 'string') throw new DeltaMutationPreparationError('Delta contains invalid text content')
         assertPositiveLength(insert.length)
-        chargePayload(insert.length)
+        chargePayload(encodedStringSize(insert))
         childLength += insert.length
         appendDense(children, {
           kind,
@@ -1647,7 +1654,7 @@ const ownDeltaMutation = mutation => {
       if (typeof key !== 'string' || key !== attrName) {
         throw new DeltaMutationPreparationError('Reserved delta attribute keys must be strings')
       }
-      chargePayload(key.length)
+      chargePayload(encodedStringSize(key))
       addPlanNode()
       if (kind === 'set') {
         const value = readOwnData(op, 'value')

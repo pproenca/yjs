@@ -10,6 +10,8 @@ const weakMapSet = WeakMap.prototype.set
  * @typedef {{
  *   createIdSet: () => IdSet,
  *   addId: (set:IdSet,client:number,clock:number,length:number) => void,
+ *   cloneIdSet: (set:IdSet) => IdSet,
+ *   differenceIdSet: (set:IdSet,excluded:IdSet) => IdSet,
  *   writeUpdate: (encoder:UpdateEncoderV1|UpdateEncoderV2,transaction:Transaction) => boolean
  * }} ReservedMutationHooks
  * @typedef {{
@@ -21,7 +23,9 @@ const weakMapSet = WeakMap.prototype.set
  *   executorInserts: IdSet,
  *   executorDeletes: IdSet,
  *   callbackInserts: IdSet,
- *   callbackDeletes: IdSet
+ *   callbackDeletes: IdSet,
+ *   phaseBaselineInserts: IdSet,
+ *   phaseBaselineDeletes: IdSet
  * }} ReservedMutationTransactionState
  */
 
@@ -51,6 +55,8 @@ export const registerReservedMutationRuntime = (runtime, hooks) => {
   weakSet(runtimeHooks, runtime, objectFreeze({
     createIdSet: hooks.createIdSet,
     addId: hooks.addId,
+    cloneIdSet: hooks.cloneIdSet,
+    differenceIdSet: hooks.differenceIdSet,
     writeUpdate: hooks.writeUpdate
   }))
 }
@@ -75,7 +81,9 @@ export const activateReservedMutationTransaction = (transaction, runtime) => {
     executorInserts: hooks.createIdSet(),
     executorDeletes: hooks.createIdSet(),
     callbackInserts: hooks.createIdSet(),
-    callbackDeletes: hooks.createIdSet()
+    callbackDeletes: hooks.createIdSet(),
+    phaseBaselineInserts: hooks.cloneIdSet(transaction.insertSet),
+    phaseBaselineDeletes: hooks.cloneIdSet(transaction.deleteSet)
   })
 }
 
@@ -119,6 +127,8 @@ export const beginReservedMutationExecutor = (transaction, runtime) => {
   if (state === undefined || state.runtime !== runtime || state.phase !== 'pre-executor') {
     throw new Error('Reserved mutation executor phase is unavailable')
   }
+  state.preInserts = state.hooks.differenceIdSet(transaction.insertSet, state.phaseBaselineInserts)
+  state.preDeletes = state.hooks.differenceIdSet(transaction.deleteSet, state.phaseBaselineDeletes)
   state.phase = 'executor'
 }
 
@@ -128,13 +138,23 @@ export const beginReservedMutationCallback = (transaction, runtime) => {
   if (state === undefined || state.runtime !== runtime || state.phase !== 'executor') {
     throw new Error('Reserved mutation callback phase is unavailable')
   }
+  state.phaseBaselineInserts = state.hooks.cloneIdSet(transaction.insertSet)
+  state.phaseBaselineDeletes = state.hooks.cloneIdSet(transaction.deleteSet)
   state.phase = 'callback'
 }
 
 /** @internal @param {Transaction} transaction */
 export const beginReservedMutationCleanup = transaction => {
   const state = weakGet(transactionStates, transaction)
-  if (state !== undefined) state.phase = 'cleanup'
+  if (state === undefined) return
+  if (state.phase === 'pre-executor') {
+    state.preInserts = state.hooks.differenceIdSet(transaction.insertSet, state.phaseBaselineInserts)
+    state.preDeletes = state.hooks.differenceIdSet(transaction.deleteSet, state.phaseBaselineDeletes)
+  } else if (state.phase === 'callback') {
+    state.callbackInserts = state.hooks.differenceIdSet(transaction.insertSet, state.phaseBaselineInserts)
+    state.callbackDeletes = state.hooks.differenceIdSet(transaction.deleteSet, state.phaseBaselineDeletes)
+  }
+  state.phase = 'cleanup'
 }
 
 /**

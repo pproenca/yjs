@@ -61,11 +61,28 @@ const policyAllowsOrigin = (origins, origin) => {
 const captureSuggestionOrigins = origins => {
   if (origins === null) return null
   if (!Array.isArray(origins)) throw new TypeError('suggestionOrigins must be an array or null')
-  return origins
+  const length = origins.length
+  const owned = new Array(length)
+  for (let index = 0; index < length; index++) {
+    const descriptor = objectGetOwnPropertyDescriptor(origins, String(index))
+    if (descriptor === undefined || !reflectApply(objectHasOwnProperty, descriptor, ['value'])) {
+      throw new TypeError('suggestionOrigins must contain own data entries')
+    }
+    objectDefineProperty(owned, index, {
+      configurable: false,
+      enumerable: true,
+      value: descriptor.value,
+      writable: false
+    })
+  }
+  return objectFreeze(owned)
 }
 
 const objectDefineProperty = Object.defineProperty
+const objectFreeze = Object.freeze
+const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
 const objectGetPrototypeOf = Object.getPrototypeOf
+const objectHasOwnProperty = Object.prototype.hasOwnProperty
 const reflectApply = Reflect.apply
 const idMapSlice = IdMap.prototype.slice
 const idMapHas = IdMap.prototype.has
@@ -522,7 +539,7 @@ export class DiffRenderer extends ObservableV2 {
         }
       }
     })
-    diffRendererPolicies.set(this, { suggestionMode: true, suggestionOrigins: null })
+    diffRendererPolicies.set(this, objectFreeze({ suggestionMode: true, suggestionOrigins: null }))
     this._destroyHandler = nextDoc.on('destroy', this.destroy.bind(this))
     prevDoc.on('destroy', this._destroyHandler)
   }
@@ -535,7 +552,7 @@ export class DiffRenderer extends ObservableV2 {
   set suggestionMode (value) {
     if (typeof value !== 'boolean') throw new TypeError('suggestionMode must be a boolean')
     const policy = getDiffRendererPolicy(this)
-    policy.suggestionMode = value
+    diffRendererPolicies.set(this, objectFreeze({ suggestionMode: value, suggestionOrigins: policy.suggestionOrigins }))
     invalidateRendererLifecycle(this)
   }
 
@@ -545,7 +562,7 @@ export class DiffRenderer extends ObservableV2 {
   /** @param {ReadonlyArray<any>|null} value */
   set suggestionOrigins (value) {
     const policy = getDiffRendererPolicy(this)
-    policy.suggestionOrigins = captureSuggestionOrigins(value)
+    diffRendererPolicies.set(this, objectFreeze({ suggestionMode: policy.suggestionMode, suggestionOrigins: captureSuggestionOrigins(value) }))
     invalidateRendererLifecycle(this)
   }
 

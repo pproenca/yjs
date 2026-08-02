@@ -2,6 +2,9 @@ import * as decoding from 'lib0/decoding'
 import * as encoding from 'lib0/encoding'
 import * as error from 'lib0/error'
 
+const mapForEach = Map.prototype.forEach
+const reflectApply = Reflect.apply
+
 export class ID {
   /**
    * @param {number} client client id
@@ -77,11 +80,13 @@ export const readID = decoder =>
  * @function
  */
 export const findRootTypeKey = type => {
-  // @ts-ignore _y must be defined, otherwise unexpected case
-  for (const [key, value] of type.doc.share.entries()) {
-    if (value === type) {
-      return key
-    }
-  }
+  const doc = type.doc
+  if (doc === null) throw error.unexpectedCase()
+  /** @type {string|null} */
+  let rootKey = null
+  reflectApply(mapForEach, doc.share, [(value, key) => {
+    if (rootKey === null && value === type) rootKey = key
+  }])
+  if (rootKey !== null) return rootKey
   throw error.unexpectedCase()
 }

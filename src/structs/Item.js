@@ -41,8 +41,21 @@ const setClear = Set.prototype.clear
 const setDelete = Set.prototype.delete
 const setHas = Set.prototype.has
 const jsonStringify = JSON.stringify
+const numberIsInteger = Number.isInteger
 const mathMax = Math.max
 const mathMin = Math.min
+const mathAbs = Math.abs
+const dataViewGetFloat32 = DataView.prototype.getFloat32
+const dataViewSetFloat32 = DataView.prototype.setFloat32
+const float32TestBed = new DataView(new ArrayBuffer(4))
+const encodingWrite = encoding.write
+const encodingWriteBigInt64 = encoding.writeBigInt64
+const encodingWriteFloat32 = encoding.writeFloat32
+const encodingWriteFloat64 = encoding.writeFloat64
+const encodingWriteVarInt = encoding.writeVarInt
+const encodingWriteVarString = encoding.writeVarString
+const encodingWriteVarUint = encoding.writeVarUint
+const encodingWriteVarUint8Array = encoding.writeVarUint8Array
 const NativeMap = Map
 const NativeSet = Set
 const deepFreeze = object.deepFreeze
@@ -2124,6 +2137,74 @@ const writeTypeCanonical = (type, encoder) => {
   if (ref === 3 || ref === 5) encoder.writeKey(readTypeFieldCanonical(type, 'name'))
 }
 
+/** @param {number} value */
+const isFloat32Canonical = value => {
+  reflectApply(dataViewSetFloat32, float32TestBed, [0, value])
+  return reflectApply(dataViewGetFloat32, float32TestBed, [0]) === value
+}
+
+/**
+ * Closed equivalent of lib0's Any encoder for the finite, owned payload domain admitted during
+ * reservation. Prototype identity replaces mutable `instanceof` dispatch.
+ *
+ * @param {encoding.Encoder} target
+ * @param {any} value
+ */
+const writeAnyCanonical = (target, value) => {
+  switch (typeof value) {
+    case 'string':
+      encodingWrite(target, 119)
+      encodingWriteVarString(target, value)
+      return
+    case 'number':
+      if (numberIsInteger(value) && mathAbs(value) <= binary.BITS31) {
+        encodingWrite(target, 125)
+        encodingWriteVarInt(target, value)
+      } else if (isFloat32Canonical(value)) {
+        encodingWrite(target, 124)
+        encodingWriteFloat32(target, value)
+      } else {
+        encodingWrite(target, 123)
+        encodingWriteFloat64(target, value)
+      }
+      return
+    case 'bigint':
+      encodingWrite(target, 122)
+      encodingWriteBigInt64(target, value)
+      return
+    case 'boolean':
+      encodingWrite(target, value ? 120 : 121)
+      return
+    case 'object': {
+      if (value === null) {
+        encodingWrite(target, 126)
+        return
+      }
+      const prototype = objectGetPrototypeOf(value)
+      if (prototype === Array.prototype) {
+        encodingWrite(target, 117)
+        encodingWriteVarUint(target, value.length)
+        for (let index = 0; index < value.length; index++) writeAnyCanonical(target, value[index])
+      } else if (prototype === Uint8Array.prototype) {
+        encodingWrite(target, 116)
+        encodingWriteVarUint8Array(target, value)
+      } else if (prototype === Object.prototype || prototype === null || prototype === Date.prototype) {
+        encodingWrite(target, 118)
+        const keys = objectKeys(value)
+        encodingWriteVarUint(target, keys.length)
+        for (let index = 0; index < keys.length; index++) {
+          const key = keys[index]
+          encodingWriteVarString(target, key)
+          writeAnyCanonical(target, readOwnDataCanonical(value, key))
+        }
+      } else throw new Error('Unsupported reserved mutation Any payload')
+      return
+    }
+    default:
+      encodingWrite(target, 127)
+  }
+}
+
 /** @param {AbstractContent} content @param {UpdateEncoderV1|UpdateEncoderV2} encoder @param {number} offset @param {number} offsetEnd */
 const writeContentCanonical = (content, encoder, offset, offsetEnd) => {
   const prototype = objectGetPrototypeOf(content)
@@ -2131,7 +2212,7 @@ const writeContentCanonical = (content, encoder, offset, offsetEnd) => {
     const values = readContentFieldCanonical(content, 'arr')
     const end = values.length - offsetEnd
     encoder.writeLen(end - offset)
-    for (let index = offset; index < end; index++) encoder.writeAny(values[index])
+    for (let index = offset; index < end; index++) writeAnyCanonical(encoder.restEncoder, values[index])
   } else if (prototype === ContentBinary.prototype) encoder.writeBuf(readContentFieldCanonical(content, 'content'))
   else if (prototype === ContentDeleted.prototype) encoder.writeLen(readContentFieldCanonical(content, 'len') - offset - offsetEnd)
   else if (prototype === ContentDoc.prototype) {

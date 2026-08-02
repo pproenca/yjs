@@ -20,6 +20,9 @@ export const generateNewClientId = random.uint53
 
 const objectFreeze = Object.freeze
 const reflectApply = Reflect.apply
+const weakMapDelete = WeakMap.prototype.delete
+const weakMapGet = WeakMap.prototype.get
+const weakMapSet = WeakMap.prototype.set
 const NativeMap = Map
 const NativeSet = Set
 const reservedEncoderV1Kernel = objectFreeze({
@@ -86,6 +89,32 @@ const createReservedEncoder = (encoder, kernel) => {
   })
 }
 
+/** @type {WeakMap<Transaction,Readonly<{v1:any,v2:any}>>} */
+const reservedEmissionContexts = new WeakMap()
+/** @param {WeakMap<any,any>} target @param {any} key */
+const weakGet = (target, key) => reflectApply(weakMapGet, target, [key])
+/** @param {WeakMap<any,any>} target @param {any} key @param {any} value */
+const weakSet = (target, key, value) => reflectApply(weakMapSet, target, [key, value])
+/** @param {WeakMap<any,any>} target @param {any} key */
+const weakDelete = (target, key) => reflectApply(weakMapDelete, target, [key])
+
+/** @param {Transaction} transaction */
+const initializeReservedEmissionContexts = transaction => {
+  const encoderV1 = new UpdateEncoderV1()
+  const encoderV2 = new UpdateEncoderV2()
+  weakSet(reservedEmissionContexts, transaction, objectFreeze({
+    v1: createReservedEncoder(encoderV1, reservedEncoderV1Kernel),
+    v2: createReservedEncoder(encoderV2, reservedEncoderV2Kernel)
+  }))
+}
+
+/** @param {Transaction} transaction */
+const readReservedEmissionContexts = transaction => {
+  const contexts = weakGet(reservedEmissionContexts, transaction)
+  if (contexts === undefined) throw new Error('Reserved mutation emission contexts are unavailable')
+  return contexts
+}
+
 /** @type {WeakMap<Doc,{revision:number}>} */
 const documentStructuralRevisions = new WeakMap()
 /**
@@ -95,17 +124,17 @@ const documentStructuralRevisions = new WeakMap()
  * @param {Doc} doc
  */
 export const readDocumentStructuralRevision = doc => {
-  let revision = documentStructuralRevisions.get(doc)
+  let revision = weakGet(documentStructuralRevisions, doc)
   if (revision === undefined) {
     revision = { revision: 0 }
-    documentStructuralRevisions.set(doc, revision)
+    weakSet(documentStructuralRevisions, doc, revision)
   }
   return revision.revision
 }
 
 /** @param {Doc} doc */
 const bumpDocumentStructuralRevision = doc => {
-  const revision = documentStructuralRevisions.get(doc)
+  const revision = weakGet(documentStructuralRevisions, doc)
   if (revision !== undefined) revision.revision++
 }
 
@@ -431,26 +460,26 @@ const cleanupTransactions = (transactionCleanups, i) => {
         // @todo Merge all the transactions into one and provide send the data as a single update message
         doc.emit('afterTransactionCleanup', [transaction, doc])
         if (doc._observers.has('update')) {
-          const encoder = new UpdateEncoderV1()
-          const reservedEncoder = createReservedEncoder(encoder, reservedEncoderV1Kernel)
+          const encoder = reservedRuntime === undefined ? new UpdateEncoderV1() : null
+          const reservedEncoder = reservedRuntime === undefined ? null : readReservedEmissionContexts(transaction).v1
           const reservedContent = writeReservedMutationUpdate(/** @type {any} */ (reservedEncoder), transaction)
           const hasContent = reservedContent === null
-            ? writeUpdateMessageFromTransaction(encoder, transaction)
+            ? writeUpdateMessageFromTransaction(/** @type {UpdateEncoderV1} */ (encoder), transaction)
             : reservedContent
           if (hasContent) {
-            const update = reservedContent === null ? encoder.toUint8Array() : reservedEncoder.toUint8Array()
+            const update = reservedContent === null ? /** @type {UpdateEncoderV1} */ (encoder).toUint8Array() : reservedEncoder.toUint8Array()
             doc.emit('update', [update, transaction.origin, doc, transaction])
           }
         }
         if (doc._observers.has('updateV2')) {
-          const encoder = new UpdateEncoderV2()
-          const reservedEncoder = createReservedEncoder(encoder, reservedEncoderV2Kernel)
+          const encoder = reservedRuntime === undefined ? new UpdateEncoderV2() : null
+          const reservedEncoder = reservedRuntime === undefined ? null : readReservedEmissionContexts(transaction).v2
           const reservedContent = writeReservedMutationUpdate(/** @type {any} */ (reservedEncoder), transaction)
           const hasContent = reservedContent === null
-            ? writeUpdateMessageFromTransaction(encoder, transaction)
+            ? writeUpdateMessageFromTransaction(/** @type {UpdateEncoderV2} */ (encoder), transaction)
             : reservedContent
           if (hasContent) {
-            const update = reservedContent === null ? encoder.toUint8Array() : reservedEncoder.toUint8Array()
+            const update = reservedContent === null ? /** @type {UpdateEncoderV2} */ (encoder).toUint8Array() : reservedEncoder.toUint8Array()
             doc.emit('updateV2', [update, transaction.origin, doc, transaction])
           }
         }
@@ -559,7 +588,10 @@ const transactInternal = (doc, f, origin, local, reservedRuntime) => {
   if (doc._transaction === null) {
     initialCall = true
     doc._transaction = new Transaction(doc, origin, local)
-    if (reservedRuntime !== null) activateReservedMutationTransaction(doc._transaction, reservedRuntime)
+    if (reservedRuntime !== null) {
+      initializeReservedEmissionContexts(doc._transaction)
+      activateReservedMutationTransaction(doc._transaction, reservedRuntime)
+    }
     transactionCleanups.push(doc._transaction)
     try {
       if (transactionCleanups.length === 1) {
@@ -587,7 +619,10 @@ const transactInternal = (doc, f, origin, local, reservedRuntime) => {
       try {
         cleanupTransactions(transactionCleanups, 0)
       } finally {
-        if (reservedRuntime !== null) deactivateReservedMutationTransaction(transactionCleanups[0])
+        if (reservedRuntime !== null) {
+          deactivateReservedMutationTransaction(transactionCleanups[0])
+          weakDelete(reservedEmissionContexts, transactionCleanups[0])
+        }
       }
     }
   }
