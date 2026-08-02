@@ -31,6 +31,7 @@ import {
 } from '../ytype.js'
 import { Skip } from '../structs/Skip.js'
 import { CausalHole, structCausalHoleRefNumber } from '../structs/CausalHole.js'
+import { TerminalCausalHole, structTerminalCausalHoleRefNumber } from '../structs/TerminalCausalHole.js'
 import { StructStore } from './StructStore.js'
 import { writeStructsFromIdSetWithExistingCausalHoles } from './encoding-helpers.js'
 
@@ -53,6 +54,17 @@ function * lazyStructReaderGenerator (decoder) {
       } else if ((binary.BITS5 & info) === structCausalHoleRefNumber) {
         const len = decoding.readVarUint(decoder.restDecoder)
         yield new CausalHole(
+          createID(client, clock),
+          len,
+          (info & binary.BIT8) === binary.BIT8 ? decoder.readLeftID() : null,
+          (info & binary.BIT7) === binary.BIT7 ? decoder.readRightID() : null,
+          decoder.readParentInfo() ? decoder.readString() : decoder.readLeftID(),
+          (info & binary.BIT6) === binary.BIT6 ? decoder.readString() : null
+        )
+        clock += len
+      } else if ((binary.BITS5 & info) === structTerminalCausalHoleRefNumber) {
+        const len = decoding.readVarUint(decoder.restDecoder)
+        yield new TerminalCausalHole(
           createID(client, clock),
           len,
           (info & binary.BIT8) === binary.BIT8 ? decoder.readLeftID() : null,
@@ -97,7 +109,7 @@ export class LazyStructReader {
   constructor (decoder, filterSkips) {
     this.gen = lazyStructReaderGenerator(decoder)
     /**
-     * @type {null | Item | Skip | GC | CausalHole}
+     * @type {null | Item | Skip | GC | CausalHole | TerminalCausalHole}
      */
     this.curr = null
     this.done = false
@@ -106,7 +118,7 @@ export class LazyStructReader {
   }
 
   /**
-   * @return {Item | GC | Skip | CausalHole |null}
+   * @return {Item | GC | Skip | CausalHole | TerminalCausalHole |null}
    */
   next () {
     // ignore "Skip" structs
@@ -259,7 +271,7 @@ export const createContentIdsFromUpdateV2 = (update, YDecoder = UpdateDecoderV2)
   const inserts = createIdSet()
   const gc = createIdSet()
   for (let curr = lazyDecoder.curr; curr !== null; curr = lazyDecoder.next()) {
-    if (curr.constructor === CausalHole) continue
+    if (curr.constructor === CausalHole || curr.constructor === TerminalCausalHole) continue
     const target = curr.constructor === GC ? gc : inserts
     target.add(curr.id.client, curr.id.clock, curr.length)
   }
@@ -282,9 +294,9 @@ export const createContentIdsFromUpdate = update => createContentIdsFromUpdateV2
  * This method is intended to slice any kind of struct and retrieve the right part.
  * It does not handle side-effects, so it should only be used by the lazy-encoder.
  *
- * @param {Item | GC | Skip | CausalHole} left
+ * @param {Item | GC | Skip | CausalHole | TerminalCausalHole} left
  * @param {number} diff
- * @return {Item | GC | Skip | CausalHole}
+ * @return {Item | GC | Skip | CausalHole | TerminalCausalHole}
  */
 export const sliceStruct = (left, diff) => {
   if (left.constructor === GC) {
@@ -295,6 +307,8 @@ export const sliceStruct = (left, diff) => {
     return new Skip(createID(client, clock + diff), left.length - diff)
   } else if (left.constructor === CausalHole) {
     return /** @type {CausalHole} */ (left).slice(left.id.clock + diff, left.length - diff)
+  } else if (left.constructor === TerminalCausalHole) {
+    return /** @type {TerminalCausalHole} */ (left).slice(left.id.clock + diff, left.length - diff)
   } else {
     const leftItem = /** @type {Item} */ (left)
     const { client, clock } = leftItem.id
@@ -324,7 +338,7 @@ const flushLazyStructWriter = lazyWriter => {
 
 /**
  * @param {LazyStructWriter} lazyWriter
- * @param {Item | GC | Skip | CausalHole} struct
+ * @param {Item | GC | Skip | CausalHole | TerminalCausalHole} struct
  * @param {number} offset
  * @param {number} offsetEnd
  */
@@ -378,7 +392,7 @@ export const finishLazyStructWriting = (lazyWriter) => {
 
 /**
  * @param {Uint8Array} update
- * @param {function(Item|GC|Skip|CausalHole):Item|GC|Skip|CausalHole} blockTransformer
+ * @param {function(Item|GC|Skip|CausalHole|TerminalCausalHole):Item|GC|Skip|CausalHole|TerminalCausalHole} blockTransformer
  * @param {typeof UpdateDecoderV2 | typeof UpdateDecoderV1} YDecoder
  * @param {typeof UpdateEncoderV2 | typeof UpdateEncoderV1 } YEncoder
  */
@@ -414,14 +428,15 @@ const createObfuscator = ({ formatting = true, subdocs = true, name = true } = {
   const formattingValueCache = map.create()
   formattingValueCache.set(null, null) // end of a formatting range should always be the end of a formatting range
   /**
-   * @param {Item|GC|Skip|CausalHole} block
-   * @return {Item|GC|Skip|CausalHole}
+   * @param {Item|GC|Skip|CausalHole|TerminalCausalHole} block
+   * @return {Item|GC|Skip|CausalHole|TerminalCausalHole}
    */
   return block => {
     switch (block.constructor) {
       case GC:
       case Skip:
       case CausalHole:
+      case TerminalCausalHole:
         return block
       case Item: {
         const item = /** @type {Item} */ (block)

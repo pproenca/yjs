@@ -1,15 +1,28 @@
 import { Skip } from '../structs/Skip.js'
 import { CausalHole, sameCausalHoleMetadata } from '../structs/CausalHole.js'
+import { TerminalCausalHole, createTerminalCausalHoleFromHole, sameTerminalCausalHoleMetadata } from '../structs/TerminalCausalHole.js'
 import { GC } from '../structs/GC.js'
 import { createID } from './ID.js'
 import { createDeleteSetFromStructStore, createIdSet } from './ids.js'
 import { findIndexSS } from './transaction-helpers.js'
-import { recordTerminalGc } from './sparse-transport.js'
+import { recordTerminalCausalHoles } from './sparse-transport.js'
 
 /** @param {ID|string} parent @param {string|null} parentSub */
 const causalHoleParentGroupKey = (parent, parentSub) => typeof parent === 'string'
   ? `root:${JSON.stringify(parent)}:${JSON.stringify(parentSub)}`
   : `item:${parent.client}:${parent.clock}:${JSON.stringify(parentSub)}`
+
+/**
+ * @param {CausalHole|TerminalCausalHole} left
+ * @param {CausalHole|TerminalCausalHole} right
+ * @param {number} clock
+ * @param {number} end
+ */
+const sameSparseMetadataAt = (left, right, clock, end) => {
+  const leftSlice = left.slice(clock, end - clock)
+  const rightSlice = right.slice(clock, end - clock)
+  return sameCausalHoleMetadata(/** @type {CausalHole} */ (/** @type {unknown} */ (leftSlice)), /** @type {CausalHole} */ (/** @type {unknown} */ (rightSlice)))
+}
 
 export class StructStore {
   constructor () {
@@ -29,6 +42,7 @@ export class StructStore {
     this.pendingDs = null
     this.skips = createIdSet()
     this.causalHoles = createIdSet()
+    this.terminalCausalHoles = createIdSet()
     /** @type {Map<string,Set<CausalHole>>} */
     this.causalHolesByParent = new Map()
     /** @type {Map<string,Set<CausalHole>>} */
@@ -40,11 +54,11 @@ export class StructStore {
   }
 
   /**
-   * @param {GC|Item|Skip|CausalHole} struct
+   * @param {GC|Item|Skip|CausalHole|TerminalCausalHole} struct
    * @function
    */
   add (struct) {
-    let structs = /** @type {Array<GC|Item|Skip|CausalHole>|undefined} */ (/** @type {unknown} */ (this.clients.get(struct.id.client)))
+    let structs = /** @type {Array<GC|Item|Skip|CausalHole|TerminalCausalHole>|undefined} */ (/** @type {unknown} */ (this.clients.get(struct.id.client)))
     if (structs === undefined) {
       structs = []
       this.clients.set(struct.id.client, /** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ (structs)))
@@ -57,12 +71,13 @@ export class StructStore {
     }
     structs.push(struct)
     if (struct.constructor === CausalHole) this._indexCausalHole(/** @type {CausalHole} */ (struct))
+    if (struct.constructor === TerminalCausalHole) this.terminalCausalHoles.add(struct.id.client, struct.id.clock, struct.length)
   }
 
   /**
    * Install a decoded struct without transaction semantics.
    *
-   * @param {GC|Item|Skip|CausalHole} struct
+   * @param {GC|Item|Skip|CausalHole|TerminalCausalHole} struct
    */
   addUpdateStruct (struct) {
     this.add(struct)
@@ -70,6 +85,11 @@ export class StructStore {
     if (struct.constructor === CausalHole) {
       this.getCausalHoleOverlaps(struct.id.client, struct.id.clock, struct.length).forEach(hole => {
         this.causalHoles.add(hole.id.client, hole.id.clock, hole.length)
+      })
+    }
+    if (struct.constructor === TerminalCausalHole) {
+      this.getTerminalCausalHoleOverlaps(struct.id.client, struct.id.clock, struct.length).forEach(terminal => {
+        this.terminalCausalHoles.add(terminal.id.client, terminal.id.clock, terminal.length)
       })
     }
   }
@@ -95,18 +115,31 @@ export class StructStore {
     return installed
   }
 
-  /** @param {Transaction} transaction @param {GC} gc */
-  installTerminalGc (transaction, gc) {
-    this.add(gc)
-    if (this.getStruct(gc.id) === gc) {
-      recordTerminalGc(transaction, gc.id.client, gc.id.clock, gc.length)
-      transaction._mergeStructs.push(gc)
+  /** @param {Transaction} transaction @param {TerminalCausalHole} terminal */
+  installTerminalCausalHole (transaction, terminal) {
+    const missing = this.terminalCausalHoles.slice(terminal.id.client, terminal.id.clock, terminal.length).filter(range => !range.exists)
+    this.add(terminal)
+    const overlaps = this.getTerminalCausalHoleOverlaps(terminal.id.client, terminal.id.clock, terminal.length)
+    overlaps.forEach(current => this.terminalCausalHoles.add(current.id.client, current.id.clock, current.length))
+    /** @type {Array<TerminalCausalHole>} */
+    const installed = []
+    for (const range of missing) {
+      const rangeEnd = range.clock + range.len
+      for (const current of overlaps) {
+        const clock = Math.max(range.clock, current.id.clock)
+        const end = Math.min(rangeEnd, current.id.clock + current.length)
+        if (clock < end) installed.push(current.slice(clock, end - clock))
+      }
     }
+    if (installed.length > 0) {
+      recordTerminalCausalHoles(transaction, installed)
+    }
+    return installed
   }
 
   /**
-   * @param {Array<GC|Item|Skip|CausalHole>} structs
-   * @param {GC|Item|Skip|CausalHole} struct
+   * @param {Array<GC|Item|Skip|CausalHole|TerminalCausalHole>} structs
+   * @param {GC|Item|Skip|CausalHole|TerminalCausalHole} struct
    */
   _replaceSparseRange (structs, struct) {
     const start = struct.id.clock
@@ -120,45 +153,68 @@ export class StructStore {
     }
     if (struct.constructor === CausalHole) {
       if (replaced.length === 1 && replaced[0].constructor === CausalHole && sameCausalHoleMetadata(/** @type {CausalHole} */ (replaced[0]), /** @type {CausalHole} */ (struct))) return
+      if (replaced.some(current => current.constructor === TerminalCausalHole && !sameSparseMetadataAt(current, struct, Math.max(start, current.id.clock), Math.min(end, current.id.clock + current.length)))) {
+        throw new Error('Conflicting terminal causal hole metadata')
+      }
       if (replaced.some(current => current.constructor !== Skip && current.constructor !== CausalHole)) return
-      if (replaced.some(current => current.constructor === CausalHole && !sameCausalHoleMetadata(
-        /** @type {CausalHole} */ (current).slice(Math.max(start, current.id.clock), Math.min(end, current.id.clock + current.length) - Math.max(start, current.id.clock)),
-        /** @type {CausalHole} */ (struct).slice(Math.max(start, current.id.clock), Math.min(end, current.id.clock + current.length) - Math.max(start, current.id.clock))
-      ))) {
+      if (replaced.some(current => current.constructor === CausalHole && !sameSparseMetadataAt(current, struct, Math.max(start, current.id.clock), Math.min(end, current.id.clock + current.length)))) {
         throw new Error('Conflicting causal hole metadata')
       }
-    } else if (replaced.some(current => current.constructor !== Skip && current.constructor !== CausalHole)) {
-      throw new Error('Sparse replacement overlaps materialized content')
+    } else if (struct.constructor === TerminalCausalHole) {
+      if (replaced.length === 1 && replaced[0].constructor === TerminalCausalHole && sameTerminalCausalHoleMetadata(/** @type {TerminalCausalHole} */ (replaced[0]), /** @type {TerminalCausalHole} */ (struct))) return
+      if (replaced.some(current => (current.constructor === CausalHole || current.constructor === TerminalCausalHole) && !sameSparseMetadataAt(current, struct, Math.max(start, current.id.clock), Math.min(end, current.id.clock + current.length)))) {
+        throw new Error('Conflicting terminal causal hole metadata')
+      }
+    } else {
+      if (replaced.some(current => current.constructor === TerminalCausalHole)) {
+        throw new Error('Terminal causal hole coverage is authoritative')
+      }
+      if (replaced.some(current => current.constructor !== Skip && current.constructor !== CausalHole)) {
+        throw new Error('Sparse replacement overlaps materialized content')
+      }
     }
 
     const first = replaced[0]
     const last = replaced[replaced.length - 1]
-    /** @type {Array<GC|Item|Skip|CausalHole>} */
+    if (
+      (first.isItem && first.id.clock < start) ||
+      (last.isItem && last.id.clock + last.length > end)
+    ) {
+      throw new Error('Terminal causal hole replacement requires materialized boundary split')
+    }
+    /** @type {Array<GC|Item|Skip|CausalHole|TerminalCausalHole>} */
     const replacement = []
-    if (first.id.clock < start) replacement.push(this._sliceSparse(/** @type {Skip|CausalHole} */ (first), first.id.clock, start - first.id.clock))
+    if (first.id.clock < start) replacement.push(this._sliceSparse(/** @type {GC|Skip|CausalHole|TerminalCausalHole} */ (first), first.id.clock, start - first.id.clock))
     replacement.push(struct)
     const lastEnd = last.id.clock + last.length
-    if (lastEnd > end) replacement.push(this._sliceSparse(/** @type {Skip|CausalHole} */ (last), end, lastEnd - end))
+    if (lastEnd > end) replacement.push(this._sliceSparse(/** @type {GC|Skip|CausalHole|TerminalCausalHole} */ (last), end, lastEnd - end))
     replaced.forEach(current => {
       if (current.constructor === CausalHole) this._unindexCausalHole(/** @type {CausalHole} */ (current))
+      if (current.constructor === TerminalCausalHole) this.terminalCausalHoles.delete(current.id.client, current.id.clock, current.length)
     })
     structs.splice(startIndex, endIndex - startIndex, ...replacement)
     replacement.forEach(current => {
       if (current.constructor === CausalHole) this._indexCausalHole(/** @type {CausalHole} */ (current))
+      if (current.constructor === TerminalCausalHole) this.terminalCausalHoles.add(current.id.client, current.id.clock, current.length)
     })
     this.skips.delete(struct.id.client, start, struct.length)
     this.causalHoles.delete(struct.id.client, start, struct.length)
+    this.terminalCausalHoles.delete(struct.id.client, start, struct.length)
+    replacement.forEach(current => {
+      if (current.constructor === TerminalCausalHole) this.terminalCausalHoles.add(current.id.client, current.id.clock, current.length)
+    })
   }
 
   /**
-   * @param {Skip|CausalHole} struct
+   * @param {GC|Skip|CausalHole|TerminalCausalHole} struct
    * @param {number} clock
    * @param {number} length
    */
   _sliceSparse (struct, clock, length) {
-    return struct.constructor === CausalHole
-      ? /** @type {CausalHole} */ (struct).slice(clock, length)
-      : new Skip(createID(struct.id.client, clock), length)
+    if (struct.constructor === CausalHole) return /** @type {CausalHole} */ (struct).slice(clock, length)
+    if (struct.constructor === TerminalCausalHole) return /** @type {TerminalCausalHole} */ (struct).slice(clock, length)
+    if (struct.constructor === GC) return new GC(createID(struct.id.client, clock), length)
+    return new Skip(createID(struct.id.client, clock), length)
   }
 
   /** @param {CausalHole} hole */
@@ -219,6 +275,30 @@ export class StructStore {
     return overlaps
   }
 
+  /**
+   * @param {number} client
+   * @param {number} clock
+   * @param {number} length
+   * @return {Array<TerminalCausalHole>}
+   */
+  getTerminalCausalHoleOverlaps (client, clock, length) {
+    if (length <= 0) return []
+    const rawStructs = this.clients.get(client)
+    if (rawStructs === undefined || rawStructs.length === 0) return []
+    const structs = /** @type {Array<GC|Item|Skip|CausalHole|TerminalCausalHole>} */ (/** @type {unknown} */ (rawStructs))
+    const end = clock + length
+    const firstClock = structs[0].id.clock
+    const last = structs[structs.length - 1]
+    if (end <= firstClock || clock >= last.id.clock + last.length) return []
+    let index = findIndexSS(/** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ (structs)), Math.max(clock, firstClock))
+    /** @type {Array<TerminalCausalHole>} */
+    const overlaps = []
+    for (let struct = structs[index]; struct !== undefined && struct.id.clock < end; struct = structs[++index]) {
+      if (struct.constructor === TerminalCausalHole && struct.id.clock + struct.length > clock) overlaps.push(/** @type {TerminalCausalHole} */ (struct))
+    }
+    return overlaps
+  }
+
   /** @param {ID|string} parent @param {string|null} parentSub */
   getCausalHolesForParentGroup (parent, parentSub) {
     return this.causalHolesByParentGroup.get(causalHoleParentGroupKey(parent, parentSub)) ?? new Set()
@@ -236,14 +316,23 @@ export class StructStore {
     return struct.constructor === CausalHole ? /** @type {CausalHole} */ (struct) : null
   }
 
+  /** @param {ID} id @return {TerminalCausalHole|null} */
+  getTerminalCausalHole (id) {
+    if (!this.terminalCausalHoles.hasId(id)) return null
+    const structs = this.clients.get(id.client)
+    if (structs === undefined) return null
+    const struct = /** @type {GC|Item|Skip|CausalHole|TerminalCausalHole} */ (/** @type {unknown} */ (structs[findIndexSS(structs, id.clock)]))
+    return struct.constructor === TerminalCausalHole ? /** @type {TerminalCausalHole} */ (struct) : null
+  }
+
   /**
    * @param {ID} id
-   * @return {GC|Item|Skip|CausalHole|null}
+   * @return {GC|Item|Skip|CausalHole|TerminalCausalHole|null}
    */
   getStruct (id) {
     const structs = this.clients.get(id.client)
     if (structs === undefined || structs.length === 0 || id.clock < structs[0].id.clock || id.clock >= this.getClock(id.client)) return null
-    return /** @type {GC|Item|Skip|CausalHole} */ (structs[findIndexSS(structs, id.clock)])
+    return /** @type {GC|Item|Skip|CausalHole|TerminalCausalHole} */ (/** @type {unknown} */ (structs[findIndexSS(structs, id.clock)]))
   }
 
   /**
@@ -257,15 +346,15 @@ export class StructStore {
     for (const hole of holes) {
       const rawStructs = this.clients.get(hole.id.client)
       if (rawStructs === undefined) continue
-      const structs = /** @type {Array<Item|GC|Skip|CausalHole>} */ (/** @type {unknown} */ (rawStructs))
+      const structs = /** @type {Array<Item|GC|Skip|CausalHole|TerminalCausalHole>} */ (/** @type {unknown} */ (rawStructs))
       const index = findIndexSS(/** @type {Array<Item|GC|Skip>} */ (/** @type {unknown} */ (structs)), hole.id.clock)
       if (structs[index] !== hole) continue
-      const gc = new GC(createID(hole.id.client, hole.id.clock), hole.length)
+      const terminal = createTerminalCausalHoleFromHole(hole)
       this._unindexCausalHole(hole)
-      structs[index] = gc
+      structs[index] = terminal
       this.causalHoles.delete(hole.id.client, hole.id.clock, hole.length)
-      recordTerminalGc(transaction, gc.id.client, gc.id.clock, gc.length)
-      transaction._mergeStructs.push(gc)
+      this.terminalCausalHoles.add(terminal.id.client, terminal.id.clock, terminal.length)
+      recordTerminalCausalHoles(transaction, [terminal])
     }
   }
 

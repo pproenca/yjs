@@ -14,7 +14,8 @@ import { Skip } from '../structs/Skip.js'
 import { createIdSet, IdRange } from './ids.js'
 import { sliceStruct } from './updates.js'
 import { GC } from '../structs/GC.js'
-import { CausalHole, normalizeCausalHoleParent, sameCausalHoleItemMetadata, sameCausalHoleMetadata } from '../structs/CausalHole.js'
+import { CausalHole, normalizeCausalHoleParent, sameCausalHoleItemMetadata, sameCausalHoleMetadata, sameCausalHoleParent } from '../structs/CausalHole.js'
+import { TerminalCausalHole } from '../structs/TerminalCausalHole.js'
 import { writeStructs } from './encoding-helpers.js'
 
 /**
@@ -30,7 +31,7 @@ export const readBlockSet = (decoder) => {
   for (let i = 0; i < numOfStateUpdates; i++) {
     const numberOfBlocks = decoding.readVarUint(decoder.restDecoder)
     /**
-     * @type {Array<GC|Item|Skip|CausalHole>}
+     * @type {Array<GC|Item|Skip|CausalHole|TerminalCausalHole>}
      */
     const refs = new Array(numberOfBlocks)
     const client = decoder.readClient()
@@ -55,6 +56,19 @@ export const readBlockSet = (decoder) => {
         case 11: {
           const len = decoding.readVarUint(decoder.restDecoder)
           refs[i] = new CausalHole(
+            createID(client, clock),
+            len,
+            (info & binary.BIT8) === binary.BIT8 ? decoder.readLeftID() : null,
+            (info & binary.BIT7) === binary.BIT7 ? decoder.readRightID() : null,
+            decoder.readParentInfo() ? decoder.readString() : decoder.readLeftID(),
+            (info & binary.BIT6) === binary.BIT6 ? decoder.readString() : null
+          )
+          clock += len
+          break
+        }
+        case 12: {
+          const len = decoding.readVarUint(decoder.restDecoder)
+          refs[i] = new TerminalCausalHole(
             createID(client, clock),
             len,
             (info & binary.BIT8) === binary.BIT8 ? decoder.readLeftID() : null,
@@ -111,12 +125,12 @@ export const writeBlockSet = (encoder, blocks) => {
 
 class BlockRange {
   /**
-   * @param {Array<Item|GC|Skip|CausalHole>} refs
+   * @param {Array<Item|GC|Skip|CausalHole|TerminalCausalHole>} refs
    */
   constructor (refs) {
     this.i = 0
     /**
-     * @type {Array<Item | GC | Skip | CausalHole>}
+     * @type {Array<Item | GC | Skip | CausalHole | TerminalCausalHole>}
      */
     this.refs = refs
   }
@@ -136,7 +150,7 @@ export class BlockSet {
       let lastClock = 0
       let lastLen = 0
       ranges.refs.forEach(block => {
-        if (block instanceof Skip || block instanceof CausalHole) return
+        if (block instanceof Skip || block instanceof CausalHole || block instanceof TerminalCausalHole) return
         if (lastClock + lastLen === block.id.clock) {
           // default case: extend prev entry
           lastLen += block.length
@@ -202,7 +216,10 @@ export class BlockSet {
       if (ranges == null) {
         this.clients.set(clientid, newranges)
       } else {
-        if (ranges.refs.some(block => block.constructor === CausalHole) || newranges.refs.some(block => block.constructor === CausalHole)) {
+        if (
+          ranges.refs.some(block => block.constructor === CausalHole || block.constructor === TerminalCausalHole) ||
+          newranges.refs.some(block => block.constructor === CausalHole || block.constructor === TerminalCausalHole)
+        ) {
           ranges.refs = mergeSparseRefs(ranges.refs, newranges.refs, resolveMergeInput)
           return
         }
@@ -314,14 +331,15 @@ export class BlockSet {
 }
 
 /**
- * @param {Item|GC|Skip|CausalHole} block
+ * @param {Item|GC|Skip|CausalHole|TerminalCausalHole} block
  * @param {number} clock
  * @param {number} length
- * @return {Item|GC|Skip|CausalHole}
+ * @return {Item|GC|Skip|CausalHole|TerminalCausalHole}
  */
 const sliceBlock = (block, clock, length) => {
   if (block.constructor === Skip) return new Skip(createID(block.id.client, clock), length)
   if (block.constructor === CausalHole) return /** @type {CausalHole} */ (block).slice(clock, length)
+  if (block.constructor === TerminalCausalHole) return /** @type {TerminalCausalHole} */ (block).slice(clock, length)
   if (block.constructor === GC) return new GC(createID(block.id.client, clock), length)
   const item = /** @type {Item} */ (block)
   if (clock === item.id.clock && length === item.length) return item
@@ -341,19 +359,33 @@ const sliceBlock = (block, clock, length) => {
   )
 }
 
-/** @param {Item|GC|Skip|CausalHole|null} block */
-const blockRank = block => block === null || block.constructor === Skip ? 0 : block.constructor === CausalHole ? 1 : 2
+/** @param {Item|GC|Skip|CausalHole|TerminalCausalHole|null} block */
+const blockRank = block => {
+  if (block === null || block.constructor === Skip) return 0
+  if (block.constructor === CausalHole) return 1
+  if (block.constructor === Item) return 2
+  if (block.constructor === GC) return 3
+  return 4
+}
 
 /**
- * @param {Item|GC|Skip|CausalHole|null} left
- * @param {Item|GC|Skip|CausalHole|null} right
+ * @param {Item|GC|Skip|CausalHole|TerminalCausalHole|null} left
+ * @param {Item|GC|Skip|CausalHole|TerminalCausalHole|null} right
  */
-const dominantBlock = (left, right) => blockRank(right) > blockRank(left) ? right : left ?? right
+const dominantBlock = (left, right) => {
+  if (left?.constructor === TerminalCausalHole || right?.constructor === TerminalCausalHole) {
+    return left?.constructor === TerminalCausalHole ? left : right
+  }
+  if (left?.constructor === GC || right?.constructor === GC) return left?.constructor === GC ? left : right
+  if (left?.constructor === Item || right?.constructor === Item) return left?.constructor === Item ? left : right
+  if (left?.constructor === CausalHole || right?.constructor === CausalHole) return left?.constructor === CausalHole ? left : right
+  return left ?? right
+}
 
 /**
- * @param {Array<Item|GC|Skip|CausalHole>|undefined} refs
+ * @param {Array<Item|GC|Skip|CausalHole|TerminalCausalHole>|undefined} refs
  * @param {number} clock
- * @return {Item|GC|Skip|CausalHole|null}
+ * @return {Item|GC|Skip|CausalHole|TerminalCausalHole|null}
  */
 const findBlockAt = (refs, clock) => {
   if (refs === undefined) return null
@@ -373,39 +405,66 @@ const findBlockAt = (refs, clock) => {
  * Infer copied parent metadata only from structs present in the merge inputs. Missing external
  * anchors deliberately fail closed.
  *
- * @param {Item} item
- * @param {(id:ID) => Item|GC|Skip|CausalHole|null} resolveMergeInput
- * @return {{parent:ID|string,parentSub:string|null}|null}
+ * @param {(id:ID) => Item|GC|Skip|CausalHole|TerminalCausalHole|null} resolveMergeInput
+ * @return {(item:Item) => {parent:ID|string,parentSub:string|null}|null}
  */
-const inferMergeItemParent = (item, resolveMergeInput) => {
-  /** @type {Item} */
-  let current = item
-  const seen = new Set()
-  while (current.parent === null) {
-    if (seen.has(current)) return null
-    seen.add(current)
-    const anchor = current.origin ?? current.rightOrigin
-    if (anchor === null) return null
-    const parentSource = resolveMergeInput(anchor)
-    if (parentSource?.constructor === CausalHole) {
-      const hole = /** @type {CausalHole} */ (parentSource)
-      return { parent: hole.parent, parentSub: hole.parentSub }
+const createMergeItemParentResolver = resolveMergeInput => {
+  /** @typedef {{parent:ID|string,parentSub:string|null}} ParentMetadata */
+  /** @type {Map<Item,ParentMetadata|null|false>} */
+  const memo = new Map()
+  const visiting = new Set()
+  /** @param {ParentMetadata} left @param {ParentMetadata} right */
+  const sameParent = (left, right) => sameCausalHoleParent(left.parent, right.parent) && left.parentSub === right.parentSub
+  /** @param {Item} item @return {ParentMetadata|null} */
+  const infer = item => {
+    const cached = memo.get(item)
+    if (cached === false) throw new Error('Conflicting merge item parent proofs')
+    if (cached !== undefined) return cached
+    if (item.parent !== null) {
+      const explicit = { parent: normalizeCausalHoleParent(item.parent), parentSub: item.parentSub }
+      memo.set(item, explicit)
+      return explicit
     }
-    if (parentSource?.constructor !== Item) return null
-    current = /** @type {Item} */ (parentSource)
+    if (visiting.has(item)) {
+      memo.set(item, false)
+      throw new Error('Cyclic merge item parent proof')
+    }
+    visiting.add(item)
+    /** @type {ParentMetadata|null} */
+    let proof = null
+    try {
+      for (const anchor of [item.origin, item.rightOrigin]) {
+        if (anchor === null) continue
+        const source = resolveMergeInput(anchor)
+        if (source?.constructor !== Item) continue
+        const candidate = infer(/** @type {Item} */ (source))
+        if (candidate === null) continue
+        if (proof !== null && !sameParent(proof, candidate)) {
+          memo.set(item, false)
+          throw new Error('Conflicting merge item parent proofs')
+        }
+        proof = candidate
+      }
+      memo.set(item, proof)
+      return proof
+    } catch (error) {
+      memo.set(item, false)
+      throw error
+    } finally {
+      visiting.delete(item)
+    }
   }
-  return { parent: normalizeCausalHoleParent(current.parent), parentSub: current.parentSub }
+  return infer
 }
 
 /**
- * Validate each original Item/CausalHole overlap once, before dominance boundaries can fragment
- * either input.
+ * Validate every original sparse overlap before dominance can erase its evidence.
  *
- * @param {Array<Item|GC|Skip|CausalHole>} left
- * @param {Array<Item|GC|Skip|CausalHole>} right
+ * @param {Array<Item|GC|Skip|CausalHole|TerminalCausalHole>} left
+ * @param {Array<Item|GC|Skip|CausalHole|TerminalCausalHole>} right
  * @param {(item:Item) => {parent:ID|string,parentSub:string|null}|null} inferParent
  */
-const validateSparseItemOverlaps = (left, right, inferParent) => {
+const validateSparseOverlaps = (left, right, inferParent) => {
   let li = 0
   let ri = 0
   while (li < left.length && ri < right.length) {
@@ -416,18 +475,45 @@ const validateSparseItemOverlaps = (left, right, inferParent) => {
     const rend = r.id.clock + r.length
     const end = math.min(lend, rend)
     if (start < end) {
-      const hole = l.constructor === CausalHole && r.constructor === Item
-        ? /** @type {CausalHole} */ (l)
-        : r.constructor === CausalHole && l.constructor === Item
-          ? /** @type {CausalHole} */ (r)
+      const lSparse = l.constructor === CausalHole || l.constructor === TerminalCausalHole
+      const rSparse = r.constructor === CausalHole || r.constructor === TerminalCausalHole
+      const lTerminal = l.constructor === TerminalCausalHole
+      const rTerminal = r.constructor === TerminalCausalHole
+      if ((lTerminal && typeof l.parent === 'string') || (rTerminal && typeof r.parent === 'string')) {
+        throw new Error('Terminal causal hole cannot target a live root')
+      }
+      const hole = lSparse && r.constructor === Item
+        ? /** @type {CausalHole|TerminalCausalHole} */ (l)
+        : rSparse && l.constructor === Item
+          ? /** @type {CausalHole|TerminalCausalHole} */ (r)
           : null
-      const item = l.constructor === Item && r.constructor === CausalHole
+      const item = l.constructor === Item && rSparse
         ? /** @type {Item} */ (l)
-        : r.constructor === Item && l.constructor === CausalHole
+        : r.constructor === Item && lSparse
           ? /** @type {Item} */ (r)
           : null
-      if (hole !== null && item !== null && !sameCausalHoleItemMetadata(hole, item, start, end - start, inferParent(item))) {
-        throw new Error('Conflicting causal hole replacement metadata')
+      if (hole !== null && item !== null && !sameCausalHoleItemMetadata(
+        /** @type {CausalHole} */ (/** @type {unknown} */ (hole)),
+        item,
+        start,
+        end - start,
+        inferParent(item)
+      )) {
+        throw new Error(hole.constructor === TerminalCausalHole ? 'Conflicting terminal causal hole replacement metadata' : 'Conflicting causal hole replacement metadata')
+      }
+      if (lSparse && rSparse) {
+        const ls = /** @type {CausalHole|TerminalCausalHole} */ (l).slice(start, end - start)
+        const rs = /** @type {CausalHole|TerminalCausalHole} */ (r).slice(start, end - start)
+        if (!sameCausalHoleMetadata(
+          /** @type {CausalHole} */ (/** @type {unknown} */ (ls)),
+          /** @type {CausalHole} */ (/** @type {unknown} */ (rs))
+        )) throw new Error('Conflicting sparse causal metadata')
+      }
+      if (
+        (l.constructor === CausalHole && r.constructor === GC) ||
+        (r.constructor === CausalHole && l.constructor === GC)
+      ) {
+        throw new Error('GC cannot replace live causal hole coverage')
       }
     }
     if (lend <= rend) li++
@@ -439,28 +525,23 @@ const validateSparseItemOverlaps = (left, right, inferParent) => {
  * Merge ranges containing causal holes. Materialized structs win; conflicting overlapping hole
  * metadata fails closed. The ordinary no-hole path above remains byte-for-byte unchanged.
  *
- * @param {Array<Item|GC|Skip|CausalHole>} left
- * @param {Array<Item|GC|Skip|CausalHole>} right
- * @param {(id:ID) => Item|GC|Skip|CausalHole|null} resolveMergeInput
+ * @param {Array<Item|GC|Skip|CausalHole|TerminalCausalHole>} left
+ * @param {Array<Item|GC|Skip|CausalHole|TerminalCausalHole>} right
+ * @param {(id:ID) => Item|GC|Skip|CausalHole|TerminalCausalHole|null} resolveMergeInput
  */
 const mergeSparseRefs = (left, right, resolveMergeInput) => {
-  const inferredParents = new Map()
-  /** @param {Item} item */
-  const inferParent = item => {
-    if (!inferredParents.has(item)) inferredParents.set(item, inferMergeItemParent(item, resolveMergeInput))
-    return /** @type {{parent:ID|string,parentSub:string|null}|null} */ (inferredParents.get(item))
-  }
-  validateSparseItemOverlaps(left, right, inferParent)
+  const inferParent = createMergeItemParentResolver(resolveMergeInput)
+  validateSparseOverlaps(left, right, inferParent)
   const boundaries = new Set()
   for (const block of left.concat(right)) {
     boundaries.add(block.id.clock)
     boundaries.add(block.id.clock + block.length)
   }
   const clocks = Array.from(boundaries).sort((a, b) => a - b)
-  /** @type {Array<{block:Item|GC|Skip|CausalHole,clock:number,length:number}>} */
+  /** @type {Array<{block:Item|GC|Skip|CausalHole|TerminalCausalHole,clock:number,length:number}>} */
   const selections = []
   /**
-   * @param {Item|GC|Skip|CausalHole} block
+   * @param {Item|GC|Skip|CausalHole|TerminalCausalHole} block
    * @param {number} clock
    * @param {number} length
    */
@@ -489,16 +570,11 @@ const mergeSparseRefs = (left, right, resolveMergeInput) => {
       select(skip, clock, length)
       continue
     }
-    if (lrank === 1 && rrank === 1) {
-      const ls = /** @type {CausalHole} */ (l).slice(clock, length)
-      const rs = /** @type {CausalHole} */ (r).slice(clock, length)
-      if (!sameCausalHoleMetadata(ls, rs)) throw new Error('Conflicting causal hole metadata')
-    }
     const chosen = dominantBlock(l, r)
     if (chosen === null) continue
     select(chosen, clock, length)
   }
-  /** @type {Array<Item|GC|Skip|CausalHole>} */
+  /** @type {Array<Item|GC|Skip|CausalHole|TerminalCausalHole>} */
   const result = []
   for (const selection of selections) {
     const sliced = sliceBlock(selection.block, selection.clock, selection.length)
@@ -506,6 +582,8 @@ const mergeSparseRefs = (left, right, resolveMergeInput) => {
     let merged = false
     if (previous?.constructor === CausalHole && sliced.constructor === CausalHole) {
       merged = /** @type {CausalHole} */ (previous).mergeWith(/** @type {CausalHole} */ (sliced))
+    } else if (previous?.constructor === TerminalCausalHole && sliced.constructor === TerminalCausalHole) {
+      merged = /** @type {TerminalCausalHole} */ (previous).mergeWith(/** @type {TerminalCausalHole} */ (sliced))
     } else if (previous?.constructor === Skip && sliced.constructor === Skip) {
       merged = /** @type {Skip} */ (previous).mergeWith(/** @type {Skip} */ (sliced))
     } else if (previous?.constructor === GC && sliced.constructor === GC) {

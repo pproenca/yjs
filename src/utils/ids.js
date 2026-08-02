@@ -12,6 +12,7 @@ import { UpdateEncoderV2, IdSetEncoderV2 } from './UpdateEncoder.js'
 import { IdSetDecoderV2 } from './UpdateDecoder.js'
 import { Skip } from '../structs/Skip.js'
 import { CausalHole } from '../structs/CausalHole.js'
+import { TerminalCausalHole } from '../structs/TerminalCausalHole.js'
 
 /**
  * @typedef {{ inserts: IdSet, deletes: IdSet }} ContentIds
@@ -723,7 +724,7 @@ export const _createInsertSliceFromStructs = (structs, filterDeleted) => {
   let clock = 0
   let len = 0
   for (const struct of structs) {
-    const sparse = struct.constructor === Skip || struct.constructor === CausalHole
+    const sparse = struct.constructor === Skip || struct.constructor === CausalHole || struct.constructor === TerminalCausalHole
     if (sparse || (filterDeleted && struct.deleted)) {
       if (len > 0) iditems.push(new IdRange(clock, len))
       len = 0
@@ -877,7 +878,7 @@ export const readAndApplyDeleteSet = (decoder, transaction, store) => {
                   structs.splice(index, 0, /** @type {Item} */ (struct).split(transaction, clockEnd - struct.id.clock))
                 }
                 struct.delete(transaction)
-              } else { // is a Skip - add range to unappliedDS
+              } else if (struct.constructor !== TerminalCausalHole) { // Skip/live hole: retain until source arrives
                 const c = math.max(struct.id.clock, clock)
                 unappliedDS.add(client, c, math.min(struct.length, clockEnd - c))
               }

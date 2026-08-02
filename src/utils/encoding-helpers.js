@@ -7,13 +7,14 @@ import { Skip } from '../structs/Skip.js'
 import { Item } from '../structs/Item.js'
 import { GC } from '../structs/GC.js'
 import { CausalHole, CausalHoleIndex, createCausalHoleFromItem, sameCausalHoleMetadata } from '../structs/CausalHole.js'
+import { TerminalCausalHole, sameTerminalCausalHoleMetadata } from '../structs/TerminalCausalHole.js'
 import { createID } from './ID.js'
 import { createIdSet, intersectSets, mergeIdSets, writeIdSet } from './ids.js'
-import { forEachLiveCausalHole, forEachTerminalGcRange } from './sparse-transport.js'
+import { forEachLiveCausalHole, forEachTerminalCausalHole } from './sparse-transport.js'
 
 /**
  * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
- * @param {Array<GC|Item|Skip|CausalHole>} structs All structs by `client`
+ * @param {Array<GC|Item|Skip|CausalHole|TerminalCausalHole>} structs All structs by `client`
  * @param {number} client
  * @param {Array<IdRange>} idranges
  *
@@ -123,6 +124,8 @@ export const writeStructsFromIdSetWithExistingCausalHoles = (encoder, sourceStor
  */
 const collectCausalHoles = (sourceStore, selected, knownStores, synthesize) => {
   const holes = new CausalHoleIndex()
+  /** @type {Array<CausalHole>} */
+  const collectedHoles = []
   /** @type {IdSet|null} */
   let known = null
   for (const store of knownStores) {
@@ -193,11 +196,12 @@ const collectCausalHoles = (sourceStore, selected, knownStores, synthesize) => {
     const hole = source.constructor === CausalHole
       ? /** @type {CausalHole} */ (source).slice(segment.clock, segment.len)
       : createCausalHoleFromItem(/** @type {Item} */ (source), segment.clock, segment.len)
-    holes.add(hole)
+    collectedHoles.push(hole)
     requireParent(hole.parent)
     queueAnchor(hole.origin)
     queueAnchor(hole.rightOrigin)
   }
+  holes.addMany(collectedHoles)
   assertAcyclicCausalHoles(holes)
   return holes
 }
@@ -238,13 +242,13 @@ const assertAcyclicCausalHoles = holes => {
  * @param {StructStore} sourceStore
  * @param {IdSet} selected
  * @param {CausalHoleIndex} holes
- * @param {Array<GC>} [terminalGc]
+ * @param {Array<TerminalCausalHole>} [terminalHoles]
  */
-const writeSparseSelection = (encoder, sourceStore, selected, holes, terminalGc = []) => {
-  /** @type {Map<number,Array<{struct:Item|CausalHole|GC,start:number,end:number}>>} */
+const writeSparseSelection = (encoder, sourceStore, selected, holes, terminalHoles = []) => {
+  /** @type {Map<number,Array<{struct:Item|CausalHole|TerminalCausalHole|GC,start:number,end:number}>>} */
   const blocks = new Map()
   /**
-   * @param {Item|CausalHole|GC} struct
+   * @param {Item|CausalHole|TerminalCausalHole|GC} struct
    * @param {number} start
    * @param {number} end
    */
@@ -270,7 +274,7 @@ const writeSparseSelection = (encoder, sourceStore, selected, holes, terminalGc 
     }
   })
   holes.forEach(hole => add(hole, hole.id.clock, hole.id.clock + hole.length))
-  terminalGc.forEach(gc => add(gc, gc.id.clock, gc.id.clock + gc.length))
+  terminalHoles.forEach(terminal => add(terminal, terminal.id.clock, terminal.id.clock + terminal.length))
   encoding.writeVarUint(encoder.restEncoder, blocks.size)
   array.from(blocks.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, unsortedBlocks]) => {
     const clientBlocks = unsortedBlocks.sort((a, b) => a.start - b.start).reduce((result, block) => {
@@ -281,11 +285,17 @@ const writeSparseSelection = (encoder, sourceStore, selected, holes, terminalGc 
         /** @type {CausalHole} */ (previous.struct).mergeWith(/** @type {CausalHole} */ (block.struct))
       ) {
         previous.end = block.end
+      } else if (
+        previous !== undefined && previous.end === block.start &&
+        previous.struct.constructor === TerminalCausalHole && block.struct.constructor === TerminalCausalHole &&
+        /** @type {TerminalCausalHole} */ (previous.struct).mergeWith(/** @type {TerminalCausalHole} */ (block.struct))
+      ) {
+        previous.end = block.end
       } else {
         result.push(block)
       }
       return result
-    }, /** @type {Array<{struct:Item|CausalHole|GC,start:number,end:number}>} */ ([]))
+    }, /** @type {Array<{struct:Item|CausalHole|TerminalCausalHole|GC,start:number,end:number}>} */ ([]))
     let count = clientBlocks.length
     let clock = clientBlocks[0].start
     for (let i = 1; i < clientBlocks.length; i++) {
@@ -326,12 +336,19 @@ const addTransactionCausalHoles = (store, transaction, holes) => {
 const collectTransactionSparseTransport = (store, transaction) => {
   const holes = new CausalHoleIndex()
   addTransactionCausalHoles(store, transaction, holes)
-  /** @type {Array<GC>} */
-  const terminalGc = []
-  forEachTerminalGcRange(transaction, (client, clock, length) => {
-    terminalGc.push(new GC(createID(client, clock), length))
+  /** @type {Array<TerminalCausalHole>} */
+  const terminalHoles = []
+  forEachTerminalCausalHole(transaction, recorded => {
+    for (const current of store.getTerminalCausalHoleOverlaps(recorded.id.client, recorded.id.clock, recorded.length)) {
+      const clock = Math.max(recorded.id.clock, current.id.clock)
+      const end = Math.min(recorded.id.clock + recorded.length, current.id.clock + current.length)
+      if (clock >= end) continue
+      const actual = current.slice(clock, end - clock)
+      const expected = recorded.slice(clock, end - clock)
+      if (sameTerminalCausalHoleMetadata(expected, actual)) terminalHoles.push(actual)
+    }
   })
-  return { holes, terminalGc }
+  return { holes, terminalHoles }
 }
 
 /**
@@ -348,10 +365,10 @@ export const writeStructsFromTransaction = (encoder, transaction) => {
     : collectCausalHoles(store, transaction.insertSet, [], false)
   const transport = collectTransactionSparseTransport(store, transaction)
   transport.holes.forEach(hole => holes.add(hole))
-  if (holes.size === 0 && transport.terminalGc.length === 0) {
+  if (holes.size === 0 && transport.terminalHoles.length === 0) {
     writeStructsFromIdSet(encoder, store, transaction.insertSet)
   } else {
-    writeSparseSelection(encoder, store, transaction.insertSet, holes, transport.terminalGc)
+    writeSparseSelection(encoder, store, transaction.insertSet, holes, transport.terminalHoles)
   }
 }
 
@@ -366,7 +383,7 @@ export const writeUpdateMessageFromTransaction = (encoder, transaction) => {
     transaction.deleteSet.clients.size === 0 &&
     transaction.insertSet.clients.size === 0 &&
     transport.holes.size === 0 &&
-    transport.terminalGc.length === 0
+    transport.terminalHoles.length === 0
   ) {
     return false
   }

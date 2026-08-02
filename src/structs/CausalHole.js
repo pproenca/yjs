@@ -305,6 +305,33 @@ export class CausalHoleIndex {
     this.clients.set(hole.id.client, holes)
   }
 
+  /** @param {Array<CausalHole>} holes */
+  addMany (holes) {
+    /** @type {Map<number,Array<CausalHole>>} */
+    const clients = new Map()
+    for (const hole of holes) {
+      const clientHoles = clients.get(hole.id.client) ?? []
+      clientHoles.push(hole)
+      clients.set(hole.id.client, clientHoles)
+    }
+    clients.forEach((clientHoles, client) => {
+      clientHoles.sort((left, right) => left.id.clock - right.id.clock || right.length - left.length)
+      const existing = this.clients.get(client)
+      const overlaps = clientHoles.some((hole, index) => index > 0 && hole.id.clock < clientHoles[index - 1].id.clock + clientHoles[index - 1].length)
+      if (existing !== undefined || overlaps) {
+        clientHoles.forEach(hole => this.add(hole))
+        return
+      }
+      const coalesced = clientHoles.reduce((result, hole) => {
+        const current = hole.slice(hole.id.clock, hole.length)
+        const previous = result[result.length - 1]
+        if (previous === undefined || !previous.mergeWith(current)) result.push(current)
+        return result
+      }, /** @type {Array<CausalHole>} */ ([]))
+      this.clients.set(client, coalesced)
+    })
+  }
+
   /** @param {(hole:CausalHole)=>void} f */
   forEach (f) {
     this.clients.forEach(holes => holes.forEach(f))

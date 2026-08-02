@@ -93,7 +93,7 @@ const encoders = [encV1, encV2, encDoc]
 /**
  * @typedef {Enc & {
  *   convert: function(Uint8Array<ArrayBuffer>):Uint8Array<ArrayBuffer>,
- *   decodeUpdate: function(Uint8Array<ArrayBuffer>):{structs:Array<Y.GC|Y.Item|Y.Skip|CausalHole>},
+ *   decodeUpdate: function(Uint8Array<ArrayBuffer>):{structs:Array<Y.GC|Y.Item|Y.Skip|CausalHole|import('../src/structs/TerminalCausalHole.js').TerminalCausalHole>},
  *   intersectUpdate: function(Uint8Array<ArrayBuffer>,Y.ContentIds):Uint8Array<ArrayBuffer>
  * }} SparseEnc
  */

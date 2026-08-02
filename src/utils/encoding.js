@@ -32,6 +32,7 @@ import { Skip } from '../structs/Skip.js'
 import { ContentType, Item, findItemInsertionLeft } from '../structs/Item.js'
 import { GC } from '../structs/GC.js'
 import { CausalHole, CausalHoleIndex, createCausalHoleFromItem, normalizeCausalHoleParent, sameCausalHoleMetadata, sameCausalHoleParent } from '../structs/CausalHole.js'
+import { TerminalCausalHole, createTerminalCausalHoleFromHole } from '../structs/TerminalCausalHole.js'
 import { Doc } from './Doc.js'
 import { writeStructs } from './encoding-helpers.js'
 
@@ -62,7 +63,7 @@ export const writeClientsStructs = (encoder, store, _sm) => {
   // Write items with higher client ids first
   // This heavily improves the conflict algorithm.
   array.from(sm.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, clock]) => {
-    const structs = /** @type {Array<GC|Item|Skip|CausalHole>} */ (store.clients.get(client))
+    const structs = /** @type {Array<GC|Item|Skip|CausalHole|TerminalCausalHole>} */ (/** @type {unknown} */ (store.clients.get(client)))
     const lastStruct = structs[structs.length - 1]
     writeStructs(encoder, structs, client, [new IdRange(clock, lastStruct.id.clock + lastStruct.length - clock)])
   })
@@ -91,15 +92,14 @@ export const writeClientsStructs = (encoder, store, _sm) => {
  * @param {StructStore} store
  * @param {BlockSet} clientsStructRefs
  * @param {ReturnType<typeof createSparseIntegrationPlan>} sparsePlan
- * @param {IdSet} terminalGc
  * @return { null | { update: Uint8Array<ArrayBuffer>, missing: Map<number,number> } }
  *
  * @private
  * @function
  */
-const integrateStructs = (transaction, store, clientsStructRefs, sparsePlan, terminalGc) => {
+const integrateStructs = (transaction, store, clientsStructRefs, sparsePlan) => {
   /**
-   * @type {Array<Item | GC | Skip | CausalHole>}
+   * @type {Array<Item | GC | Skip | CausalHole | TerminalCausalHole>}
    */
   const stack = []
   // sort them so that we take the higher id first, in case of conflicts the lower id will probably not conflict with the id from the higher user.
@@ -143,7 +143,7 @@ const integrateStructs = (transaction, store, clientsStructRefs, sparsePlan, ter
     }
   }
   /**
-   * @type {GC|Item|Skip|CausalHole}
+   * @type {GC|Item|Skip|CausalHole|TerminalCausalHole}
    */
   let stackHead = /** @type {any} */ (curStructsTarget).refs[/** @type {any} */ (curStructsTarget).i++]
   // caching the state because it is used very often
@@ -186,7 +186,7 @@ const integrateStructs = (transaction, store, clientsStructRefs, sparsePlan, ter
         stack.push(stackHead)
         // get the struct reader that has the missing struct
         /**
-         * @type {{ refs: Array<GC|Item|Skip|CausalHole>, i: number }}
+         * @type {{ refs: Array<GC|Item|Skip|CausalHole|TerminalCausalHole>, i: number }}
          */
         const structRefs = clientsStructRefs.clients.get(/** @type {number} */ (missing)) || { refs: [], i: 0 }
         if (structRefs.refs.length === structRefs.i || missing === stackHead.id.client || stack.some(s => s.id.client === missing)) { // @todo this could be optimized!
@@ -204,10 +204,8 @@ const integrateStructs = (transaction, store, clientsStructRefs, sparsePlan, ter
           const skip = new Skip(createID(stackHead.id.client, localClock), -offset)
           skip.integrate(transaction, 0)
         }
-        if (stackHead.constructor === GC && terminalGc.has(stackHead.id.client, stackHead.id.clock)) {
-          store.installTerminalGc(transaction, /** @type {GC} */ (stackHead))
-        } else if (stackHead.constructor === CausalHole && sparsePlan?.isTerminalHole(/** @type {CausalHole} */ (stackHead))) {
-          store.installTerminalGc(transaction, new GC(createID(stackHead.id.client, stackHead.id.clock), stackHead.length))
+        if (stackHead.constructor === CausalHole && sparsePlan?.isTerminalHole(/** @type {CausalHole} */ (stackHead))) {
+          store.installTerminalCausalHole(transaction, createTerminalCausalHoleFromHole(/** @type {CausalHole} */ (stackHead)))
         } else {
           stackHead.integrate(transaction, 0)
         }
@@ -216,16 +214,16 @@ const integrateStructs = (transaction, store, clientsStructRefs, sparsePlan, ter
     }
     // iterate to next stackHead
     if (stack.length > 0) {
-      stackHead = /** @type {GC|Item|CausalHole} */ (stack.pop())
+      stackHead = /** @type {GC|Item|CausalHole|TerminalCausalHole} */ (stack.pop())
     } else if (curStructsTarget !== null && curStructsTarget.i < curStructsTarget.refs.length) {
-      stackHead = /** @type {GC|Item|CausalHole} */ (curStructsTarget.refs[curStructsTarget.i++])
+      stackHead = /** @type {GC|Item|CausalHole|TerminalCausalHole} */ (curStructsTarget.refs[curStructsTarget.i++])
     } else {
       curStructsTarget = getNextStructTarget()
       if (curStructsTarget === null) {
         // we are done!
         break
       } else {
-        stackHead = /** @type {GC|Item|CausalHole} */ (curStructsTarget.refs[curStructsTarget.i++])
+        stackHead = /** @type {GC|Item|CausalHole|TerminalCausalHole} */ (curStructsTarget.refs[curStructsTarget.i++])
       }
     }
   }
@@ -263,20 +261,19 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     const ss = readBlockSet(structDecoder)
     const ranges = array.from(ss.clients.values())
     const hasIncomingHoles = ranges.some(range => range.refs.some(struct => struct.constructor === CausalHole))
-    const hasIncomingGc = ranges.some(range => range.refs.some(struct => struct.constructor === GC))
-    if (hasIncomingHoles) normalizeIncomingCausalHoles(ss, store)
-    const hasSparseCausality = hasIncomingHoles || (!store.causalHoles.isEmpty() && ranges.some(range => range.refs.some(struct =>
+    const hasIncomingTerminals = ranges.some(range => range.refs.some(struct => struct.constructor === TerminalCausalHole))
+    if (hasIncomingHoles || hasIncomingTerminals) normalizeIncomingCausalHoles(ss, store)
+    const hasSparseCausality = hasIncomingHoles || hasIncomingTerminals || (!store.causalHoles.isEmpty() && ranges.some(range => range.refs.some(struct =>
       struct.constructor === Item && (
         (struct.origin !== null && store.causalHoles.hasId(struct.origin)) ||
         (struct.rightOrigin !== null && store.causalHoles.hasId(struct.rightOrigin)) ||
         store.causalHoles.intersects(struct.id.client, struct.id.clock, struct.length)
       )
     )))
-    const sparseDeleteSet = hasSparseCausality || hasIncomingGc ? readIdSet(structDecoder) : null
-    const terminalGc = sparseDeleteSet === null ? createIdSet() : normalizeIncomingTerminalGc(ss, sparseDeleteSet)
-    const sparseValidation = validateCausalHoleEnvelope(ss, store)
+    const sparseDeleteSet = hasSparseCausality || hasIncomingTerminals ? readIdSet(structDecoder) : null
+    const sparseValidation = validateCausalHoleEnvelope(ss, store, sparseDeleteSet ?? createIdSet())
     const sparsePlan = sparseValidation === null ? null : createSparseIntegrationPlan(ss, store, doc, sparseValidation)
-    sparsePlan?.applySplits()
+    sparsePlan?.applySplits(transaction)
     const knownState = createIdSet()
     ss.clients.forEach((_, client) => {
       const storeStructs = store.clients.get(client)
@@ -292,13 +289,14 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
         })
       }
     })
+    sparsePlan?.excludeTerminalCoverageFromKnownState(knownState)
     // remove known items from ss
     ss.exclude(knownState)
     // console.log('time to read structs: ', performance.now() - start) // @todo remove
     // start = performance.now()
     // console.log('time to merge: ', performance.now() - start) // @todo remove
     // start = performance.now()
-    const restStructs = integrateStructs(transaction, store, ss, sparsePlan, terminalGc)
+    const restStructs = integrateStructs(transaction, store, ss, sparsePlan)
     const pending = store.pendingStructs
     if (pending) {
       // check if we can apply something
@@ -371,34 +369,6 @@ const applyDecodedDeleteSet = (deleteSet, transaction, store) => {
 }
 
 /**
- * A GC range without a matching delete-set commitment is sparse terminal coverage. Split mixed
- * ranges once so integration can keep ordinary GC semantics and transport GC semantics disjoint.
- *
- * @param {BlockSet} blockSet
- * @param {IdSet} deleteSet
- */
-const normalizeIncomingTerminalGc = (blockSet, deleteSet) => {
-  const terminalGc = createIdSet()
-  blockSet.clients.forEach(range => {
-    /** @type {Array<GC|Item|Skip|CausalHole>} */
-    const normalized = []
-    for (const struct of range.refs) {
-      if (struct.constructor !== GC) {
-        normalized.push(struct)
-        continue
-      }
-      for (const slice of deleteSet.slice(struct.id.client, struct.id.clock, struct.length)) {
-        const gc = new GC(createID(struct.id.client, slice.clock), slice.len)
-        normalized.push(gc)
-        if (!slice.exists) terminalGc.add(gc.id.client, gc.id.clock, gc.length)
-      }
-    }
-    range.refs = normalized
-  })
-  return terminalGc
-}
-
-/**
  * Split decoded holes at every known store boundary and prove that their known prefix can be
  * replayed without touching the store. Decoded refs are private to this read and remain disposable
  * if a later preflight check rejects the update.
@@ -408,16 +378,16 @@ const normalizeIncomingTerminalGc = (blockSet, deleteSet) => {
  */
 const normalizeIncomingCausalHoles = (blockSet, store) => {
   blockSet.clients.forEach(range => {
-    /** @type {Array<GC|Item|Skip|CausalHole>} */
+    /** @type {Array<GC|Item|Skip|CausalHole|TerminalCausalHole>} */
     const normalized = []
     let structIndex = -1
     for (const decoded of range.refs) {
-      if (decoded.constructor !== CausalHole) {
+      if (decoded.constructor !== CausalHole && decoded.constructor !== TerminalCausalHole) {
         normalized.push(decoded)
         continue
       }
-      const hole = /** @type {CausalHole} */ (decoded)
-      const structs = /** @type {Array<GC|Item|Skip|CausalHole>|undefined} */ (/** @type {unknown} */ (store.clients.get(hole.id.client)))
+      const hole = /** @type {CausalHole|TerminalCausalHole} */ (decoded)
+      const structs = /** @type {Array<GC|Item|Skip|CausalHole|TerminalCausalHole>|undefined} */ (/** @type {unknown} */ (store.clients.get(hole.id.client)))
       const knownEnd = Math.min(hole.id.clock + hole.length, store.getClock(hole.id.client))
       if (structs === undefined || hole.id.clock >= knownEnd) {
         normalized.push(hole)
@@ -436,12 +406,15 @@ const normalizeIncomingCausalHoles = (blockSet, store) => {
         }
         const end = Math.min(knownEnd, existing.id.clock + existing.length)
         const incomingSlice = hole.slice(cursor, end - cursor)
-        if (existing.constructor === CausalHole) {
-          const existingSlice = /** @type {CausalHole} */ (existing).slice(cursor, end - cursor)
-          if (!sameCausalHoleMetadata(incomingSlice, existingSlice)) throw new Error('Conflicting causal hole metadata')
+        if (existing.constructor === CausalHole || existing.constructor === TerminalCausalHole) {
+          const existingSlice = /** @type {CausalHole|TerminalCausalHole} */ (existing).slice(cursor, end - cursor)
+          if (!sameCausalHoleMetadata(
+            /** @type {CausalHole} */ (/** @type {unknown} */ (incomingSlice)),
+            /** @type {CausalHole} */ (/** @type {unknown} */ (existingSlice))
+          )) throw new Error('Conflicting causal hole metadata')
         } else if (existing.constructor === Item) {
           const existingSlice = createCausalHoleFromItem(/** @type {Item} */ (existing), cursor, end - cursor)
-          if (!sameCausalHoleMetadata(incomingSlice, existingSlice)) throw new Error('Conflicting causal hole metadata')
+          if (!sameCausalHoleMetadata(/** @type {CausalHole} */ (/** @type {unknown} */ (incomingSlice)), existingSlice)) throw new Error('Conflicting causal hole metadata')
         }
         normalized.push(incomingSlice)
         cursor = end
@@ -456,19 +429,29 @@ const normalizeIncomingCausalHoles = (blockSet, store) => {
 /**
  * @param {BlockSet} blockSet
  * @param {StructStore} store
+ * @param {IdSet} deleteSet
  */
-const validateCausalHoleEnvelope = (blockSet, store) => {
+const validateCausalHoleEnvelope = (blockSet, store, deleteSet) => {
   /** @type {Array<CausalHole>} */
   const incomingHoles = []
+  /** @type {Array<TerminalCausalHole>} */
+  const incomingTerminals = []
   /** @type {Array<Item>} */
   const incomingItems = []
+  /** @type {Array<GC>} */
+  const incomingGc = []
   blockSet.clients.forEach(range => {
     range.refs.forEach(struct => {
       if (struct.constructor === CausalHole) incomingHoles.push(/** @type {CausalHole} */ (struct))
+      if (struct.constructor === TerminalCausalHole) incomingTerminals.push(/** @type {TerminalCausalHole} */ (struct))
       if (struct.constructor === Item) incomingItems.push(/** @type {Item} */ (struct))
+      if (struct.constructor === GC) incomingGc.push(/** @type {GC} */ (struct))
     })
   })
-  if (incomingHoles.length === 0 && store.causalHoles.isEmpty()) return null
+  if (
+    incomingHoles.length === 0 && incomingTerminals.length === 0 &&
+    store.causalHoles.isEmpty() && store.terminalCausalHoles.isEmpty()
+  ) return null
 
   /**
    * @param {ID} id
@@ -502,7 +485,7 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
     return null
   }
   /**
-   * @param {CausalHole} hole
+   * @param {CausalHole|TerminalCausalHole} hole
    */
   const coveredByRealStore = hole => {
     let clock = hole.id.clock
@@ -514,14 +497,17 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
     }
     return true
   }
-  /** @param {CausalHole} hole */
+  /** @param {CausalHole|TerminalCausalHole} hole */
   const coveredByStoredHole = hole => {
     let clock = hole.id.clock
     const end = clock + hole.length
     for (const existing of store.getCausalHoleOverlaps(hole.id.client, clock, hole.length)) {
       if (existing.id.clock > clock) return false
       const overlapEnd = Math.min(end, existing.id.clock + existing.length)
-      if (!sameCausalHoleMetadata(hole.slice(clock, overlapEnd - clock), existing.slice(clock, overlapEnd - clock))) {
+      if (!sameCausalHoleMetadata(
+        /** @type {CausalHole} */ (/** @type {unknown} */ (hole.slice(clock, overlapEnd - clock))),
+        existing.slice(clock, overlapEnd - clock)
+      )) {
         throw new Error('Conflicting causal hole metadata')
       }
       clock = overlapEnd
@@ -529,33 +515,97 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
     }
     return false
   }
+  /** @param {CausalHole|TerminalCausalHole} hole */
+  const coveredByStoredTerminal = hole => {
+    let clock = hole.id.clock
+    const end = clock + hole.length
+    for (const existing of store.getTerminalCausalHoleOverlaps(hole.id.client, clock, hole.length)) {
+      if (existing.id.clock > clock) return false
+      const overlapEnd = Math.min(end, existing.id.clock + existing.length)
+      if (!sameCausalHoleMetadata(
+        /** @type {CausalHole} */ (/** @type {unknown} */ (hole.slice(clock, overlapEnd - clock))),
+        /** @type {CausalHole} */ (/** @type {unknown} */ (existing.slice(clock, overlapEnd - clock)))
+      )) {
+        throw new Error('Conflicting terminal causal hole metadata')
+      }
+      clock = overlapEnd
+      if (clock === end) return true
+    }
+    return false
+  }
+
+  /** @typedef {CausalHole|TerminalCausalHole} SparseCoverage */
+  /** @type {Map<SparseCoverage,0|1|2>} */
+  const terminalColors = new Map()
+  /** @param {SparseCoverage} sparse @return {boolean} */
+  const hasDeadStructuralParent = sparse => {
+    const color = terminalColors.get(sparse) ?? 0
+    if (color === 2) return true
+    if (color === 1) throw new Error('Cyclic terminal causal hole parent')
+    terminalColors.set(sparse, 1)
+    const parent = sparse.parent
+    let dead = false
+    if (typeof parent !== 'string') {
+      const existing = store.getStruct(parent)
+      const incoming = incomingAt(parent)
+      if (
+        deleteSet.hasId(parent) &&
+        (existing?.constructor === Item || incoming?.constructor === Item)
+      ) {
+        dead = true
+      } else if (
+        existing?.constructor === GC || existing?.constructor === TerminalCausalHole ||
+        (existing?.constructor === Item && existing.deleted)
+      ) {
+        dead = true
+      } else if (existing?.constructor !== Item) {
+        if (incoming?.constructor === GC || (incoming?.constructor === Item && incoming.deleted)) {
+          dead = true
+        } else if (incoming?.constructor === CausalHole || incoming?.constructor === TerminalCausalHole) {
+          dead = hasDeadStructuralParent(/** @type {SparseCoverage} */ (incoming))
+        }
+      }
+    }
+    terminalColors.set(sparse, dead ? 2 : 0)
+    return dead
+  }
+
   const liveIncomingHoles = new CausalHoleIndex()
   /** @type {Array<CausalHole>} */
   const effectiveIncomingHoles = []
+  /** @type {Array<TerminalCausalHole>} */
+  const effectiveIncomingTerminals = []
+  /** @type {Set<SparseCoverage>} */
+  const terminalHoles = new Set()
+  for (const terminal of incomingTerminals) {
+    if (!hasDeadStructuralParent(terminal)) throw new Error('Terminal causal hole parent is not dead')
+    if (coveredByStoredTerminal(terminal)) continue
+    coveredByStoredHole(terminal)
+    terminalHoles.add(terminal)
+    effectiveIncomingTerminals.push(terminal)
+  }
   for (const hole of incomingHoles) {
-    if (coveredByRealStore(hole) || coveredByStoredHole(hole)) continue
+    const terminal = hasDeadStructuralParent(hole)
+    if (coveredByStoredTerminal(hole)) continue
+    const storedHole = coveredByStoredHole(hole)
+    if ((coveredByRealStore(hole) || storedHole) && !terminal) continue
+    if (terminal) terminalHoles.add(hole)
     effectiveIncomingHoles.push(hole)
   }
 
-  /** @type {Map<Item|CausalHole,Item>} */
+  /** @type {Map<Item|SparseCoverage,Item>} */
   const structuralParentDependencies = new Map()
-  /** @type {Set<CausalHole>} */
-  const terminalHoles = new Set()
   /** @param {CausalHole} hole */
   const classifyHoleStructuralParent = hole => {
     const parent = hole.parent
     if (typeof parent === 'string') return true
     const existing = store.getStruct(parent)
     if (existing !== null && existing.constructor !== Skip && existing.constructor !== CausalHole) {
-      if (existing.constructor === Item && /** @type {Item} */ (existing).content instanceof ContentType) return true
-      if (existing.constructor === GC || (existing.constructor === Item && existing.deleted)) {
-        terminalHoles.add(hole)
-        return false
-      }
+      if (existing.constructor === Item && !existing.deleted && /** @type {Item} */ (existing).content instanceof ContentType) return true
       throw new Error('Causal hole parent is not a materialized type')
     }
     const incoming = incomingAt(parent)
-    if (incoming?.constructor === Item && /** @type {Item} */ (incoming).content instanceof ContentType) {
+    if (incoming?.constructor === Item && !incoming.deleted && /** @type {Item} */ (incoming).content instanceof ContentType) {
       structuralParentDependencies.set(hole, /** @type {Item} */ (incoming))
       return true
     }
@@ -565,7 +615,8 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
   /** @type {Map<string,Array<CausalHole>>} */
   const incomingHolesByParentGroup = new Map()
   for (const hole of effectiveIncomingHoles) {
-    if (!classifyHoleStructuralParent(hole)) continue
+    if (terminalHoles.has(hole)) continue
+    classifyHoleStructuralParent(hole)
     liveIncomingHoles.add(hole)
     const key = sparseParentKey(hole.parent, hole.parentSub)
     const holes = incomingHolesByParentGroup.get(key) ?? []
@@ -575,6 +626,38 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
 
   /** @param {number} client @param {number} clock @param {number} length */
   const getHoleOverlaps = (client, clock, length) => store.getCausalHoleOverlaps(client, clock, length).concat(liveIncomingHoles.getOverlaps(client, clock, length))
+  /** @type {Map<number,Array<TerminalCausalHole>>} */
+  const incomingTerminalsByClient = new Map()
+  for (const terminal of effectiveIncomingTerminals) {
+    const terminals = incomingTerminalsByClient.get(terminal.id.client) ?? []
+    terminals.push(terminal)
+    incomingTerminalsByClient.set(terminal.id.client, terminals)
+  }
+  incomingTerminalsByClient.forEach(terminals => terminals.sort((left, right) => left.id.clock - right.id.clock))
+  /** @param {number} client @param {number} clock @param {number} length */
+  const getIncomingTerminalOverlaps = (client, clock, length) => {
+    const terminals = incomingTerminalsByClient.get(client)
+    if (terminals === undefined || length <= 0) return []
+    const end = clock + length
+    let left = 0
+    let right = terminals.length
+    while (left < right) {
+      const middle = (left + right) >>> 1
+      if (terminals[middle].id.clock + terminals[middle].length <= clock) left = middle + 1
+      else right = middle
+    }
+    /** @type {Array<TerminalCausalHole>} */
+    const overlaps = []
+    while (left < terminals.length && terminals[left].id.clock < end) overlaps.push(terminals[left++])
+    return overlaps
+  }
+  /** @param {number} client @param {number} clock @param {number} length */
+  const getTerminalOverlaps = (client, clock, length) => store.getTerminalCausalHoleOverlaps(client, clock, length).concat(getIncomingTerminalOverlaps(client, clock, length))
+  for (const gc of incomingGc) {
+    if (getHoleOverlaps(gc.id.client, gc.id.clock, gc.length).length > 0) {
+      throw new Error('GC cannot replace live causal hole coverage')
+    }
+  }
 
   /** @type {Set<Item>} */
   const sparseConnectedItems = new Set()
@@ -588,26 +671,33 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
     const incoming = incomingAt(parent)
     if (incoming?.constructor === Item && /** @type {Item} */ (incoming).content instanceof ContentType && incoming !== item) {
       structuralParentDependencies.set(item, /** @type {Item} */ (incoming))
+    } else if (existing?.constructor === CausalHole) {
+      throw new Error('Sparse item parent has no materialized type replacement')
     }
   }
 
-  /** @type {Array<CausalHole>} */
-  const roots = effectiveIncomingHoles.filter(hole => !terminalHoles.has(hole))
+  /** @type {Array<SparseCoverage>} */
+  const roots = /** @type {Array<SparseCoverage>} */ ([...effectiveIncomingHoles, ...effectiveIncomingTerminals])
   for (const item of incomingItems) {
     const overlaps = getHoleOverlaps(item.id.client, item.id.clock, item.length)
     if (overlaps.length > 0) sparseConnectedItems.add(item)
     overlaps.forEach(hole => roots.push(hole))
+    const terminalOverlaps = getTerminalOverlaps(item.id.client, item.id.clock, item.length)
+    if (terminalOverlaps.length > 0) {
+      sparseConnectedItems.add(item)
+      terminalOverlaps.forEach(terminal => roots.push(terminal))
+    }
     for (const anchor of [item.origin, item.rightOrigin]) {
       if (anchor === null) continue
       const dependency = resolve(anchor)
-      if (dependency?.constructor === CausalHole) {
+      if (dependency?.constructor === CausalHole || dependency?.constructor === TerminalCausalHole) {
         sparseConnectedItems.add(item)
-        roots.push(/** @type {CausalHole} */ (dependency))
+        roots.push(/** @type {SparseCoverage} */ (dependency))
       }
     }
     if (item.parent !== null) {
       const parent = normalizeCausalHoleParent(item.parent)
-      if (typeof parent !== 'string' && store.getStruct(parent)?.constructor === CausalHole && incomingAt(parent)?.constructor === Item) {
+      if (typeof parent !== 'string' && store.getStruct(parent)?.constructor === CausalHole) {
         sparseConnectedItems.add(item)
       }
     }
@@ -615,22 +705,17 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
   sparseConnectedItems.forEach(registerStructuralParentDependency)
   if (roots.length === 0 && terminalHoles.size === 0 && structuralParentDependencies.size === 0) return null
 
-  /** @type {Map<CausalHole,0|1|2>} */
+  /** @type {Map<SparseCoverage,0|1|2>} */
   const colors = new Map()
   const reachable = new Set()
   for (const root of roots) {
     if (colors.get(root) === 2) continue
-    /** @type {Array<{hole:CausalHole,next:number}>} */
+    /** @type {Array<{hole:SparseCoverage,next:number}>} */
     const stack = [{ hole: root, next: 0 }]
     colors.set(root, 1)
     while (stack.length > 0) {
       const frame = stack[stack.length - 1]
       reachable.add(frame.hole)
-      if (frame.next === 0 && !classifyHoleStructuralParent(frame.hole)) {
-        colors.set(frame.hole, 2)
-        stack.pop()
-        continue
-      }
       const anchors = [frame.hole.origin, frame.hole.rightOrigin]
       if (frame.next >= anchors.length) {
         colors.set(frame.hole, 2)
@@ -641,8 +726,8 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
       if (anchor === null) continue
       const dependency = resolve(anchor)
       if (dependency === null || dependency.constructor === Skip) throw new Error('Missing causal hole anchor')
-      if (dependency.constructor !== CausalHole) continue
-      const next = /** @type {CausalHole} */ (dependency)
+      if (dependency.constructor !== CausalHole && dependency.constructor !== TerminalCausalHole) continue
+      const next = /** @type {SparseCoverage} */ (dependency)
       const color = colors.get(next) ?? 0
       if (color === 1) throw new Error('Cyclic causal hole metadata')
       if (color === 0) {
@@ -653,16 +738,16 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
   }
 
   /** @typedef {{parent:ID|string,parentSub:string|null}} ParentMetadata */
-  /** @type {Map<Item|CausalHole,ParentMetadata>} */
+  /** @type {Map<Item|SparseCoverage,ParentMetadata>} */
   const parentMemo = new Map()
-  /** @param {Item|CausalHole} start */
+  /** @param {Item|SparseCoverage} start */
   const getParentMetadata = start => {
     const cached = parentMemo.get(start)
     if (cached !== undefined) return cached
-    /** @type {Array<Item|CausalHole>} */
+    /** @type {Array<Item|SparseCoverage>} */
     const path = []
     const seen = new Set()
-    /** @type {Item|CausalHole} */
+    /** @type {Item|SparseCoverage} */
     let current = start
     /** @type {ParentMetadata|null} */
     let metadata = null
@@ -675,8 +760,8 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
       if (seen.has(current)) throw new Error('Cyclic sparse parent metadata')
       seen.add(current)
       path.push(current)
-      if (current.constructor === CausalHole) {
-        const hole = /** @type {CausalHole} */ (current)
+      if (current.constructor === CausalHole || current.constructor === TerminalCausalHole) {
+        const hole = /** @type {SparseCoverage} */ (current)
         metadata = { parent: hole.parent, parentSub: hole.parentSub }
         break
       }
@@ -688,8 +773,8 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
       const anchor = item.origin ?? item.rightOrigin
       if (anchor === null) throw new Error('Sparse item parent cannot be inferred')
       const dependency = resolve(anchor)
-      if (dependency?.constructor !== Item && dependency?.constructor !== CausalHole) throw new Error('Sparse item parent cannot be inferred')
-      current = /** @type {Item|CausalHole} */ (dependency)
+      if (dependency?.constructor !== Item && dependency?.constructor !== CausalHole && dependency?.constructor !== TerminalCausalHole) throw new Error('Sparse item parent cannot be inferred')
+      current = /** @type {Item|SparseCoverage} */ (dependency)
     }
     for (const struct of path) parentMemo.set(struct, metadata)
     return metadata
@@ -701,16 +786,16 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
     }
   }
 
-  /** @type {Map<CausalHole,Item|null>} */
+  /** @type {Map<SparseCoverage,Item|null>} */
   const leftTerminal = new Map()
-  /** @type {Map<CausalHole,Item|null>} */
+  /** @type {Map<SparseCoverage,Item|null>} */
   const rightTerminal = new Map()
-  /** @param {CausalHole} start @param {boolean} left */
+  /** @param {SparseCoverage} start @param {boolean} left */
   const getTerminal = (start, left) => {
     const memo = left ? leftTerminal : rightTerminal
     const cached = memo.get(start)
     if (cached !== undefined || memo.has(start)) return cached ?? null
-    /** @type {Array<CausalHole>} */
+    /** @type {Array<SparseCoverage>} */
     const path = []
     let current = start
     /** @type {Item|null} */
@@ -728,8 +813,8 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
         terminal = /** @type {Item} */ (dependency)
         break
       }
-      if (dependency?.constructor !== CausalHole) throw new Error('Missing causal hole anchor')
-      current = /** @type {CausalHole} */ (dependency)
+      if (dependency?.constructor !== CausalHole && dependency?.constructor !== TerminalCausalHole) throw new Error('Missing causal hole anchor')
+      current = /** @type {SparseCoverage} */ (dependency)
     }
     for (const hole of path) memo.set(hole, terminal)
     return terminal
@@ -744,8 +829,8 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
     for (const anchor of [hole.origin, hole.rightOrigin]) {
       if (anchor === null) continue
       const dependency = resolve(anchor)
-      if (dependency?.constructor === Item || dependency?.constructor === CausalHole) {
-        assertParentMetadata(getParentMetadata(/** @type {Item|CausalHole} */ (dependency)), expected)
+      if (dependency?.constructor === Item || dependency?.constructor === CausalHole || dependency?.constructor === TerminalCausalHole) {
+        assertParentMetadata(getParentMetadata(/** @type {Item|SparseCoverage} */ (dependency)), expected)
       }
     }
   })
@@ -754,13 +839,13 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
     const dependencies = [item.origin, item.rightOrigin]
       .filter(anchor => anchor !== null)
       .map(anchor => resolve(/** @type {ID} */ (anchor)))
-    const hole = dependencies.find(dependency => dependency?.constructor === CausalHole)
-    if (hole?.constructor !== CausalHole) continue
-    const expected = getParentMetadata(/** @type {CausalHole} */ (hole))
+    const hole = dependencies.find(dependency => dependency?.constructor === CausalHole || dependency?.constructor === TerminalCausalHole)
+    if (hole?.constructor !== CausalHole && hole?.constructor !== TerminalCausalHole) continue
+    const expected = getParentMetadata(/** @type {SparseCoverage} */ (hole))
     assertParentMetadata(getParentMetadata(item), expected)
     for (const dependency of dependencies) {
-      if (dependency?.constructor === Item || dependency?.constructor === CausalHole) {
-        assertParentMetadata(getParentMetadata(/** @type {Item|CausalHole} */ (dependency)), expected)
+      if (dependency?.constructor === Item || dependency?.constructor === CausalHole || dependency?.constructor === TerminalCausalHole) {
+        assertParentMetadata(getParentMetadata(/** @type {Item|SparseCoverage} */ (dependency)), expected)
       }
     }
   }
@@ -775,13 +860,25 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
       }
       assertParentMetadata(getParentMetadata(item), { parent: expected.parent, parentSub: expected.parentSub })
     }
+    for (const terminal of getTerminalOverlaps(item.id.client, item.id.clock, item.length)) {
+      const clock = Math.max(item.id.clock, terminal.id.clock)
+      const end = Math.min(item.id.clock + item.length, terminal.id.clock + terminal.length)
+      const expected = terminal.slice(clock, end - clock)
+      const origin = clock === item.id.clock ? item.origin : createID(item.id.client, clock - 1)
+      if (!compareIDs(origin, expected.origin) || !compareIDs(item.rightOrigin, expected.rightOrigin)) {
+        throw new Error('Conflicting terminal causal hole replacement anchors')
+      }
+      assertParentMetadata(getParentMetadata(item), { parent: expected.parent, parentSub: expected.parentSub })
+    }
   }
   return {
     incomingHoles: effectiveIncomingHoles,
+    incomingTerminals: effectiveIncomingTerminals,
     incomingItems,
     resolve,
     getParentMetadata,
     getHoleOverlaps,
+    getTerminalOverlaps,
     getHolesForParentGroup: (/** @type {ID|string} */ parent, /** @type {string|null} */ parentSub) =>
       Array.from(store.getCausalHolesForParentGroup(parent, parentSub)).concat(incomingHolesByParentGroup.get(sparseParentKey(parent, parentSub)) ?? []),
     structuralParentDependencies,
@@ -1207,8 +1304,19 @@ const createSparseIntegrationPlan = (blockSet, store, doc, validation) => {
 
   return {
     isTerminalHole: (/** @type {CausalHole} */ hole) => validation.terminalHoles.has(hole),
-    getStructuralParentDependency: (/** @type {Item|CausalHole} */ struct) => validation.structuralParentDependencies.get(struct) ?? null,
-    applySplits: () => {
+    getStructuralParentDependency: (/** @type {Item|CausalHole|TerminalCausalHole} */ struct) => validation.structuralParentDependencies.get(struct) ?? null,
+    excludeTerminalCoverageFromKnownState: (/** @type {IdSet} */ knownState) => {
+      validation.terminalHoles.forEach(terminal => knownState.delete(terminal.id.client, terminal.id.clock, terminal.length))
+    },
+    applySplits: (/** @type {Transaction} */ transaction) => {
+      validation.terminalHoles.forEach(terminal => {
+        for (const clock of [terminal.id.clock, terminal.id.clock + terminal.length]) {
+          const existing = store.getStruct(createID(terminal.id.client, clock))
+          if (existing?.constructor === Item && existing.id.clock < clock) {
+            getItemCleanStart(transaction, createID(terminal.id.client, clock))
+          }
+        }
+      })
       blockSet.clients.forEach(range => {
         for (let index = 0; index < range.refs.length; index++) {
           const struct = range.refs[index]
@@ -1523,14 +1631,15 @@ export const encodeStateVector = doc => encodeStateVectorV2(doc, new IdSetEncode
 /**
  * Return the creator clientID of the missing op or define missing items and return null.
  *
- * @param {Item|CausalHole} struct
+ * @param {Item|CausalHole|TerminalCausalHole} struct
  * @param {Transaction} transaction
  * @param {StructStore} store
  * @param {ReturnType<typeof createSparseIntegrationPlan>} sparsePlan
  * @return {null | number}
  */
 const getMissing = (struct, transaction, store, sparsePlan) => {
-  if (struct.constructor !== Item && struct.constructor !== CausalHole) return null
+  if (struct.constructor !== Item && struct.constructor !== CausalHole && struct.constructor !== TerminalCausalHole) return null
+  if (struct.constructor === TerminalCausalHole) return null
   if (struct.constructor === CausalHole && sparsePlan?.isTerminalHole(/** @type {CausalHole} */ (struct))) return null
   // we may not access these variables anymore after they have been written!
   const origin = struct.origin
@@ -1557,21 +1666,23 @@ const getMissing = (struct, transaction, store, sparsePlan) => {
   // We have all missing ids, now find the items
   const originHole = origin === null ? null : store.getCausalHole(origin)
   const rightOriginHole = rightOrigin === null ? null : store.getCausalHole(rightOrigin)
+  const originTerminal = origin === null ? null : store.getTerminalCausalHole(origin)
+  const rightOriginTerminal = rightOrigin === null ? null : store.getTerminalCausalHole(rightOrigin)
   const replacesHole = store.causalHoles.intersects(item.id.client, item.id.clock, item.length)
   if (origin) {
-    if (originHole === null) {
+    if (originHole === null && originTerminal === null) {
       item.left = getItemCleanEnd(transaction, store, origin)
       // copy left id to so that the original id can be gc'd
       item.origin = item.left.lastId
     }
   }
   if (rightOrigin) {
-    if (rightOriginHole === null) {
+    if (rightOriginHole === null && rightOriginTerminal === null) {
       item.right = getItemCleanStart(transaction, rightOrigin)
       item.rightOrigin = item.right.id
     }
   }
-  if ((item.left && item.left.constructor === GC) || (item.right && item.right.constructor === GC)) {
+  if (originTerminal !== null || rightOriginTerminal !== null || (item.left && item.left.constructor === GC) || (item.right && item.right.constructor === GC)) {
     item.parent = null
   } else if (originHole !== null || rightOriginHole !== null) {
     const hole = /** @type {CausalHole} */ (originHole ?? rightOriginHole)
@@ -1587,11 +1698,11 @@ const getMissing = (struct, transaction, store, sparsePlan) => {
       item.parentSub = item.right.parentSub
     }
   } else if (parent.constructor === ID) {
-    const parentItem = store.getItem(parent)
-    if (parentItem.constructor === GC) {
+    const parentItem = store.getStruct(parent)
+    if (parentItem === null || parentItem.constructor === GC || parentItem.constructor === TerminalCausalHole) {
       item.parent = null
     } else {
-      item.parent = /** @type {ContentType} */ (parentItem.content).type
+      item.parent = /** @type {ContentType} */ (/** @type {Item} */ (parentItem).content).type
     }
   } else if (typeof parent === 'string') {
     item.parent = transaction.doc.get(parent)

@@ -1,12 +1,11 @@
 /** @typedef {import('../structs/CausalHole.js').CausalHole} CausalHole */
+/** @typedef {import('../structs/TerminalCausalHole.js').TerminalCausalHole} TerminalCausalHole */
 
 /**
  * Transaction-private sparse transport state. Weak keys keep it outside the public Transaction
  * metadata contract and release it with the transaction.
  *
- * @typedef {{clock:number,length:number}} TransportRange
- * @typedef {{ranges:Array<TransportRange>,normalized:boolean}} TransportRanges
- * @typedef {{liveHoles:Map<number,Array<CausalHole>>,terminalGc:Map<number,TransportRanges>}} SparseTransport
+ * @typedef {{liveHoles:Map<number,Array<CausalHole>>,terminalHoles:Map<number,Array<TerminalCausalHole>>}} SparseTransport
  */
 
 /** @type {WeakMap<Transaction,SparseTransport>} */
@@ -16,7 +15,7 @@ const sparseTransport = new WeakMap()
 const getOrCreate = transaction => {
   let transport = sparseTransport.get(transaction)
   if (transport === undefined) {
-    transport = { liveHoles: new Map(), terminalGc: new Map() }
+    transport = { liveHoles: new Map(), terminalHoles: new Map() }
     sparseTransport.set(transaction, transport)
   }
   return transport
@@ -33,32 +32,15 @@ export const recordLiveCausalHoles = (transaction, holes) => {
   }
 }
 
-/** @param {Transaction} transaction @param {number} client @param {number} clock @param {number} length */
-export const recordTerminalGc = (transaction, client, clock, length) => {
-  if (length <= 0) return
-  const terminalGc = getOrCreate(transaction).terminalGc
-  const clientRanges = terminalGc.get(client) ?? { ranges: [], normalized: true }
-  clientRanges.ranges.push({ clock, length })
-  clientRanges.normalized = false
-  terminalGc.set(client, clientRanges)
-}
-
-/** @param {TransportRanges} clientRanges */
-const normalizeRanges = clientRanges => {
-  if (clientRanges.normalized) return clientRanges.ranges
-  const ranges = clientRanges.ranges.sort((left, right) => left.clock - right.clock)
-  let write = 0
-  for (const current of ranges) {
-    const previous = ranges[write - 1]
-    if (previous !== undefined && current.clock <= previous.clock + previous.length) {
-      previous.length = Math.max(previous.clock + previous.length, current.clock + current.length) - previous.clock
-    } else {
-      ranges[write++] = current
-    }
+/** @param {Transaction} transaction @param {Array<TerminalCausalHole>} terminals */
+export const recordTerminalCausalHoles = (transaction, terminals) => {
+  if (terminals.length === 0) return
+  const transport = getOrCreate(transaction)
+  for (const terminal of terminals) {
+    const clientTerminals = transport.terminalHoles.get(terminal.id.client) ?? []
+    clientTerminals.push(terminal)
+    transport.terminalHoles.set(terminal.id.client, clientTerminals)
   }
-  ranges.length = write
-  clientRanges.normalized = true
-  return ranges
 }
 
 /** @param {Transaction} transaction @param {(hole:CausalHole)=>void} f */
@@ -66,21 +48,19 @@ export const forEachLiveCausalHole = (transaction, f) => {
   sparseTransport.get(transaction)?.liveHoles.forEach(holes => holes.forEach(f))
 }
 
-/** @param {Transaction} transaction @param {(client:number,clock:number,length:number)=>void} f */
-export const forEachTerminalGcRange = (transaction, f) => {
-  sparseTransport.get(transaction)?.terminalGc.forEach((clientRanges, client) => {
-    normalizeRanges(clientRanges).forEach(range => f(client, range.clock, range.length))
-  })
+/** @param {Transaction} transaction @param {(terminal:TerminalCausalHole)=>void} f */
+export const forEachTerminalCausalHole = (transaction, f) => {
+  sparseTransport.get(transaction)?.terminalHoles.forEach(terminals => terminals.forEach(f))
 }
 
 /** @param {Transaction} transaction */
 export const hasSparseTransport = transaction => {
   const transport = sparseTransport.get(transaction)
-  return transport !== undefined && (transport.liveHoles.size > 0 || transport.terminalGc.size > 0)
+  return transport !== undefined && (transport.liveHoles.size > 0 || transport.terminalHoles.size > 0)
 }
 
 /** @param {Transaction} transaction @param {number} client */
 export const hasSparseTransportClient = (transaction, client) => {
   const transport = sparseTransport.get(transaction)
-  return transport !== undefined && (transport.liveHoles.has(client) || transport.terminalGc.has(client))
+  return transport !== undefined && (transport.liveHoles.has(client) || transport.terminalHoles.has(client))
 }
