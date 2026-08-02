@@ -2524,6 +2524,49 @@ export const testAttributionResolveContentIdsExactAccept = () => {
   t.compare(counts, { base: 1, suggestion: 0, change: 1 })
 }
 
+const createInsertResolutionFixture = () => {
+  const base = new Y.Doc({ gc: false })
+  base.clientID = 1
+  base.get('text').insert(0, 'a')
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Y.ContentIds?} */
+  let ids = null
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) ids = Y.createContentIdsFromUpdate(update)
+  })
+  suggestion.get('text').insert(1, 'X')
+  const resolvedIds = /** @type {Y.ContentIds} */ (/** @type {unknown} */ (ids))
+  return { base, suggestion, renderer, ids: resolvedIds }
+}
+
+export const testAttributionResolveContentIdsAcceptObserverFailureReceipt = () => {
+  const { base, suggestion, renderer, ids } = createInsertResolutionFixture()
+  const selected = Y.mergeIdSets([ids.inserts, ids.deletes])
+  /** @type {Array<Uint8Array<ArrayBuffer>>} */
+  const updates = []
+  /** @type {Array<Y.IdSet>} */
+  const events = []
+  base.on('update', update => updates.push(update))
+  renderer.on('change', changed => events.push(changed))
+  const throwObserver = () => { throw new Error('accept observer cleanup failure') }
+  base.get('text').observe(throwObserver)
+
+  t.fails(() => renderer.resolveContentIds(ids, 'accept', {}))
+  base.get('text').unobserve(throwObserver)
+  t.assert(base.get('text').toString() === 'aX' && suggestion.get('text').toString() === 'aX', 'accept commits before observer cleanup fails')
+  t.assert(updates.length === 1 && events.length === 1)
+  const emitted = Y.createContentIdsFromUpdate(updates[0])
+  t.assert(Y.equalIdSets(Y.mergeIdSets([emitted.inserts, emitted.deletes]), selected), 'accept update contains only actionable ids')
+  t.assert(Y.equalIdSets(events[0], selected), 'accept event contains only actionable ids')
+
+  renderer.resolveContentIds(ids, 'accept', {})
+  t.assert(updates.length === 1 && events.length === 1, 'same-disposition retry is write-free')
+  t.fails(() => renderer.resolveContentIds(ids, 'reject', {}))
+  t.assert(updates.length === 1 && events.length === 1, 'opposite retry fails without writes')
+}
+
 /**
  * Expansion boundary: a later same-client insertion must remain independently reviewable even
  * when its origin is an earlier pending insertion. Encoding only the later structural range is
@@ -2841,6 +2884,40 @@ export const testAttributionResolveContentIdsExactReject = () => {
   t.compare(counts, { base: 1, suggestion: 1, change: 1 })
   t.fails(() => renderer.resolveContentIds(exactIds, 'accept', origin))
   t.compare(counts, { base: 1, suggestion: 1, change: 1 })
+}
+
+export const testAttributionResolveContentIdsRejectObserverFailureReceipt = () => {
+  for (const observerDoc of ['base', 'suggestion']) {
+    const { base, suggestion, renderer, ids } = createInsertResolutionFixture()
+    const selected = Y.mergeIdSets([ids.inserts, ids.deletes])
+    /** @type {Array<Uint8Array<ArrayBuffer>>} */
+    const baseUpdates = []
+    /** @type {Array<Uint8Array<ArrayBuffer>>} */
+    const suggestionUpdates = []
+    /** @type {Array<Y.IdSet>} */
+    const events = []
+    base.on('update', update => baseUpdates.push(update))
+    suggestion.on('update', update => suggestionUpdates.push(update))
+    renderer.on('change', changed => events.push(changed))
+    const target = observerDoc === 'base' ? base.get('text') : suggestion.get('text')
+    const throwObserver = () => { throw new Error(`${observerDoc} reject observer cleanup failure`) }
+    target.observe(throwObserver)
+
+    t.fails(() => renderer.resolveContentIds(ids, 'reject', {}))
+    target.unobserve(throwObserver)
+    t.assert(base.get('text').toString() === 'a' && suggestion.get('text').toString() === 'a', `${observerDoc} observer fails after reject commits`)
+    t.assert(baseUpdates.length === 1 && suggestionUpdates.length === 1 && events.length === 1)
+    for (const update of [...baseUpdates, ...suggestionUpdates]) {
+      const emitted = Y.createContentIdsFromUpdate(update)
+      t.assert(Y.equalIdSets(Y.mergeIdSets([emitted.inserts, emitted.deletes]), selected), 'reject update contains only actionable ids')
+    }
+    t.assert(Y.diffIdSet(events[0], selected).isEmpty(), 'reject event contains only actionable ids')
+
+    renderer.resolveContentIds(ids, 'reject', {})
+    t.assert(baseUpdates.length === 1 && suggestionUpdates.length === 1 && events.length === 1, 'same-disposition retry is write-free')
+    t.fails(() => renderer.resolveContentIds(ids, 'accept', {}))
+    t.assert(baseUpdates.length === 1 && suggestionUpdates.length === 1 && events.length === 1, 'opposite retry fails without writes')
+  }
 }
 
 export const testAttributionResolveContentIdsGcReloadNestedReject = () => {

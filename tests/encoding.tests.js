@@ -18,26 +18,32 @@ import * as Y from '../src/index.js'
 import { CausalHole, sameCausalHoleMetadata } from '../src/structs/CausalHole.js'
 
 /**
- * @param {Array<CausalHole>} holes
+ * @param {Array<Y.GC|Y.Item|Y.Skip|CausalHole>} structs
  * @param {typeof Y.UpdateEncoderV1|typeof Y.UpdateEncoderV2} Encoder
  */
-const encodeCausalHoles = (holes, Encoder) => {
-  if (holes.length === 0) throw new Error('Expected causal holes')
-  const client = holes[0].id.client
-  let clock = holes[0].id.clock
+const encodeStructs = (structs, Encoder) => {
+  if (structs.length === 0) throw new Error('Expected structs')
+  const client = structs[0].id.client
+  let clock = structs[0].id.clock
   const encoder = new Encoder()
   encoding.writeVarUint(encoder.restEncoder, 1)
-  encoding.writeVarUint(encoder.restEncoder, holes.length)
+  encoding.writeVarUint(encoder.restEncoder, structs.length)
   encoder.writeClient(client)
   encoding.writeVarUint(encoder.restEncoder, clock)
-  holes.forEach(hole => {
-    if (hole.id.client !== client || hole.id.clock !== clock) throw new Error('Causal holes must be contiguous')
-    hole.write(encoder, 0, 0)
-    clock += hole.length
+  structs.forEach(struct => {
+    if (struct.id.client !== client || struct.id.clock !== clock) throw new Error('Structs must be contiguous')
+    struct.write(encoder, 0, 0)
+    clock += struct.length
   })
   encoding.writeVarUint(encoder.restEncoder, 0)
   return encoder.toUint8Array()
 }
+
+/**
+ * @param {Array<CausalHole>} holes
+ * @param {typeof Y.UpdateEncoderV1|typeof Y.UpdateEncoderV2} Encoder
+ */
+const encodeCausalHoles = (holes, Encoder) => encodeStructs(holes, Encoder)
 
 const createCausalHoleBase = () => {
   const doc = new Y.Doc({ gc: false })
@@ -136,6 +142,129 @@ export const testCausalHoleForgedEnvelopesFailAtomically = () => {
   })
 }
 
+export const testCausalHoleParentMetadataValidation = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, event: 'update' },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, event: 'updateV2' }
+  ].forEach(({ Encoder, apply, event }) => {
+    /**
+     * @param {Y.Doc} doc
+     * @param {Uint8Array<ArrayBuffer>} update
+     */
+    const expectFailure = (doc, update) => {
+      const before = Y.encodeStateAsUpdate(doc)
+      let updates = 0
+      doc.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+      t.fails(() => apply(doc, update))
+      t.compareArrays(Array.from(Y.encodeStateAsUpdate(doc)), Array.from(before))
+      t.assert(updates === 0)
+      t.assert(doc.store.pendingStructs === null && doc.store.pendingDs === null)
+    }
+
+    const scalarParent = new Y.Doc({ gc: false })
+    scalarParent.clientID = 1
+    scalarParent.get('text').insert(0, 'a')
+    expectFailure(
+      scalarParent,
+      encodeCausalHoles([new CausalHole(Y.createID(2, 0), 1, null, null, Y.createID(1, 0), null)], Encoder)
+    )
+
+    const crossRoot = new Y.Doc({ gc: false })
+    crossRoot.clientID = 1
+    crossRoot.get('left').insert(0, 'a')
+    crossRoot.get('right').insert(0, 'b')
+    expectFailure(
+      crossRoot,
+      encodeCausalHoles([new CausalHole(Y.createID(2, 0), 1, Y.createID(1, 1), null, 'left', null)], Encoder)
+    )
+
+    const crossMap = new Y.Doc({ gc: false })
+    crossMap.clientID = 1
+    crossMap.get('map').setAttr('actual', 'value')
+    expectFailure(
+      crossMap,
+      encodeCausalHoles([new CausalHole(Y.createID(2, 0), 1, Y.createID(1, 0), null, 'map', 'forged')], Encoder)
+    )
+
+    const consumer = new Y.Doc({ gc: false })
+    consumer.clientID = 1
+    consumer.get('left').insert(0, 'a')
+    consumer.get('right').insert(0, 'b')
+    apply(consumer, encodeCausalHoles([
+      new CausalHole(Y.createID(2, 0), 1, Y.createID(1, 0), null, 'left', null)
+    ], Encoder))
+    expectFailure(
+      consumer,
+      encodeStructs([
+        new Y.Item(
+          Y.createID(3, 0),
+          null,
+          Y.createID(2, 0),
+          null,
+          Y.createID(1, 1),
+          null,
+          null,
+          new Y.ContentString('x')
+        )
+      ], Encoder)
+    )
+  })
+}
+
+export const testCausalHoleLongChainValidation = () => {
+  const length = 10000
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, apply }) => {
+    const base = createCausalHoleBase()
+    /** @type {Array<CausalHole>} */
+    const holes = []
+    for (let clock = 0; clock < length; clock++) {
+      holes.push(new CausalHole(
+        Y.createID(2, clock),
+        1,
+        clock === 0 ? Y.createID(1, 0) : Y.createID(2, clock - 1),
+        clock % 2 === 0 ? null : Y.createID(1, 0),
+        'text',
+        null
+      ))
+    }
+    apply(base, encodeCausalHoles(holes, Encoder))
+    t.assert(base.get('text').toString() === 'a')
+    t.assert(base.store.pendingStructs === null && base.store.pendingDs === null)
+    t.assert(base.store.clients.get(2)?.length === length)
+    t.assert(base.store.causalHoles.clients.get(2)?.getIds().length === 1)
+  })
+}
+
+export const testCausalHoleSparseMergeGaps = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, merge: Y.mergeUpdates, decode: Y.decodeUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, merge: Y.mergeUpdatesV2, decode: Y.decodeUpdateV2 }
+  ].forEach(({ Encoder, apply, merge, decode }) => {
+    const first = encodeCausalHoles([
+      new CausalHole(Y.createID(2, 0), 1, Y.createID(1, 0), null, 'text', null)
+    ], Encoder)
+    const last = encodeCausalHoles([
+      new CausalHole(Y.createID(2, 3), 1, Y.createID(1, 0), null, 'text', null)
+    ], Encoder)
+    const sequential = createCausalHoleBase()
+    apply(sequential, first)
+    apply(sequential, last)
+    const mergedUpdate = merge([first, last])
+    const merged = createCausalHoleBase()
+    apply(merged, mergedUpdate)
+
+    /** @param {Y.Doc} doc */
+    const signature = doc => (doc.store.clients.get(2) ?? []).map(struct => [struct.constructor.name, struct.id.clock, struct.length])
+    t.compare(signature(merged), signature(sequential))
+    t.compare(signature(merged), [['CausalHole', 0, 1], ['Skip', 1, 2], ['CausalHole', 3, 1]])
+    t.assert(decode(mergedUpdate).structs.some(struct => struct.constructor === Y.Skip && struct.id.clock === 1 && struct.length === 2))
+    t.assert(merged.store.pendingStructs === null && merged.store.pendingDs === null)
+  })
+}
+
 export const testOrdinaryUpdateEncodingExcludesCausalHoles = () => {
   const doc = new Y.Doc({ gc: false })
   doc.clientID = 7
@@ -147,6 +276,7 @@ export const testOrdinaryUpdateEncodingExcludesCausalHoles = () => {
   const v2 = Y.convertUpdateFormatV1ToV2(v1)
   const roundtrip = Y.convertUpdateFormatV2ToV1(v2)
 
+  t.compareArrays(Array.from(v1), [1, 1, 7, 0, 4, 1, 4, 116, 101, 120, 116, 8, 111, 114, 100, 105, 110, 97, 114, 121, 0])
   t.assert(!Y.decodeUpdate(v1).structs.some(struct => struct.constructor === CausalHole))
   t.assert(!Y.decodeUpdateV2(v2).structs.some(struct => struct.constructor === CausalHole))
   t.compareArrays(Array.from(v1), Array.from(roundtrip))

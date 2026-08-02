@@ -1,4 +1,5 @@
 import { Skip } from '../structs/Skip.js'
+import { Item } from '../structs/Item.js'
 import { CausalHole, sameCausalHoleMetadata } from '../structs/CausalHole.js'
 import { createID } from './ID.js'
 import { createDeleteSetFromStructStore, createIdSet } from './ids.js'
@@ -22,6 +23,8 @@ export class StructStore {
     this.pendingDs = null
     this.skips = createIdSet()
     this.causalHoles = createIdSet()
+    /** @type {Map<number,Array<{clock:number,consumer:ID,side:'origin'|'rightOrigin'}>>} */
+    this.causalHoleConsumers = new Map()
   }
 
   get ds () {
@@ -104,6 +107,7 @@ export class StructStore {
     structs.splice(startIndex, endIndex - startIndex, ...replacement)
     this.skips.delete(struct.id.client, start, struct.length)
     this.causalHoles.delete(struct.id.client, start, struct.length)
+    if (struct.constructor !== CausalHole && struct.constructor !== Skip) this._deleteCausalHoleConsumers(struct.id.client, start, struct.length)
   }
 
   /**
@@ -137,6 +141,71 @@ export class StructStore {
     const structs = this.clients.get(id.client)
     if (structs === undefined || structs.length === 0 || id.clock < structs[0].id.clock || id.clock >= this.getClock(id.client)) return null
     return /** @type {GC|Item|Skip|CausalHole} */ (structs[findIndexSS(structs, id.clock)])
+  }
+
+  /**
+   * @param {ID} anchor
+   * @param {Item} consumer
+   * @param {'origin'|'rightOrigin'} side
+   */
+  addCausalHoleConsumer (anchor, consumer, side) {
+    let entries = this.causalHoleConsumers.get(anchor.client)
+    if (entries === undefined) {
+      entries = []
+      this.causalHoleConsumers.set(anchor.client, entries)
+    }
+    let left = 0
+    let right = entries.length
+    while (left < right) {
+      const middle = (left + right) >>> 1
+      if (entries[middle].clock < anchor.clock) left = middle + 1
+      else right = middle
+    }
+    while (left < entries.length && entries[left].clock === anchor.clock) {
+      const entry = entries[left]
+      if (entry.side === side && entry.consumer.client === consumer.id.client && entry.consumer.clock === consumer.id.clock) return
+      left++
+    }
+    entries.splice(left, 0, { clock: anchor.clock, consumer: createID(consumer.id.client, consumer.id.clock), side })
+  }
+
+  /**
+   * @param {number} client
+   * @param {number} clock
+   * @param {number} length
+   */
+  getCausalHoleConsumers (client, clock, length) {
+    const entries = this.causalHoleConsumers.get(client) ?? []
+    const end = clock + length
+    let left = 0
+    let right = entries.length
+    while (left < right) {
+      const middle = (left + right) >>> 1
+      if (entries[middle].clock < clock) left = middle + 1
+      else right = middle
+    }
+    /** @type {Array<{clock:number,item:Item,side:'origin'|'rightOrigin'}>} */
+    const consumers = []
+    for (let index = left; index < entries.length && entries[index].clock < end; index++) {
+      const entry = entries[index]
+      const struct = this.getStruct(entry.consumer)
+      if (struct?.constructor === Item) consumers.push({ clock: entry.clock, item: /** @type {Item} */ (struct), side: entry.side })
+    }
+    return consumers
+  }
+
+  /**
+   * @param {number} client
+   * @param {number} clock
+   * @param {number} length
+   */
+  _deleteCausalHoleConsumers (client, clock, length) {
+    const entries = this.causalHoleConsumers.get(client)
+    if (entries === undefined) return
+    const end = clock + length
+    const remaining = entries.filter(entry => entry.clock < clock || entry.clock >= end)
+    if (remaining.length === 0) this.causalHoleConsumers.delete(client)
+    else this.causalHoleConsumers.set(client, remaining)
   }
 
   /**

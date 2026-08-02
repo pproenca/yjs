@@ -21,17 +21,17 @@ import * as math from 'lib0/math'
 import * as array from 'lib0/array'
 
 import { getStateVector, StructStore } from './StructStore.js'
-import { getItemCleanStart, getItemCleanEnd } from './transaction-helpers.js'
+import { findIndexSS, getItemCleanStart, getItemCleanEnd } from './transaction-helpers.js'
 import { createIdSet, IdRange, readAndApplyDeleteSet, readIdSet, mergeIdSets, writeIdSet } from './ids.js'
-import { createID, ID } from './ID.js'
+import { compareIDs, createID, ID } from './ID.js'
 import { UpdateDecoderV1, UpdateDecoderV2, IdSetDecoderV1 } from './UpdateDecoder.js'
 import { UpdateEncoderV1, UpdateEncoderV2, IdSetEncoderV1, IdSetEncoderV2 } from './UpdateEncoder.js'
 import { convertUpdateFormatV2ToV1, LazyStructReader, LazyStructWriter, writeStructToLazyStructWriter, finishLazyStructWriting } from './updates.js'
 import { readBlockSet, writeBlockSet } from './BlockSet.js'
 import { Skip } from '../structs/Skip.js'
-import { Item } from '../structs/Item.js'
+import { ContentType, Item } from '../structs/Item.js'
 import { GC } from '../structs/GC.js'
-import { CausalHole, sameCausalHoleMetadata } from '../structs/CausalHole.js'
+import { CausalHole, normalizeCausalHoleParent, sameCausalHoleMetadata, sameCausalHoleParent } from '../structs/CausalHole.js'
 import { Doc } from './Doc.js'
 import { writeStructs } from './encoding-helpers.js'
 
@@ -253,9 +253,17 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     const store = doc.store
     // let start = performance.now()
     const ss = readBlockSet(structDecoder)
-    const hasCausalHoles = array.from(ss.clients.values()).some(range => range.refs.some(struct => struct.constructor === CausalHole))
-    const sparseDeleteSet = hasCausalHoles ? readIdSet(structDecoder) : null
+    const ranges = array.from(ss.clients.values())
+    const hasIncomingHoles = ranges.some(range => range.refs.some(struct => struct.constructor === CausalHole))
+    const hasSparseCausality = hasIncomingHoles || (!store.causalHoles.isEmpty() && ranges.some(range => range.refs.some(struct =>
+      struct.constructor === Item && (
+        (struct.origin !== null && store.causalHoles.hasId(struct.origin)) ||
+        (struct.rightOrigin !== null && store.causalHoles.hasId(struct.rightOrigin))
+      )
+    )))
+    const sparseDeleteSet = hasSparseCausality ? readIdSet(structDecoder) : null
     validateCausalHoleEnvelope(ss, store)
+    splitIncomingItemsAtCausalHoleConsumers(ss, store)
     const knownState = createIdSet()
     ss.clients.forEach((_, client) => {
       const storeStructs = store.clients.get(client)
@@ -356,20 +364,31 @@ const applyDecodedDeleteSet = (deleteSet, transaction, store) => {
 const validateCausalHoleEnvelope = (blockSet, store) => {
   /** @type {Array<CausalHole>} */
   const incomingHoles = []
+  /** @type {Array<Item>} */
+  const incomingItems = []
   blockSet.clients.forEach(range => {
     range.refs.forEach(struct => {
       if (struct.constructor === CausalHole) incomingHoles.push(/** @type {CausalHole} */ (struct))
+      if (struct.constructor === Item) incomingItems.push(/** @type {Item} */ (struct))
     })
   })
-  if (incomingHoles.length === 0) return
+  if (incomingHoles.length === 0 && store.causalHoles.isEmpty()) return
   /**
    * @param {ID} id
    */
   const incomingAt = id => {
     const refs = blockSet.clients.get(id.client)?.refs
-    if (refs === undefined) return null
-    for (const struct of refs) {
-      if (struct.id.clock <= id.clock && id.clock < struct.id.clock + struct.length) return struct
+    if (refs === undefined || refs.length === 0 || id.clock < refs[0].id.clock) return null
+    const last = refs[refs.length - 1]
+    if (id.clock >= last.id.clock + last.length) return null
+    let left = 0
+    let right = refs.length - 1
+    while (left <= right) {
+      const middle = (left + right) >>> 1
+      const struct = refs[middle]
+      if (id.clock < struct.id.clock) right = middle - 1
+      else if (id.clock >= struct.id.clock + struct.length) left = middle + 1
+      else return struct
     }
     return null
   }
@@ -401,7 +420,9 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
   for (const hole of incomingHoles) {
     if (coveredByRealStore(hole)) continue
     const existingStructs = store.clients.get(hole.id.client) ?? []
-    for (const existing of existingStructs) {
+    if (existingStructs.length === 0 || hole.id.clock >= store.getClock(hole.id.client)) continue
+    let index = findIndexSS(existingStructs, Math.max(hole.id.clock, existingStructs[0].id.clock))
+    for (let existing = existingStructs[index]; existing !== undefined && existing.id.clock < hole.id.clock + hole.length; existing = existingStructs[++index]) {
       const start = Math.max(hole.id.clock, existing.id.clock)
       const end = Math.min(hole.id.clock + hole.length, existing.id.clock + existing.length)
       if (start >= end || existing.constructor !== CausalHole) continue
@@ -410,28 +431,190 @@ const validateCausalHoleEnvelope = (blockSet, store) => {
       }
     }
   }
-  /**
-   * @param {CausalHole} hole
-   * @param {Set<string>} path
-   */
-  const visit = (hole, path) => {
-    const key = `${hole.id.client}:${hole.id.clock}`
-    if (path.has(key)) throw new Error('Cyclic causal hole metadata')
-    const nextPath = new Set(path)
-    nextPath.add(key)
-    for (const anchor of [hole.origin, hole.rightOrigin]) {
-      if (anchor === null) continue
-      const dependency = resolve(anchor)
-      if (dependency === null) throw new Error('Missing causal hole anchor')
-      if (dependency.constructor === CausalHole) visit(/** @type {CausalHole} */ (dependency), nextPath)
-    }
-    if (typeof hole.parent !== 'string') {
-      const parent = resolve(hole.parent)
-      if (parent?.constructor !== Item) throw new Error('Causal hole parent is not materialized')
+
+  /** @param {CausalHole} hole */
+  const validateStructuralParent = hole => {
+    if (typeof hole.parent === 'string') return
+    const parent = resolve(hole.parent)
+    if (parent?.constructor !== Item || !(/** @type {Item} */ (parent).content instanceof ContentType)) {
+      throw new Error('Causal hole parent is not a materialized type')
     }
   }
-  incomingHoles.forEach(hole => {
-    if (!coveredByRealStore(hole)) visit(hole, new Set())
+
+  /** @type {Array<CausalHole>} */
+  const roots = incomingHoles.filter(hole => !coveredByRealStore(hole))
+  for (const item of incomingItems) {
+    for (const anchor of [item.origin, item.rightOrigin]) {
+      if (anchor === null) continue
+      const dependency = resolve(anchor)
+      if (dependency?.constructor === CausalHole) roots.push(/** @type {CausalHole} */ (dependency))
+    }
+  }
+  if (roots.length === 0) return
+
+  /** @type {Map<CausalHole,0|1|2>} */
+  const colors = new Map()
+  const reachable = new Set()
+  for (const root of roots) {
+    if (colors.get(root) === 2) continue
+    /** @type {Array<{hole:CausalHole,next:number}>} */
+    const stack = [{ hole: root, next: 0 }]
+    colors.set(root, 1)
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1]
+      reachable.add(frame.hole)
+      if (frame.next === 0) validateStructuralParent(frame.hole)
+      const anchors = [frame.hole.origin, frame.hole.rightOrigin]
+      if (frame.next >= anchors.length) {
+        colors.set(frame.hole, 2)
+        stack.pop()
+        continue
+      }
+      const anchor = anchors[frame.next++]
+      if (anchor === null) continue
+      const dependency = resolve(anchor)
+      if (dependency === null || dependency.constructor === Skip) throw new Error('Missing causal hole anchor')
+      if (dependency.constructor !== CausalHole) continue
+      const next = /** @type {CausalHole} */ (dependency)
+      const color = colors.get(next) ?? 0
+      if (color === 1) throw new Error('Cyclic causal hole metadata')
+      if (color === 0) {
+        colors.set(next, 1)
+        stack.push({ hole: next, next: 0 })
+      }
+    }
+  }
+
+  /** @typedef {{parent:ID|string,parentSub:string|null}} ParentMetadata */
+  /** @type {Map<Item|CausalHole,ParentMetadata>} */
+  const parentMemo = new Map()
+  /** @param {Item|CausalHole} start */
+  const getParentMetadata = start => {
+    const cached = parentMemo.get(start)
+    if (cached !== undefined) return cached
+    /** @type {Array<Item|CausalHole>} */
+    const path = []
+    const seen = new Set()
+    /** @type {Item|CausalHole} */
+    let current = start
+    /** @type {ParentMetadata|null} */
+    let metadata = null
+    while (metadata === null) {
+      const known = parentMemo.get(current)
+      if (known !== undefined) {
+        metadata = known
+        break
+      }
+      if (seen.has(current)) throw new Error('Cyclic sparse parent metadata')
+      seen.add(current)
+      path.push(current)
+      if (current.constructor === CausalHole) {
+        const hole = /** @type {CausalHole} */ (current)
+        metadata = { parent: hole.parent, parentSub: hole.parentSub }
+        break
+      }
+      const item = /** @type {Item} */ (current)
+      if (item.parent !== null) {
+        metadata = { parent: normalizeCausalHoleParent(item.parent), parentSub: item.parentSub }
+        break
+      }
+      const anchor = item.origin ?? item.rightOrigin
+      if (anchor === null) throw new Error('Sparse item parent cannot be inferred')
+      const dependency = resolve(anchor)
+      if (dependency?.constructor !== Item && dependency?.constructor !== CausalHole) throw new Error('Sparse item parent cannot be inferred')
+      current = /** @type {Item|CausalHole} */ (dependency)
+    }
+    for (const struct of path) parentMemo.set(struct, metadata)
+    return metadata
+  }
+  /** @param {ParentMetadata} actual @param {ParentMetadata} expected */
+  const assertParentMetadata = (actual, expected) => {
+    if (!sameCausalHoleParent(actual.parent, expected.parent) || actual.parentSub !== expected.parentSub) {
+      throw new Error('Conflicting causal hole parent metadata')
+    }
+  }
+
+  /** @type {Map<CausalHole,Item|null>} */
+  const leftTerminal = new Map()
+  /** @type {Map<CausalHole,Item|null>} */
+  const rightTerminal = new Map()
+  /** @param {CausalHole} start @param {boolean} left */
+  const getTerminal = (start, left) => {
+    const memo = left ? leftTerminal : rightTerminal
+    const cached = memo.get(start)
+    if (cached !== undefined || memo.has(start)) return cached ?? null
+    /** @type {Array<CausalHole>} */
+    const path = []
+    let current = start
+    /** @type {Item|null} */
+    let terminal = null
+    while (true) {
+      if (memo.has(current)) {
+        terminal = memo.get(current) ?? null
+        break
+      }
+      path.push(current)
+      const anchor = left ? current.origin : current.rightOrigin
+      if (anchor === null) break
+      const dependency = resolve(anchor)
+      if (dependency?.constructor === Item) {
+        terminal = /** @type {Item} */ (dependency)
+        break
+      }
+      if (dependency?.constructor !== CausalHole) throw new Error('Missing causal hole anchor')
+      current = /** @type {CausalHole} */ (dependency)
+    }
+    for (const hole of path) memo.set(hole, terminal)
+    return terminal
+  }
+
+  reachable.forEach(hole => {
+    const expected = { parent: hole.parent, parentSub: hole.parentSub }
+    const left = getTerminal(hole, true)
+    const right = getTerminal(hole, false)
+    if (left !== null) assertParentMetadata(getParentMetadata(left), expected)
+    if (right !== null) assertParentMetadata(getParentMetadata(right), expected)
+  })
+
+  for (const item of incomingItems) {
+    const dependencies = [item.origin, item.rightOrigin]
+      .filter(anchor => anchor !== null)
+      .map(anchor => resolve(/** @type {ID} */ (anchor)))
+    const hole = dependencies.find(dependency => dependency?.constructor === CausalHole)
+    if (hole?.constructor !== CausalHole) continue
+    const expected = getParentMetadata(/** @type {CausalHole} */ (hole))
+    assertParentMetadata(getParentMetadata(item), expected)
+    for (const dependency of dependencies) {
+      if (dependency?.constructor === Item || dependency?.constructor === CausalHole) {
+        assertParentMetadata(getParentMetadata(/** @type {Item|CausalHole} */ (dependency)), expected)
+      }
+    }
+  }
+}
+
+/**
+ * @param {BlockSet} blockSet
+ * @param {StructStore} store
+ */
+const splitIncomingItemsAtCausalHoleConsumers = (blockSet, store) => {
+  if (store.causalHoleConsumers.size === 0) return
+  blockSet.clients.forEach((range, client) => {
+    for (let index = 0; index < range.refs.length; index++) {
+      const struct = range.refs[index]
+      if (struct.constructor !== Item || !store.causalHoles.intersects(client, struct.id.clock, struct.length)) continue
+      const start = struct.id.clock
+      const end = start + struct.length
+      const boundaries = Array.from(new Set(store.getCausalHoleConsumers(client, start, struct.length)
+        .map(consumer => consumer.side === 'origin' ? consumer.clock + 1 : consumer.clock)
+        .filter(clock => start < clock && clock < end)))
+        .sort((left, right) => left - right)
+      let current = /** @type {Item} */ (struct)
+      for (const clock of boundaries) {
+        const right = current.split(null, clock - current.id.clock)
+        range.refs.splice(++index, 0, right)
+        current = right
+      }
+    }
   })
 }
 
@@ -746,21 +929,18 @@ const getMissing = (struct, transaction, store) => {
   // We have all missing ids, now find the items
   const originHole = origin === null ? null : store.getCausalHole(origin)
   const rightOriginHole = rightOrigin === null ? null : store.getCausalHole(rightOrigin)
+  const replacesHole = store.causalHoles.intersects(item.id.client, item.id.clock, item.length)
   if (origin) {
     if (originHole === null) {
       item.left = getItemCleanEnd(transaction, store, origin)
       // copy left id to so that the original id can be gc'd
       item.origin = item.left.lastId
-    } else {
-      item.left = resolveCausalHoleAnchor(transaction, store, originHole, true)
     }
   }
   if (rightOrigin) {
     if (rightOriginHole === null) {
       item.right = getItemCleanStart(transaction, rightOrigin)
       item.rightOrigin = item.right.id
-    } else {
-      item.right = resolveCausalHoleAnchor(transaction, store, rightOriginHole, false)
     }
   }
   if ((item.left && item.left.constructor === GC) || (item.right && item.right.constructor === GC)) {
@@ -788,25 +968,233 @@ const getMissing = (struct, transaction, store) => {
   } else if (typeof parent === 'string') {
     item.parent = transaction.doc.get(parent)
   }
+  if (originHole !== null && origin !== null) store.addCausalHoleConsumer(origin, item, 'origin')
+  if (rightOriginHole !== null && rightOrigin !== null) store.addCausalHoleConsumer(rightOrigin, item, 'rightOrigin')
+  if (
+    (originHole !== null || rightOriginHole !== null || replacesHole) &&
+    item.parent !== null && typeof item.parent !== 'string' && item.parent.constructor !== ID
+  ) {
+    const bounds = getVirtualInsertionBounds(transaction, store, item, /** @type {YType} */ (item.parent))
+    item.left = bounds.left
+    item.right = bounds.right
+  }
   return null
 }
 
 /**
  * @param {Transaction} transaction
  * @param {StructStore} store
- * @param {CausalHole} hole
- * @param {boolean} left
- * @param {Set<CausalHole>} [seen]
- * @return {Item|null}
+ * @param {Item} target
+ * @param {YType} parent
  */
-const resolveCausalHoleAnchor = (transaction, store, hole, left, seen = new Set()) => {
-  if (seen.has(hole)) throw new Error('Cyclic causal hole metadata')
-  seen.add(hole)
-  const anchor = left ? hole.origin : hole.rightOrigin
-  if (anchor === null) return null
-  const nested = store.getCausalHole(anchor)
-  if (nested !== null) return resolveCausalHoleAnchor(transaction, store, nested, left, seen)
-  return left ? getItemCleanEnd(transaction, store, anchor) : getItemCleanStart(transaction, anchor)
+const getVirtualInsertionBounds = (transaction, store, target, parent) => {
+  /**
+   * @typedef {{
+   *   id:ID,
+   *   length:number,
+   *   origin:ID|null,
+   *   rightOrigin:ID|null,
+   *   actual:Item|null,
+   *   target:boolean,
+   *   left:ShadowNode|null,
+   *   right:ShadowNode|null
+   * }} ShadowNode
+   */
+  /** @type {Array<{id:ID,length:number,origin:ID|null,rightOrigin:ID|null,actual:Item|null,target:boolean}>} */
+  const ranges = []
+  let current = getParentListStart(parent, target.parentSub)
+  while (current !== null) {
+    ranges.push({ id: current.id, length: current.length, origin: current.origin, rightOrigin: current.rightOrigin, actual: current, target: false })
+    current = current.right
+  }
+  const parentID = normalizeCausalHoleParent(parent)
+  store.clients.forEach(rawStructs => {
+    const structs = /** @type {Array<GC|Item|Skip|CausalHole>} */ (/** @type {unknown} */ (rawStructs))
+    for (const struct of structs) {
+      if (
+        struct.constructor !== CausalHole ||
+        !sameCausalHoleParent(struct.parent, parentID) ||
+        struct.parentSub !== target.parentSub
+      ) continue
+      const hole = /** @type {CausalHole} */ (struct)
+      if (hole.id.client !== target.id.client || hole.id.clock + hole.length <= target.id.clock || target.id.clock + target.length <= hole.id.clock) {
+        ranges.push({ id: hole.id, length: hole.length, origin: hole.origin, rightOrigin: hole.rightOrigin, actual: null, target: false })
+        continue
+      }
+      if (hole.id.clock < target.id.clock) {
+        const left = hole.slice(hole.id.clock, target.id.clock - hole.id.clock)
+        ranges.push({ id: left.id, length: left.length, origin: left.origin, rightOrigin: left.rightOrigin, actual: null, target: false })
+      }
+      const holeEnd = hole.id.clock + hole.length
+      const targetEnd = target.id.clock + target.length
+      if (targetEnd < holeEnd) {
+        const right = hole.slice(targetEnd, holeEnd - targetEnd)
+        ranges.push({ id: right.id, length: right.length, origin: right.origin, rightOrigin: right.rightOrigin, actual: null, target: false })
+      }
+    }
+  })
+  ranges.push({ id: target.id, length: target.length, origin: target.origin, rightOrigin: target.rightOrigin, actual: null, target: true })
+
+  /** @type {Map<number,Set<number>>} */
+  const boundaries = new Map()
+  /** @param {ID|null} id @param {number} offset */
+  const addBoundary = (id, offset) => {
+    if (id === null) return
+    let clocks = boundaries.get(id.client)
+    if (clocks === undefined) {
+      clocks = new Set()
+      boundaries.set(id.client, clocks)
+    }
+    clocks.add(id.clock + offset)
+  }
+  for (const range of ranges) {
+    addBoundary(range.origin, 1)
+    addBoundary(range.rightOrigin, 0)
+  }
+  store.causalHoleConsumers.forEach((entries, client) => {
+    for (const entry of entries) addBoundary(createID(client, entry.clock), entry.side === 'origin' ? 1 : 0)
+  })
+
+  /** @type {Array<ShadowNode>} */
+  const nodes = []
+  for (const range of ranges) {
+    const end = range.id.clock + range.length
+    const cuts = array.from(boundaries.get(range.id.client) ?? [])
+      .filter(clock => range.id.clock < clock && clock < end)
+      .sort((left, right) => left - right)
+    let clock = range.id.clock
+    for (const cut of cuts.concat(end)) {
+      nodes.push({
+        id: createID(range.id.client, clock),
+        length: cut - clock,
+        origin: clock === range.id.clock ? range.origin : createID(range.id.client, clock - 1),
+        rightOrigin: range.rightOrigin,
+        actual: range.actual,
+        target: range.target,
+        left: null,
+        right: null
+      })
+      clock = cut
+    }
+  }
+
+  /** @type {Map<number,Array<ShadowNode>>} */
+  const nodesByClient = new Map()
+  for (const node of nodes) {
+    const clientNodes = nodesByClient.get(node.id.client) ?? []
+    clientNodes.push(node)
+    nodesByClient.set(node.id.client, clientNodes)
+  }
+  nodesByClient.forEach(clientNodes => clientNodes.sort((left, right) => left.id.clock - right.id.clock))
+  /** @param {ID} id */
+  const getNode = id => {
+    const clientNodes = nodesByClient.get(id.client)
+    if (clientNodes === undefined) return null
+    let left = 0
+    let right = clientNodes.length - 1
+    while (left <= right) {
+      const middle = (left + right) >>> 1
+      const node = clientNodes[middle]
+      if (id.clock < node.id.clock) right = middle - 1
+      else if (id.clock >= node.id.clock + node.length) left = middle + 1
+      else return node
+    }
+    return null
+  }
+
+  /** @type {Map<ShadowNode,number>} */
+  const indegree = new Map()
+  /** @type {Map<ShadowNode,Array<ShadowNode>>} */
+  const dependents = new Map()
+  for (const node of nodes) {
+    const dependencies = new Set()
+    for (const anchor of [node.origin, node.rightOrigin]) {
+      if (anchor === null) continue
+      const dependency = getNode(anchor)
+      if (dependency === null) throw new Error('Missing virtual causal anchor')
+      if (dependency !== node) dependencies.add(dependency)
+    }
+    indegree.set(node, dependencies.size)
+    dependencies.forEach(dependency => {
+      const list = dependents.get(dependency) ?? []
+      list.push(node)
+      dependents.set(dependency, list)
+    })
+  }
+  const ready = nodes.filter(node => indegree.get(node) === 0)
+  ready.sort((left, right) => left.id.client - right.id.client || left.id.clock - right.id.clock)
+  /** @type {ShadowNode|null} */
+  let start = null
+  let integrated = 0
+  while (ready.length > 0) {
+    const node = /** @type {ShadowNode} */ (ready.pop())
+    let left = node.origin === null ? null : getNode(node.origin)
+    const right = node.rightOrigin === null ? null : getNode(node.rightOrigin)
+    if ((!left && (!right || right.left !== null)) || (left && left.right !== right)) {
+      let scan = left === null ? start : left.right
+      const conflictingItems = new Set()
+      const itemsBeforeOrigin = new Set()
+      while (scan !== null && scan !== right) {
+        itemsBeforeOrigin.add(scan)
+        conflictingItems.add(scan)
+        if (compareIDs(node.origin, scan.origin)) {
+          if (scan.id.client < node.id.client) {
+            left = scan
+            conflictingItems.clear()
+          } else if (compareIDs(node.rightOrigin, scan.rightOrigin)) {
+            break
+          }
+        } else if (scan.origin !== null) {
+          const scanOrigin = getNode(scan.origin)
+          if (scanOrigin !== null && itemsBeforeOrigin.has(scanOrigin)) {
+            if (!conflictingItems.has(scanOrigin)) {
+              left = scan
+              conflictingItems.clear()
+            }
+          } else {
+            break
+          }
+        } else {
+          break
+        }
+        scan = scan.right
+      }
+    }
+    node.left = left
+    if (left === null) {
+      node.right = start
+      start = node
+    } else {
+      node.right = left.right
+      left.right = node
+    }
+    if (node.right !== null) node.right.left = node
+    integrated++
+    for (const dependent of dependents.get(node) ?? []) {
+      const remaining = /** @type {number} */ (indegree.get(dependent)) - 1
+      indegree.set(dependent, remaining)
+      if (remaining === 0) ready.push(dependent)
+    }
+  }
+  if (integrated !== nodes.length) throw new Error('Cyclic virtual causal metadata')
+  const targets = nodes.filter(node => node.target)
+  if (targets.length !== 1) throw new Error('Sparse replacement must split at virtual consumers')
+  let shadowLeft = targets[0].left
+  while (shadowLeft !== null && shadowLeft.actual === null) shadowLeft = shadowLeft.left
+  let shadowRight = targets[0].right
+  while (shadowRight !== null && shadowRight.actual === null) shadowRight = shadowRight.right
+  return {
+    left: shadowLeft === null ? null : getItemCleanEnd(transaction, store, createID(shadowLeft.id.client, shadowLeft.id.clock + shadowLeft.length - 1)),
+    right: shadowRight === null ? null : getItemCleanStart(transaction, createID(shadowRight.id.client, shadowRight.id.clock))
+  }
+}
+
+/** @param {YType} parent @param {string|null} parentSub */
+const getParentListStart = (parent, parentSub) => {
+  if (parentSub === null) return parent._start
+  let item = parent._map.get(parentSub) ?? null
+  while (item !== null && item.left !== null) item = item.left
+  return item
 }
 
 /**
@@ -819,8 +1207,8 @@ const resolveCausalHoleParent = (transaction, store, hole) => {
   if (typeof hole.parent === 'string') return transaction.doc.get(hole.parent)
   if (store.getCausalHole(hole.parent) !== null) throw new Error('Causal hole parent is not materialized')
   const parentItem = store.getItem(hole.parent)
-  if (parentItem.constructor !== Item) throw new Error('Causal hole parent is not materialized')
-  return /** @type {ContentType} */ (parentItem.content).type
+  if (parentItem.constructor !== Item || !(parentItem.content instanceof ContentType)) throw new Error('Causal hole parent is not a materialized type')
+  return parentItem.content.type
 }
 
 /**

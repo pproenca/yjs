@@ -164,6 +164,144 @@ const createSplitSparseFixture = () => {
 }
 
 /**
+ * @param {'origin'|'rightOrigin'} anchorSide
+ * @param {number} sourceClient
+ * @param {number} concurrentClient
+ */
+const createVirtualAnchorFixture = (anchorSide, sourceClient, concurrentClient) => {
+  const seed = new Y.Doc({ gc: false })
+  seed.clientID = 10
+  seed.get('text').insert(0, 'a')
+  const baseline = Y.encodeStateAsUpdate(seed)
+  const base = Y.cloneDoc(seed, { gc: false })
+  const suggestion = Y.cloneDoc(seed, { gc: false, isSuggestionDoc: true })
+  suggestion.clientID = sourceClient
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Array<Uint8Array<ArrayBuffer>>} */
+  const sourceUpdates = []
+  /** @type {Array<Y.ContentIds>} */
+  const changes = []
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) {
+      sourceUpdates.push(update)
+      changes.push(Y.createContentIdsFromUpdate(update))
+    }
+  })
+  const text = suggestion.get('text')
+  if (anchorSide === 'origin') {
+    text.insert(1, 'X')
+    text.insert(2, 'Y')
+  } else {
+    text.insert(0, 'X')
+    text.insert(0, 'Y')
+  }
+
+  const concurrent = Y.createDocFromUpdate(baseline, { gc: false })
+  concurrent.clientID = concurrentClient
+  /** @type {Uint8Array<ArrayBuffer>|null} */
+  let concurrentUpdate = null
+  concurrent.on('update', update => { concurrentUpdate = update })
+  concurrent.get('text').insert(anchorSide === 'origin' ? 1 : 0, 'C')
+  const concurrentWire = /** @type {Uint8Array<ArrayBuffer>} */ (/** @type {unknown} */ (concurrentUpdate))
+  Y.applyUpdate(base, concurrentWire)
+  Y.applyUpdate(suggestion, concurrentWire)
+
+  /** @type {Uint8Array<ArrayBuffer>|null} */
+  let sparseUpdate = null
+  base.on('update', update => { sparseUpdate = update })
+  renderer.resolveContentIds(changes[1], 'accept', {})
+  const sparseWire = /** @type {Uint8Array<ArrayBuffer>} */ (/** @type {unknown} */ (sparseUpdate))
+  return {
+    anchorSide,
+    sourceClient,
+    baseline,
+    concurrentUpdate: concurrentWire,
+    sourceUpdates,
+    changes,
+    sparseUpdate: sparseWire
+  }
+}
+
+const createInteriorConsumerFixture = () => {
+  const seed = new Y.Doc({ gc: false })
+  seed.clientID = 10
+  seed.get('text').insert(0, 'a')
+  const baseline = Y.encodeStateAsUpdate(seed)
+  const base = Y.cloneDoc(seed, { gc: false })
+  const suggestion = Y.cloneDoc(seed, { gc: false, isSuggestionDoc: true })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Array<Uint8Array<ArrayBuffer>>} */
+  const sourceUpdates = []
+  /** @type {Array<Y.ContentIds>} */
+  const changes = []
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) {
+      sourceUpdates.push(update)
+      changes.push(Y.createContentIdsFromUpdate(update))
+    }
+  })
+  const text = suggestion.get('text')
+  text.insert(1, 'AB')
+  text.insert(2, 'k')
+  text.insert(2, 'l')
+  text.insert(5, 'm')
+
+  const concurrent = Y.createDocFromUpdate(baseline, { gc: false })
+  concurrent.clientID = 6
+  /** @type {Uint8Array<ArrayBuffer>|null} */
+  let concurrentUpdate = null
+  concurrent.on('update', update => { concurrentUpdate = update })
+  concurrent.get('text').insert(1, 'C')
+  const concurrentWire = /** @type {Uint8Array<ArrayBuffer>} */ (/** @type {unknown} */ (concurrentUpdate))
+  Y.applyUpdate(base, concurrentWire)
+  Y.applyUpdate(suggestion, concurrentWire)
+
+  const selected = Y.createContentIds(
+    Y.mergeIdSets(changes.slice(1).map(change => change.inserts)),
+    Y.mergeIdSets(changes.slice(1).map(change => change.deletes))
+  )
+  /** @type {Uint8Array<ArrayBuffer>|null} */
+  let sparseUpdate = null
+  base.on('update', update => { sparseUpdate = update })
+  renderer.resolveContentIds(selected, 'accept', {})
+  const sparseWire = /** @type {Uint8Array<ArrayBuffer>} */ (/** @type {unknown} */ (sparseUpdate))
+  return {
+    baseline,
+    concurrentUpdate: concurrentWire,
+    sourceUpdates,
+    selected,
+    sparseUpdate: sparseWire
+  }
+}
+
+/** @param {Y.Doc} canonical @param {Y.Doc} actual @param {SparseEnc} enc @param {string} label */
+const assertSparseConvergence = (canonical, actual, enc, label) => {
+  /** @param {Y.Doc} doc */
+  const signature = doc => array.from(doc.store.clients.entries())
+    .sort(([left], [right]) => left - right)
+    .flatMap(([client, structs]) => structs.map(struct => [client, struct.id.clock, struct.length, struct.constructor.name]))
+  /** @param {Y.Doc} doc */
+  const linkedOrder = doc => {
+    const ids = []
+    let item = doc.get('text')._start
+    while (item !== null) {
+      ids.push([item.id.client, item.id.clock, item.length, item.deleted])
+      item = item.right
+    }
+    return ids
+  }
+  t.compare(signature(actual), signature(canonical), `${label} store coverage`)
+  t.compare(linkedOrder(actual), linkedOrder(canonical), `${label} linked order`)
+  t.assert(actual.get('text').toDelta().equals(canonical.get('text').toDelta()), `${label} delta`)
+  t.compareArrays(Array.from(Y.encodeStateVector(actual)), Array.from(Y.encodeStateVector(canonical)))
+  t.compareArrays(Array.from(enc.encodeStateAsUpdate(actual)), Array.from(enc.encodeStateAsUpdate(canonical)))
+  const diff = Y.createDiffRenderer(canonical, actual)
+  t.assert(diff.inserts.isEmpty() && diff.deletes.isEmpty(), `${label} structural diff`)
+  diff.destroy()
+}
+
+/**
  * @param {Array<Y.Doc>} users
  * @param {Enc} enc
  */
@@ -315,6 +453,111 @@ export const testSparseCausalHoleSplitArrivalMatrix = () => {
     t.assert(realPreferred.get('text').toString() === 'aXYZW', `${enc.description} merge prefers real content`)
     t.assert(realPreferred.store.causalHoles.isEmpty())
   })
+}
+
+export const testSparseCausalHoleVirtualAnchorConvergenceMatrix = () => {
+  for (const anchorSide of /** @type {const} */ (['origin', 'rightOrigin'])) {
+    for (const [sourceClient, concurrentClient] of [[4, 2], [2, 6]]) {
+      const fixture = createVirtualAnchorFixture(anchorSide, sourceClient, concurrentClient)
+      sparseEncoders.forEach(enc => {
+        const canonical = new Y.Doc({ gc: false })
+        ;[fixture.baseline, ...fixture.sourceUpdates, fixture.concurrentUpdate].forEach(update => {
+          enc.applyUpdate(canonical, enc.convert(update))
+        })
+        const expected = canonical.get('text').toString()
+        const expectedSparse = expected.replace('X', '')
+        const sparse = enc.convert(fixture.sparseUpdate)
+        const sparseIds = enc.readUpdateToContentIds(sparse)
+        t.assert(Y.equalIdSets(sparseIds.inserts, fixture.changes[1].inserts) && Y.equalIdSets(sparseIds.deletes, fixture.changes[1].deletes), `${enc.description} ${anchorSide} sparse ids do not expand`)
+
+        const target = new Y.Doc({ gc: false })
+        enc.applyUpdate(target, enc.convert(fixture.baseline))
+        enc.applyUpdate(target, enc.convert(fixture.concurrentUpdate))
+        enc.applyUpdate(target, sparse)
+        t.assert(target.get('text').toString() === expectedSparse, `${enc.description} ${anchorSide} sparse order matches canonical projection`)
+        t.assert(target.store.pendingStructs === null && target.store.pendingDs === null)
+
+        const reloaded = new Y.Doc({ gc: false })
+        enc.applyUpdate(reloaded, enc.encodeStateAsUpdate(target))
+        t.assert(reloaded.get('text').toString() === expectedSparse, `${enc.description} ${anchorSide} reload preserves virtual placement`)
+        t.assert(reloaded.store.getCausalHoleConsumers(fixture.sourceClient, 0, 1).length === 1, `${enc.description} ${anchorSide} reload rebuilds the consumer index`)
+        enc.applyUpdate(reloaded, enc.convert(fixture.sourceUpdates[0]))
+
+        t.assert(reloaded.get('text').toString() === expected, `${enc.description} ${anchorSide} replacement converges`)
+        t.assert(reloaded.store.causalHoles.isEmpty())
+        t.assert(reloaded.store.pendingStructs === null && reloaded.store.pendingDs === null)
+        assertSparseConvergence(canonical, reloaded, enc, `${enc.description} ${anchorSide}`)
+      })
+    }
+  }
+}
+
+export const testSparseCausalHoleInteriorConsumerConvergenceMatrix = () => {
+  const fixture = createInteriorConsumerFixture()
+  sparseEncoders.forEach(enc => {
+    const source = enc.convert(fixture.sourceUpdates[0])
+    const sourceStruct = enc.decodeUpdate(source).structs.find(struct => struct.id.client === 2 && struct.id.clock === 0)
+    t.assert(sourceStruct?.constructor === Y.Item && sourceStruct.length === 2, `${enc.description} replacement arrives as one unsplit range`)
+    const sparse = enc.convert(fixture.sparseUpdate)
+    const sparseIds = enc.readUpdateToContentIds(sparse)
+    t.assert(Y.equalIdSets(sparseIds.inserts, fixture.selected.inserts) && Y.equalIdSets(sparseIds.deletes, fixture.selected.deletes), `${enc.description} interior selection does not expand`)
+
+    const canonical = new Y.Doc({ gc: false })
+    ;[fixture.baseline, ...fixture.sourceUpdates, fixture.concurrentUpdate].forEach(update => {
+      enc.applyUpdate(canonical, enc.convert(update))
+    })
+    t.assert(canonical.get('text').toString() === 'aAlkBmC')
+
+    const sparseDoc = new Y.Doc({ gc: false })
+    enc.applyUpdate(sparseDoc, enc.convert(fixture.baseline))
+    enc.applyUpdate(sparseDoc, enc.convert(fixture.concurrentUpdate))
+    enc.applyUpdate(sparseDoc, sparse)
+    t.assert(sparseDoc.get('text').toString() === 'alkmC', `${enc.description} interior sparse order matches canonical projection`)
+
+    const reloaded = new Y.Doc({ gc: false })
+    enc.applyUpdate(reloaded, enc.encodeStateAsUpdate(sparseDoc))
+    t.assert(reloaded.get('text').toString() === 'alkmC')
+    t.assert(reloaded.store.getCausalHoleConsumers(2, 0, 2).length === 4, `${enc.description} reload rebuilds interior consumers`)
+    enc.applyUpdate(reloaded, source)
+
+    t.assert(reloaded.get('text').toString() === 'aAlkBmC', `${enc.description} unsplit replacement converges`)
+    t.assert(reloaded.store.causalHoles.isEmpty())
+    t.assert(reloaded.store.pendingStructs === null && reloaded.store.pendingDs === null)
+    const first = reloaded.store.getStruct(Y.createID(2, 0))
+    const second = reloaded.store.getStruct(Y.createID(2, 1))
+    t.assert(first?.constructor === Y.Item && first.length === 1 && second?.constructor === Y.Item && second.length === 1, `${enc.description} replacement splits at virtual consumers`)
+    assertSparseConvergence(canonical, reloaded, enc, `${enc.description} interior consumers`)
+  })
+}
+
+export const testSparseCausalHoleLargeRangeCoalescing = () => {
+  const length = 100000
+  const base = new Y.Doc({ gc: false })
+  base.clientID = 1
+  base.get('text').insert(0, 'a')
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  suggestion.get('text').insert(1, 'X'.repeat(length - 1) + 'Z')
+  const selected = Y.createIdSet()
+  selected.add(2, length - 1, 1)
+  /** @type {Uint8Array<ArrayBuffer>|null} */
+  let sparse = null
+  base.on('update', update => { sparse = update })
+  renderer.resolveContentIds(Y.createContentIds(selected), 'accept', {})
+  const v1 = /** @type {Uint8Array<ArrayBuffer>} */ (/** @type {unknown} */ (sparse))
+
+  ;[
+    Y.decodeUpdate(v1).structs,
+    Y.decodeUpdateV2(Y.convertUpdateFormatV1ToV2(v1)).structs
+  ].forEach(structs => {
+    const holes = structs.filter(struct => struct.constructor === CausalHole)
+    t.assert(holes.length === 1)
+    t.assert(holes[0].id.clock === 0 && holes[0].length === length - 1)
+  })
+  t.assert(base.get('text').toString() === 'aZ')
+  t.assert(base.store.causalHoles.clients.get(2)?.getIds().length === 1)
+  t.assert(base.store.pendingStructs === null && base.store.pendingDs === null)
 }
 
 /**

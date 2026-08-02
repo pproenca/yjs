@@ -5,9 +5,9 @@ import * as array from 'lib0/array'
 import { findIndexSS } from './transaction-helpers.js'
 import { Skip } from '../structs/Skip.js'
 import { Item } from '../structs/Item.js'
-import { CausalHole, createCausalHoleFromItem, sameCausalHoleMetadata } from '../structs/CausalHole.js'
+import { CausalHole, CausalHoleIndex, createCausalHoleFromItem } from '../structs/CausalHole.js'
 import { createID } from './ID.js'
-import { writeIdSet } from './ids.js'
+import { createIdSet, intersectSets, mergeIdSets, writeIdSet } from './ids.js'
 
 /**
  * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
@@ -120,15 +120,21 @@ export const writeStructsFromIdSetWithExistingCausalHoles = (encoder, sourceStor
  * @param {boolean} synthesize
  */
 const collectCausalHoles = (sourceStore, selected, knownStores, synthesize) => {
-  /** @type {Map<string,CausalHole>} */
-  const holes = new Map()
-  /**
-   * @param {ID} id
-   */
-  const isKnown = id => knownStores.length > 0 && knownStores.every(store => {
-    if (id.clock >= store.getClock(id.client) || store.skips.hasId(id) || store.causalHoles.hasId(id)) return false
-    return store.getStruct(id)?.constructor === Item
-  })
+  const holes = new CausalHoleIndex()
+  /** @type {IdSet|null} */
+  let known = null
+  for (const store of knownStores) {
+    const materialized = createIdSet()
+    store.clients.forEach((structs, client) => {
+      for (const struct of structs) {
+        if (struct.constructor === Item) materialized.add(client, struct.id.clock, struct.length)
+      }
+    })
+    known = known === null ? materialized : intersectSets(known, materialized)
+  }
+  const available = mergeIdSets(known === null ? [selected] : [selected, known])
+  /** @param {ID} id */
+  const isKnown = id => known?.hasId(id) ?? false
   /** @param {ID} id */
   const isSourceMaterialized = id => id.clock < sourceStore.getClock(id.client) &&
     !sourceStore.skips.hasId(id) && !sourceStore.causalHoles.hasId(id) && sourceStore.getStruct(id)?.constructor === Item
@@ -139,37 +145,12 @@ const collectCausalHoles = (sourceStore, selected, knownStores, synthesize) => {
     if (typeof parent === 'string' || selected.hasId(parent) || isKnown(parent) || (!synthesize && isSourceMaterialized(parent))) return
     throw new Error('Selected content has an unavailable structural parent')
   }
-  /**
-   * @param {ID|null} id
-   * @param {Set<string>} path
-   */
-  const visitAnchor = (id, path) => {
-    if (id === null || selected.hasId(id) || isKnown(id)) return
-    const key = `${id.client}:${id.clock}`
-    if (path.has(key)) throw new Error('Cyclic causal hole metadata')
-    const source = sourceStore.getStruct(id)
-    if (!synthesize && (source === null || source.constructor === Skip)) return
-    if (source === null || source.constructor === Skip) {
-      throw new Error('Missing causal anchor')
-    }
-    if (!synthesize && source.constructor !== CausalHole) return
-    let hole
-    if (source.constructor === CausalHole) {
-      hole = /** @type {CausalHole} */ (source).slice(id.clock, 1)
-    } else if (source.constructor === Item) {
-      hole = createCausalHoleFromItem(/** @type {Item} */ (source), id.clock, 1)
-    } else {
-      throw new Error('Missing causal anchor')
-    }
-    const previous = holes.get(key)
-    if (previous !== undefined && !sameCausalHoleMetadata(previous, hole)) throw new Error('Conflicting causal hole metadata')
-    if (previous !== undefined) return
-    holes.set(key, hole)
-    requireParent(hole.parent)
-    const nextPath = new Set(path)
-    nextPath.add(key)
-    visitAnchor(hole.origin, nextPath)
-    visitAnchor(hole.rightOrigin, nextPath)
+  /** @type {Array<ID>} */
+  const pending = []
+  const processed = new Set()
+  /** @param {ID|null} id */
+  const queueAnchor = id => {
+    if (id !== null && !available.hasId(id)) pending.push(id)
   }
   selected.forEach((range, client) => {
     const structs = sourceStore.clients.get(client)
@@ -185,19 +166,72 @@ const collectCausalHoles = (sourceStore, selected, knownStores, synthesize) => {
       const sliceEnd = Math.min(end, struct.id.clock + struct.length)
       const metadata = createCausalHoleFromItem(/** @type {Item} */ (struct), clock, sliceEnd - clock)
       requireParent(metadata.parent)
-      visitAnchor(metadata.origin, new Set())
-      visitAnchor(metadata.rightOrigin, new Set())
+      queueAnchor(metadata.origin)
+      queueAnchor(metadata.rightOrigin)
       clock = sliceEnd
     }
   })
+  while (pending.length > 0) {
+    const id = /** @type {ID} */ (pending.pop())
+    const key = `${id.client}:${id.clock}`
+    if (processed.has(key) || available.hasId(id)) continue
+    processed.add(key)
+    const source = sourceStore.getStruct(id)
+    if (!synthesize && (source === null || source.constructor === Skip || source.constructor !== CausalHole)) continue
+    if (source === null || source.constructor === Skip || (source.constructor !== Item && source.constructor !== CausalHole)) {
+      throw new Error('Missing causal anchor')
+    }
+    const segment = available.slice(source.id.client, source.id.clock, source.length)
+      .find(slice => !slice.exists && slice.clock <= id.clock && id.clock < slice.clock + slice.len)
+    if (segment === undefined) continue
+    const hole = source.constructor === CausalHole
+      ? /** @type {CausalHole} */ (source).slice(segment.clock, segment.len)
+      : createCausalHoleFromItem(/** @type {Item} */ (source), segment.clock, segment.len)
+    holes.add(hole)
+    requireParent(hole.parent)
+    queueAnchor(hole.origin)
+    queueAnchor(hole.rightOrigin)
+  }
+  assertAcyclicCausalHoles(holes)
   return holes
+}
+
+/** @param {CausalHoleIndex} holes */
+const assertAcyclicCausalHoles = holes => {
+  /** @type {Map<CausalHole,0|1|2>} */
+  const colors = new Map()
+  for (const root of holes.values()) {
+    if (colors.get(root) === 2) continue
+    /** @type {Array<{hole:CausalHole,next:number}>} */
+    const stack = [{ hole: root, next: 0 }]
+    colors.set(root, 1)
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1]
+      const anchors = [frame.hole.origin, frame.hole.rightOrigin]
+      if (frame.next >= anchors.length) {
+        colors.set(frame.hole, 2)
+        stack.pop()
+        continue
+      }
+      const anchor = anchors[frame.next++]
+      if (anchor === null) continue
+      const dependency = holes.get(anchor)
+      if (dependency === null) continue
+      const color = colors.get(dependency) ?? 0
+      if (color === 1) throw new Error('Cyclic causal hole metadata')
+      if (color === 0) {
+        colors.set(dependency, 1)
+        stack.push({ hole: dependency, next: 0 })
+      }
+    }
+  }
 }
 
 /**
  * @param {UpdateEncoderV1|UpdateEncoderV2} encoder
  * @param {StructStore} sourceStore
  * @param {IdSet} selected
- * @param {Map<string,CausalHole>} holes
+ * @param {CausalHoleIndex} holes
  */
 const writeSparseSelection = (encoder, sourceStore, selected, holes) => {
   /** @type {Map<number,Array<{struct:Item|CausalHole,start:number,end:number}>>} */

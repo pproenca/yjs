@@ -363,7 +363,13 @@ const mergeSparseRefs = (left, right) => {
     const r = right[ri]?.id.clock <= clock && clock < right[ri].id.clock + right[ri].length ? right[ri] : null
     const lrank = l === null || l.constructor === Skip ? 0 : l.constructor === CausalHole ? 1 : 2
     const rrank = r === null || r.constructor === Skip ? 0 : r.constructor === CausalHole ? 1 : 2
-    if (lrank === 0 && rrank === 0 && l === null && r === null) continue
+    if (lrank === 0 && rrank === 0 && l === null && r === null) {
+      const previous = result[result.length - 1]
+      const skip = new Skip(createID(left[0]?.id.client ?? right[0].id.client, clock), length)
+      const merged = previous?.constructor === Skip && /** @type {Skip} */ (previous).mergeWith(skip)
+      if (!merged) result.push(skip)
+      continue
+    }
     if (lrank === 1 && rrank === 1) {
       const ls = /** @type {CausalHole} */ (l).slice(clock, length)
       const rs = /** @type {CausalHole} */ (r).slice(clock, length)

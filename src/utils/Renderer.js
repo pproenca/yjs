@@ -654,26 +654,36 @@ export class DiffRenderer extends ObservableV2 {
       update = prepareRejectUpdate(this, actionable)
     }
 
+    const recordReceipt = () => {
+      if (
+        projection.prevDoc.store.pendingStructs !== null || projection.prevDoc.store.pendingDs !== null ||
+        projection.nextDoc.store.pendingStructs !== null || projection.nextDoc.store.pendingDs !== null
+      ) {
+        throw new Error('Diff resolution produced incomplete document stores')
+      }
+      insertIntoIdSet(receipt.inserts, actionable.inserts)
+      insertIntoIdSet(receipt.deletes, actionable.deletes)
+    }
     if (disposition === 'accept') {
-      applyUpdate(projection.prevDoc, update, origin)
+      projection.prevDoc.transact(() => {
+        applyUpdate(projection.prevDoc, update, origin)
+        recordReceipt()
+      }, origin, false)
     } else {
       projection.nextDoc.transact(tr => {
         applyUpdate(projection.nextDoc, update)
-        applyUpdate(projection.prevDoc, update, origin)
-        // `applyUpdate` forces an enclosing transaction remote. This is still the local reject
-        // transaction; restoring the flag also prevents the scratch-generated ids from rotating
-        // the suggestion document's client id during cleanup.
-        tr.local = true
+        try {
+          projection.prevDoc.transact(() => {
+            applyUpdate(projection.prevDoc, update, origin)
+            recordReceipt()
+          }, origin, false)
+        } finally {
+          // Base observers may feed the update back into this enclosing suggestion transaction.
+          // It remains the local reject transaction even when either document's cleanup throws.
+          tr.local = true
+        }
       }, origin)
     }
-    if (
-      projection.prevDoc.store.pendingStructs !== null || projection.prevDoc.store.pendingDs !== null ||
-      projection.nextDoc.store.pendingStructs !== null || projection.nextDoc.store.pendingDs !== null
-    ) {
-      throw new Error('Diff resolution produced incomplete document stores')
-    }
-    insertIntoIdSet(receipt.inserts, actionable.inserts)
-    insertIntoIdSet(receipt.deletes, actionable.deletes)
   }
 
   /**

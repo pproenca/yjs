@@ -17,7 +17,7 @@ const validID = id => id === null || (Number.isSafeInteger(id.client) && id.clie
  * @param {YType|ID|string} parent
  * @return {ID|string}
  */
-const normalizeParent = parent => {
+export const normalizeCausalHoleParent = parent => {
   if (typeof parent === 'string') return parent
   if (parent.constructor === ID) return createID(/** @type {ID} */ (parent).client, /** @type {ID} */ (parent).clock)
   const item = /** @type {YType} */ (parent)._item
@@ -50,7 +50,7 @@ export class CausalHole {
     this.length = length
     this.origin = copyID(origin)
     this.rightOrigin = copyID(rightOrigin)
-    this.parent = normalizeParent(parent)
+    this.parent = normalizeCausalHoleParent(parent)
     this.parentSub = parentSub
   }
 
@@ -189,7 +189,89 @@ export const createCausalHoleFromItem = (item, clock, length) => {
     length,
     offset === 0 ? item.origin : createID(item.id.client, clock - 1),
     item.rightOrigin,
-    normalizeParent(item.parent),
+    normalizeCausalHoleParent(item.parent),
     item.parentSub
   )
+}
+
+export class CausalHoleIndex {
+  constructor () {
+    /** @type {Map<number,Array<CausalHole>>} */
+    this.clients = new Map()
+  }
+
+  get size () {
+    let size = 0
+    this.clients.forEach(holes => { size += holes.length })
+    return size
+  }
+
+  /** @param {ID} id */
+  get (id) {
+    const holes = this.clients.get(id.client)
+    if (holes === undefined) return null
+    let left = 0
+    let right = holes.length - 1
+    while (left <= right) {
+      const middle = (left + right) >>> 1
+      const hole = holes[middle]
+      if (id.clock < hole.id.clock) right = middle - 1
+      else if (id.clock >= hole.id.clock + hole.length) left = middle + 1
+      else return hole
+    }
+    return null
+  }
+
+  /** @param {CausalHole} hole */
+  add (hole) {
+    const candidate = hole.slice(hole.id.clock, hole.length)
+    const holes = this.clients.get(hole.id.client) ?? []
+    const start = candidate.id.clock
+    const end = start + candidate.length
+    let left = 0
+    let right = holes.length
+    while (left < right) {
+      const middle = (left + right) >>> 1
+      if (holes[middle].id.clock + holes[middle].length <= start) left = middle + 1
+      else right = middle
+    }
+    const overlapStart = left
+    /** @type {Array<CausalHole>} */
+    const pending = []
+    let cursor = start
+    while (left < holes.length && holes[left].id.clock < end) {
+      const existing = holes[left]
+      if (cursor < existing.id.clock) pending.push(candidate.slice(cursor, existing.id.clock - cursor))
+      const overlapClock = Math.max(start, existing.id.clock)
+      const overlapEnd = Math.min(end, existing.id.clock + existing.length)
+      if (!sameCausalHoleMetadata(existing.slice(overlapClock, overlapEnd - overlapClock), candidate.slice(overlapClock, overlapEnd - overlapClock))) {
+        throw new Error('Conflicting causal hole metadata')
+      }
+      cursor = Math.max(cursor, overlapEnd)
+      left++
+    }
+    if (cursor < end) pending.push(candidate.slice(cursor, end - cursor))
+    if (pending.length === 0) return
+    const replaceStart = overlapStart > 0 && holes[overlapStart - 1].id.clock + holes[overlapStart - 1].length === start ? overlapStart - 1 : overlapStart
+    const replaceEnd = left < holes.length && holes[left].id.clock === end ? left + 1 : left
+    const merged = holes.slice(replaceStart, replaceEnd).concat(pending).sort((left, right) => left.id.clock - right.id.clock).reduce((result, current) => {
+      const previous = result[result.length - 1]
+      if (previous === undefined || !previous.mergeWith(current)) result.push(current)
+      return result
+    }, /** @type {Array<CausalHole>} */ ([]))
+    holes.splice(replaceStart, replaceEnd - replaceStart, ...merged)
+    this.clients.set(hole.id.client, holes)
+  }
+
+  /** @param {(hole:CausalHole)=>void} f */
+  forEach (f) {
+    this.clients.forEach(holes => holes.forEach(f))
+  }
+
+  values () {
+    /** @type {Array<CausalHole>} */
+    const holes = []
+    this.forEach(hole => holes.push(hole))
+    return holes
+  }
 }
