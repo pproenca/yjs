@@ -265,7 +265,9 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
       store.causalHoles.intersects(struct.id.client, struct.id.clock, struct.length)
     )
   )))
-  const sparseDeleteSet = hasSparseCausality ? readIdSet(structDecoder) : null
+  // Sparse documents decode the complete envelope before opening a transaction. Besides validating
+  // causal-hole updates, this keeps malformed ordinary Item updates from partially mutating them.
+  const sparseDeleteSet = ydoc.sparseExactResolution || hasSparseCausality ? readIdSet(structDecoder) : null
   const sparseValidation = validateCausalHoleEnvelope(ss, store)
   const sparsePlan = sparseValidation === null ? null : createSparseIntegrationPlan(ss, store, ydoc, sparseValidation)
 
@@ -1305,7 +1307,11 @@ export const writeStateAsUpdate = (encoder, doc, targetStateVector = new Map()) 
 export const encodeStateAsUpdateV2 = (doc, encodedTargetStateVector = new Uint8Array([0]), encoder = new UpdateEncoderV2()) => {
   const targetStateVector = decodeStateVector(encodedTargetStateVector)
   writeStateAsUpdate(encoder, doc, targetStateVector)
-  const updates = [encoder.toUint8Array()]
+  const stateUpdate = encoder.toUint8Array()
+  if (doc.sparseExactResolution && (doc.store.pendingDs || doc.store.pendingStructs)) {
+    return encodeSparseStateWithPending(doc, stateUpdate, encodedTargetStateVector, encoder)
+  }
+  const updates = [stateUpdate]
   // also add the pending updates (if there are any)
   if (doc.store.pendingDs) {
     updates.push(doc.store.pendingDs)
@@ -1321,6 +1327,54 @@ export const encodeStateAsUpdateV2 = (doc, encodedTargetStateVector = new Uint8A
     }
   }
   return updates[0]
+}
+
+/**
+ * Serialize a sparse document's authoritative state and unresolved transport as one update without
+ * relaxing the public merge API. Pending refs are decoded, checked against the live sparse store,
+ * and merged only after the sparse envelope and virtual geometry validate.
+ *
+ * @param {Doc} doc
+ * @param {Uint8Array<ArrayBuffer>} stateUpdate
+ * @param {Uint8Array} encodedTargetStateVector
+ * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
+ */
+const encodeSparseStateWithPending = (doc, stateUpdate, encodedTargetStateVector, encoder) => {
+  const isV1 = encoder.constructor === UpdateEncoderV1
+  const Decoder = isV1 ? UpdateDecoderV1 : UpdateDecoderV2
+  const stateDecoder = new Decoder(decoding.createDecoder(stateUpdate))
+  const blocks = readBlockSet(stateDecoder)
+  const deleteSets = [readIdSet(stateDecoder)]
+
+  if (doc.store.pendingStructs) {
+    const pendingUpdate = diffUpdateV2(doc.store.pendingStructs.update, encodedTargetStateVector)
+    const pendingDecoder = new UpdateDecoderV2(decoding.createDecoder(pendingUpdate))
+    const pendingBlocks = readBlockSet(pendingDecoder)
+    const pendingRanges = array.from(pendingBlocks.clients.values())
+    if (pendingRanges.some(range => range.refs.some(struct => struct.constructor === GC))) {
+      throw new Error('Sparse exact-resolution pending state rejects plain GC')
+    }
+    const hasPendingHoles = pendingRanges.some(range => range.refs.some(struct => struct.constructor === CausalHole))
+    if (hasPendingHoles) normalizeIncomingCausalHoles(pendingBlocks, doc.store)
+    const validation = validateCausalHoleEnvelope(pendingBlocks, doc.store)
+    if (validation !== null) createSparseIntegrationPlan(pendingBlocks, doc.store, doc, validation)
+    blocks.insertInto(pendingBlocks)
+    deleteSets.push(readIdSet(pendingDecoder))
+  }
+
+  if (doc.store.pendingDs) {
+    const pendingDeleteDecoder = new UpdateDecoderV2(decoding.createDecoder(doc.store.pendingDs))
+    const pendingDeleteBlocks = readBlockSet(pendingDeleteDecoder)
+    if (pendingDeleteBlocks.clients.size !== 0) {
+      throw new Error('Sparse pending delete state must not contain structs')
+    }
+    deleteSets.push(readIdSet(pendingDeleteDecoder))
+  }
+
+  const result = isV1 ? new UpdateEncoderV1() : new UpdateEncoderV2()
+  writeBlockSet(result, blocks)
+  writeIdSet(result, mergeIdSets(deleteSets))
+  return result.toUint8Array()
 }
 
 /**

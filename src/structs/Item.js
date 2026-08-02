@@ -985,6 +985,9 @@ export const createContentDocFromDoc = ydoc => {
   if (!ydoc.gc) {
     opts.gc = false
   }
+  if (ydoc.sparseExactResolution) {
+    opts.sparseExactResolution = true
+  }
   if (ydoc.autoLoad) {
     opts.autoLoad = true
   }

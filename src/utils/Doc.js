@@ -52,18 +52,46 @@ export class Doc extends ObservableV2 {
   /**
    * @param {DocOpts} opts configuration
    */
-  constructor ({ guid = random.uuidv4(), collectionid = null, gc = true, gcFilter = () => true, meta = null, autoLoad = false, shouldLoad = true, isSuggestionDoc = false, sparseExactResolution = false } = {}) {
-    if (sparseExactResolution && gc) {
+  constructor (opts = {}) {
+    if (
+      Object.prototype.hasOwnProperty.call(opts, 'sparseExactResolution') &&
+      typeof opts.sparseExactResolution !== 'boolean'
+    ) {
+      throw new TypeError('sparseExactResolution must be a boolean')
+    }
+    const { guid = random.uuidv4(), collectionid = null, gc = true, gcFilter = () => true, meta = null, autoLoad = false, shouldLoad = true, isSuggestionDoc = false, sparseExactResolution = false } = opts
+    if (typeof sparseExactResolution !== 'boolean') {
+      throw new TypeError('sparseExactResolution must be a boolean')
+    }
+    if (sparseExactResolution && gc !== false) {
       throw new Error('Sparse exact resolution requires gc:false')
     }
     super()
     this.gc = gc
+    if (sparseExactResolution) {
+      Object.defineProperty(this, 'gc', {
+        get: () => false,
+        set: value => {
+          if (value !== false) {
+            throw new Error('Sparse exact resolution requires gc:false')
+          }
+        },
+        enumerable: true,
+        configurable: false
+      })
+    }
     this.gcFilter = gcFilter
     this.clientID = generateNewClientId()
     this.guid = guid
     this.collectionid = collectionid
     this.isSuggestionDoc = isSuggestionDoc
     this.sparseExactResolution = sparseExactResolution
+    Object.defineProperty(this, 'sparseExactResolution', {
+      value: sparseExactResolution,
+      enumerable: true,
+      writable: false,
+      configurable: false
+    })
     this.cleanupFormatting = !isSuggestionDoc
     /**
      * @type {Map<string, YType>}
