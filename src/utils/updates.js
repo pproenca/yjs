@@ -5,6 +5,7 @@ import * as error from 'lib0/error'
 import * as f from 'lib0/function'
 import * as logging from 'lib0/logging'
 import * as map from 'lib0/map'
+import * as math from 'lib0/math'
 import * as string from 'lib0/string'
 
 import { readIdSet, writeIdSet, createIdSet, intersectSets } from './ids.js'
@@ -211,8 +212,12 @@ export const encodeStateVectorFromUpdateV2 = (update, YEncoder = IdSetEncoderV2,
         currClock = 0
         stopCounting = curr.id.clock !== 0
       }
-      // we ignore skips
-      if (curr.constructor === Skip || curr.constructor === CausalHole) {
+      // Sparse coverage stops the contiguous state vector. A leading causal hole must reset the
+      // optimistic clock initialized from the first decoded struct.
+      if (curr.constructor === CausalHole) {
+        currClock = math.min(currClock, curr.id.clock)
+        stopCounting = true
+      } else if (curr.constructor === Skip) {
         stopCounting = true
       }
       if (!stopCounting) {

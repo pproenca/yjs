@@ -10,6 +10,7 @@ import * as decoding from 'lib0/decoding'
 import * as object from 'lib0/object'
 import * as delta from 'lib0/delta'
 import * as array from 'lib0/array'
+import { CausalHole, sameCausalHoleMetadata } from '../src/structs/CausalHole.js'
 
 /**
  * @typedef {Object} Enc
@@ -90,6 +91,79 @@ const encDoc = {
 const encoders = [encV1, encV2, encDoc]
 
 /**
+ * @typedef {Enc & {
+ *   convert: function(Uint8Array<ArrayBuffer>):Uint8Array<ArrayBuffer>,
+ *   decodeUpdate: function(Uint8Array<ArrayBuffer>):{structs:Array<Y.GC|Y.Item|Y.Skip|CausalHole>},
+ *   intersectUpdate: function(Uint8Array<ArrayBuffer>,Y.ContentIds):Uint8Array<ArrayBuffer>
+ * }} SparseEnc
+ */
+
+/** @type {Array<SparseEnc>} */
+const sparseEncoders = [
+  {
+    ...encV1,
+    convert: update => update,
+    decodeUpdate: Y.decodeUpdate,
+    intersectUpdate: Y.intersectUpdateWithContentIds
+  },
+  {
+    ...encV2,
+    convert: Y.convertUpdateFormatV1ToV2,
+    decodeUpdate: Y.decodeUpdateV2,
+    intersectUpdate: (update, ids) => Y.intersectUpdateWithContentIdsV2(update, ids)
+  }
+]
+
+const createLaterSparseFixture = () => {
+  const base = new Y.Doc({ gc: false })
+  base.clientID = 1
+  base.get('text').insert(0, 'a')
+  const baseline = Y.encodeStateAsUpdate(base)
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Array<Uint8Array<ArrayBuffer>>} */
+  const suggestionUpdates = []
+  /** @type {Array<Y.ContentIds>} */
+  const changes = []
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) {
+      suggestionUpdates.push(update)
+      changes.push(Y.createContentIdsFromUpdate(update))
+    }
+  })
+  suggestion.get('text').insert(1, 'X')
+  suggestion.get('text').insert(2, 'Y')
+  /** @type {Uint8Array<ArrayBuffer>|null} */
+  let sparseUpdate = null
+  base.on('update', update => { sparseUpdate = update })
+  renderer.resolveContentIds(changes[1], 'accept', {})
+  if (sparseUpdate === null) throw new Error('Expected sparse resolution update')
+  return { base, baseline, suggestionUpdates, changes, sparseUpdate }
+}
+
+const createSplitSparseFixture = () => {
+  const base = new Y.Doc({ gc: false })
+  base.clientID = 1
+  base.get('text').insert(0, 'a')
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  suggestion.clientID = 2
+  const renderer = Y.createDiffRenderer(base, suggestion)
+  /** @type {Uint8Array<ArrayBuffer>|null} */
+  let sourceUpdate = null
+  suggestion.on('update', (update, _origin, _doc, tr) => {
+    if (tr.local) sourceUpdate = update
+  })
+  suggestion.get('text').insert(1, 'XYZW')
+  const source = /** @type {Uint8Array<ArrayBuffer>} */ (/** @type {unknown} */ (sourceUpdate))
+  const sourceIds = Y.createContentIdsFromUpdate(source)
+  const selected = Y.createIdSet()
+  sourceIds.inserts.forEach((range, client) => selected.add(client, range.clock + range.len - 1, 1))
+  renderer.resolveContentIds(Y.createContentIds(selected), 'accept', {})
+  return { base, source, sourceIds, selected }
+}
+
+/**
  * @param {Array<Y.Doc>} users
  * @param {Enc} enc
  */
@@ -115,6 +189,131 @@ export const testMergeUpdates = tc => {
   encoders.forEach(enc => {
     const merged = fromUpdates(users, enc)
     t.compareArrays(array0.toArray(), merged.get('array').toArray())
+  })
+}
+
+export const testSparseCausalHoleCodecMatrix = () => {
+  sparseEncoders.forEach(enc => {
+    const fixture = createLaterSparseFixture()
+    const baseline = enc.convert(fixture.baseline)
+    const sparse = enc.convert(fixture.sparseUpdate)
+    const selected = fixture.changes[1]
+    const sparseIds = enc.readUpdateToContentIds(sparse)
+    t.assert(Y.equalIdSets(sparseIds.inserts, selected.inserts))
+    t.assert(Y.equalIdSets(sparseIds.deletes, selected.deletes))
+    const structs = enc.decodeUpdate(sparse).structs
+    const hole = /** @type {CausalHole|undefined} */ (structs.find(struct => struct.constructor === CausalHole))
+    const selectedItem = /** @type {Y.Item|undefined} */ (structs.find(struct => struct.id.client === 2 && struct.id.clock === 1))
+    t.assert(hole?.id.client === 2 && hole.id.clock === 0 && hole.length === 1)
+    t.assert(selectedItem?.id.client === 2 && selectedItem.id.clock === 1)
+    t.assert(Y.compareIDs(/** @type {Y.Item} */ (selectedItem).origin, Y.createID(2, 0)), `${enc.description} preserves the selected item's canonical origin`)
+    const sparseState = Y.decodeStateVector(enc.encodeStateVectorFromUpdate(sparse))
+    t.assert((sparseState.get(2) ?? 0) === 0, `${enc.description} update state vector stops at the hole`)
+
+    /**
+     * @param {Y.Doc} doc
+     * @param {string} label
+     */
+    const assertSparse = (doc, label) => {
+      t.assert(doc.get('text').toString() === 'aY', `${enc.description} ${label} visible content`)
+      t.assert(doc.store.pendingStructs === null && doc.store.pendingDs === null, `${enc.description} ${label} has no pending state`)
+      t.assert(doc.store.causalHoles.has(2, 0), `${enc.description} ${label} preserves hole coverage`)
+      t.assert(!Y.createInsertSetFromStructStore(doc.store, false).has(2, 0), `${enc.description} ${label} excludes holes from semantic ids`)
+      t.assert(Y.createInsertSetFromStructStore(doc.store, false).has(2, 1), `${enc.description} ${label} keeps selected ids`)
+      t.assert((Y.decodeStateVector(enc.encodeStateVector(doc)).get(2) ?? 0) === 0, `${enc.description} ${label} requests the hole`)
+    }
+
+    const incremental = new Y.Doc({ gc: false })
+    enc.applyUpdate(incremental, baseline)
+    let updateCount = 0
+    /** @type {Y.Transaction|null} */
+    let sparseTransaction = null
+    incremental.on(enc.updateEventName, () => { updateCount++ })
+    incremental.on('afterTransaction', tr => { sparseTransaction = tr })
+    enc.applyUpdate(incremental, sparse)
+    assertSparse(incremental, 'incremental reload')
+    t.assert(updateCount === 1)
+    t.assert(Y.equalIdSets(/** @type {Y.Transaction} */ (/** @type {unknown} */ (sparseTransaction)).insertSet, selected.inserts), `${enc.description} transaction ids exclude the envelope`)
+
+    const full = enc.encodeStateAsUpdate(fixture.base)
+    const fullReload = new Y.Doc({ gc: false })
+    enc.applyUpdate(fullReload, full)
+    assertSparse(fullReload, 'full reload')
+    const fullIds = enc.readUpdateToContentIds(full)
+    t.assert(!fullIds.inserts.has(2, 0) && fullIds.inserts.has(2, 1), `${enc.description} full content ids exclude holes`)
+
+    const merged = enc.mergeUpdates([baseline, sparse])
+    const mergedReload = new Y.Doc({ gc: false })
+    enc.applyUpdate(mergedReload, merged)
+    assertSparse(mergedReload, 'merged reload')
+
+    const baselineDoc = new Y.Doc({ gc: false })
+    enc.applyUpdate(baselineDoc, baseline)
+    const diff = enc.diffUpdate(merged, enc.encodeStateVector(baselineDoc))
+    const diffReload = new Y.Doc({ gc: false })
+    enc.applyUpdate(diffReload, baseline)
+    enc.applyUpdate(diffReload, diff)
+    assertSparse(diffReload, 'diff reload')
+
+    const earlier = enc.convert(fixture.suggestionUpdates[0])
+    enc.applyUpdate(incremental, earlier)
+    t.assert(incremental.get('text').toString() === 'aXY', `${enc.description} real content replaces its hole`)
+    t.assert(incremental.store.causalHoles.isEmpty())
+    t.assert(incremental.store.pendingStructs === null && incremental.store.pendingDs === null)
+  })
+}
+
+export const testSparseCausalHoleSplitArrivalMatrix = () => {
+  const permutations = [
+    [0, 1, 2],
+    [0, 2, 1],
+    [1, 0, 2],
+    [1, 2, 0],
+    [2, 0, 1],
+    [2, 1, 0]
+  ]
+  sparseEncoders.forEach(enc => {
+    const fixture = createSplitSparseFixture()
+    const sparse = enc.encodeStateAsUpdate(fixture.base)
+    const source = enc.convert(fixture.source)
+    const sourceRange = fixture.sourceIds.inserts.clients.get(2)?.getIds()[0]
+    if (sourceRange === undefined) throw new Error('Missing split source range')
+
+    const residual = new Y.Doc({ gc: false })
+    enc.applyUpdate(residual, sparse)
+    const initialHole = residual.store.getCausalHole(Y.createID(2, sourceRange.clock))
+    if (initialHole === null) throw new Error('Missing initial causal hole')
+    const expectedLeft = initialHole.slice(sourceRange.clock, 1)
+    const expectedRight = initialHole.slice(sourceRange.clock + 2, 1)
+    const middle = Y.createIdSet()
+    middle.add(2, sourceRange.clock + 1, 1)
+    enc.applyUpdate(residual, enc.intersectUpdate(source, Y.createContentIds(middle)))
+    const left = residual.store.getCausalHole(Y.createID(2, sourceRange.clock))
+    const right = residual.store.getCausalHole(Y.createID(2, sourceRange.clock + 2))
+    t.assert(left !== null && right !== null)
+    t.assert(sameCausalHoleMetadata(/** @type {CausalHole} */ (left), expectedLeft), `${enc.description} preserves left residual metadata`)
+    t.assert(sameCausalHoleMetadata(/** @type {CausalHole} */ (right), expectedRight), `${enc.description} preserves right residual metadata`)
+    t.assert(residual.get('text').toString() === 'aYW')
+    t.assert((Y.decodeStateVector(enc.encodeStateVector(residual)).get(2) ?? 0) === 0)
+
+    permutations.forEach(order => {
+      const target = new Y.Doc({ gc: false })
+      enc.applyUpdate(target, sparse)
+      order.forEach(offset => {
+        const selected = Y.createIdSet()
+        selected.add(2, sourceRange.clock + offset, 1)
+        enc.applyUpdate(target, enc.intersectUpdate(source, Y.createContentIds(selected)))
+        t.assert(target.store.pendingStructs === null && target.store.pendingDs === null)
+      })
+      t.assert(target.get('text').toString() === 'aXYZW', `${enc.description} split order ${order.join('')} converges`)
+      t.assert(target.store.causalHoles.isEmpty(), `${enc.description} split order ${order.join('')} replaces every hole`)
+      t.assert(Y.decodeStateVector(enc.encodeStateVector(target)).get(2) === 4)
+    })
+
+    const realPreferred = new Y.Doc({ gc: false })
+    enc.applyUpdate(realPreferred, enc.mergeUpdates([sparse, source]))
+    t.assert(realPreferred.get('text').toString() === 'aXYZW', `${enc.description} merge prefers real content`)
+    t.assert(realPreferred.store.causalHoles.isEmpty())
   })
 }
 

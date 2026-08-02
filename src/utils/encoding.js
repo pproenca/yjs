@@ -253,6 +253,8 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     const store = doc.store
     // let start = performance.now()
     const ss = readBlockSet(structDecoder)
+    const hasCausalHoles = array.from(ss.clients.values()).some(range => range.refs.some(struct => struct.constructor === CausalHole))
+    const sparseDeleteSet = hasCausalHoles ? readIdSet(structDecoder) : null
     validateCausalHoleEnvelope(ss, store)
     const knownState = createIdSet()
     ss.clients.forEach((_, client) => {
@@ -300,7 +302,9 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     }
     // console.log('time to integrate: ', performance.now() - start) // @todo remove
     // start = performance.now()
-    const dsRest = readAndApplyDeleteSet(structDecoder, transaction, store)
+    const dsRest = sparseDeleteSet === null
+      ? readAndApplyDeleteSet(structDecoder, transaction, store)
+      : applyDecodedDeleteSet(sparseDeleteSet, transaction, store)
     if (store.pendingDs) {
       // @todo we could make a lower-bound state-vector check as we do above
       const pendingDSUpdate = new UpdateDecoderV2(decoding.createDecoder(store.pendingDs))
@@ -330,6 +334,20 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
       applyUpdateV2(transaction.doc, update)
     }
   }, transactionOrigin, false)
+
+/**
+ * @param {IdSet} deleteSet
+ * @param {Transaction} transaction
+ * @param {StructStore} store
+ */
+const applyDecodedDeleteSet = (deleteSet, transaction, store) => {
+  const encoder = new UpdateEncoderV2()
+  encoding.writeVarUint(encoder.restEncoder, 0)
+  writeIdSet(encoder, deleteSet)
+  const decoder = new UpdateDecoderV2(decoding.createDecoder(encoder.toUint8Array()))
+  decoding.readVarUint(decoder.restDecoder)
+  return readAndApplyDeleteSet(decoder, transaction, store)
+}
 
 /**
  * @param {BlockSet} blockSet
