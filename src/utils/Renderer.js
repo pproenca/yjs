@@ -12,9 +12,32 @@ import { transact } from './Transaction.js'
 import { UndoManager, StackItem } from './UndoManager.js'
 import { Doc } from './Doc.js'
 
-import { $renderer, AttributedContent } from './renderer-helpers.js'
+import { $renderer, AttributedContent, cloneRendererContentAttribute, cloneRendererIdMap, cloneRendererIdSet, destroyRendererLifecycle, initializeRendererLifecycle, invalidateRendererLifecycle } from './renderer-helpers.js'
 
 export { baseRenderer, AbstractRenderer, rendererContentLength, $renderer } from './renderer-helpers.js'
+
+/**
+ * @typedef {{
+ *   inserts: IdMap<any>,
+ *   deletes: IdMap<any>,
+ *   attributed: IdSet,
+ *   prevDoc: Doc,
+ *   prevDocStore: StructStore,
+ *   nextDoc: Doc
+ * }} DiffRendererProjection
+ */
+
+/** @type {WeakMap<DiffRenderer, DiffRendererProjection>} */
+const diffRendererProjections = new WeakMap()
+
+/**
+ * @param {DiffRenderer} renderer
+ */
+const getDiffRendererProjection = renderer => {
+  const projection = diffRendererProjections.get(renderer)
+  if (projection === undefined) throw new Error('DiffRenderer projection is not initialized')
+  return projection
+}
 
 /**
  * @implements AbstractRenderer
@@ -117,7 +140,8 @@ const getItemContent = (store, client, clock, len) => {
 const collectSuggestedChanges = (tr, renderer, start, end, collectAll) => {
   const inserts = createIdSet()
   const deletes = createIdSet()
-  const store = renderer._nextDoc.store
+  const projection = getDiffRendererProjection(renderer)
+  const store = projection.nextDoc.store
   /**
    * make sure to collect suggestions until all formats are closed
    * @type {Set<string>}
@@ -137,7 +161,7 @@ const collectSuggestedChanges = (tr, renderer, start, end, collectAll) => {
       break
     }
     if (!item.deleted) {
-      const slice = renderer.inserts.slice(item.id.client, item.id.clock, item.length)
+      const slice = projection.inserts.slice(item.id.client, item.id.clock, item.length)
       if (slice.some(s => s.attrs === null)) {
         for (let i = slice.length - 1; i >= 0; i--) {
           const s = slice[i]
@@ -153,7 +177,7 @@ const collectSuggestedChanges = (tr, renderer, start, end, collectAll) => {
   // eslint-disable-next-line
   itemLoop: while (item != null) {
     const itemClient = item.id.client
-    const slice = (item.deleted ? renderer.deletes : renderer.inserts).slice(itemClient, item.id.clock, item.length)
+    const slice = (item.deleted ? projection.deletes : projection.inserts).slice(itemClient, item.id.clock, item.length)
     foundEndItem ||= item === endItem
     if (item.deleted) {
       // item probably gc'd content. Need to split item and fill with content again
@@ -170,7 +194,7 @@ const collectSuggestedChanges = (tr, renderer, start, end, collectAll) => {
         if (tr != null) {
           const splicedItem = getItemCleanStart(tr, createID(itemClient, s.clock))
           if (s.attrs != null) {
-            splicedItem.content = getItemContent(renderer._prevDocStore, itemClient, s.clock, s.len)
+            splicedItem.content = getItemContent(projection.prevDocStore, itemClient, s.clock, s.len)
           }
         }
       }
@@ -296,11 +320,12 @@ const isIntegratedItem = (struct, doc) => struct.isItem && struct.parent != null
 const prepareRejectUpdate = (renderer, ids) => {
   const inserts = diffIdSet(ids.inserts, ids.deletes)
   const deletes = diffIdSet(ids.deletes, ids.inserts)
+  const { prevDoc, nextDoc } = getDiffRendererProjection(renderer)
   const scratch = new Doc({ gc: false, isSuggestionDoc: true })
   try {
-    applyUpdate(scratch, encodeStateAsUpdate(renderer._prevDoc))
-    applyUpdate(scratch, encodeStateAsUpdate(renderer._nextDoc))
-    scratch.clientID = renderer._nextDoc.clientID
+    applyUpdate(scratch, encodeStateAsUpdate(prevDoc))
+    applyUpdate(scratch, encodeStateAsUpdate(nextDoc))
+    scratch.clientID = nextDoc.clientID
 
     assertStructCoverage(scratch.store, deletes, struct => isIntegratedItem(/** @type {Item} */ (struct), scratch) && struct.deleted && !(/** @type {Item} */ (struct).content instanceof ContentDeleted), 'Missing canonical deletion preimage')
 
@@ -349,6 +374,14 @@ export class Attributions {
 const extractAttributions = (attrs, slice) => attrs == null ? createIdMapFromIdSet(slice, []) : mergeIdMaps([intersectMaps(attrs, slice), createIdMapFromIdSet(slice, [])])
 
 /**
+ * Capture caller-owned attribution definitions into the private renderer projection.
+ *
+ * @param {IdMap<any>|undefined} attrs
+ * @param {IdSet} slice
+ */
+const captureAttributions = (attrs, slice) => cloneRendererIdMap(extractAttributions(attrs, slice))
+
+/**
  * @implements AbstractRenderer
  *
  * @extends {ObservableV2<{change:(idset:IdSet,origin:any,local:boolean)=>void}>}
@@ -362,35 +395,44 @@ export class DiffRenderer extends ObservableV2 {
    */
   constructor (prevDoc, nextDoc, { attrs = null } = {}) {
     super()
+    initializeRendererLifecycle(this)
     const _nextDocInserts = createInsertSetFromStructStore(nextDoc.store, false) // unmaintained
     const _prevDocInserts = createInsertSetFromStructStore(prevDoc.store, false) // unmaintained
     const nextDocDeletes = createDeleteSetFromStructStore(nextDoc.store) // maintained
     const prevDocDeletes = createDeleteSetFromStructStore(prevDoc.store) // maintained
     const insertDiff = diffIdSet(_nextDocInserts, _prevDocInserts)
     const deleteDiff = diffIdSet(nextDocDeletes, prevDocDeletes)
-    this.inserts = extractAttributions(attrs?.inserts, insertDiff)
-    this.deletes = extractAttributions(attrs?.deletes, deleteDiff)
-    /**
-     * Raw coverage of `inserts` ∪ `deletes`, maintained alongside them. Over-approximates the
-     * actually-rendered set (e.g. it keeps suggested-inserts that were deleted later) —
-     * `readContent` remains authoritative. See {@link AbstractRenderer#attributed}.
-     * @type {IdSet}
-     */
-    this.attributed = mergeIdSets([insertDiff, deleteDiff])
-    this._prevDoc = prevDoc
-    this._prevDocStore = prevDoc.store
-    this._nextDoc = nextDoc
+    const projection = {
+      inserts: captureAttributions(attrs?.inserts, insertDiff),
+      deletes: captureAttributions(attrs?.deletes, deleteDiff),
+      attributed: mergeIdSets([insertDiff, deleteDiff]),
+      prevDoc,
+      prevDocStore: prevDoc.store,
+      nextDoc
+    }
+    diffRendererProjections.set(this, projection)
     diffResolutionReceipts.set(this, { accepted: createResolutionReceipt(), rejected: createResolutionReceipt() })
     // update before observer calls fired
     this._nextBOH = nextDoc.on('beforeObserverCalls', tr => {
-      // update inserts
       const diffInserts = diffIdSet(tr.insertSet, _prevDocInserts)
-      insertIntoIdMap(this.inserts, extractAttributions(attrs?.inserts, diffInserts))
-      // update deletes
-      const diffDeletes = diffIdSet(diffIdSet(tr.deleteSet, prevDocDeletes), this.inserts)
-      insertIntoIdMap(this.deletes, extractAttributions(attrs?.deletes, diffDeletes))
-      insertIntoIdSet(this.attributed, diffInserts)
-      insertIntoIdSet(this.attributed, diffDeletes)
+      const diffDeletes = diffIdSet(diffIdSet(diffIdSet(tr.deleteSet, prevDocDeletes), projection.inserts), diffInserts)
+      const changed = !tr.insertSet.isEmpty() || !tr.deleteSet.isEmpty()
+      if (!changed) return
+      try {
+        // Prepare both snapshots before publishing either into the private projection.
+        const capturedInserts = captureAttributions(attrs?.inserts, diffInserts)
+        const capturedDeletes = captureAttributions(attrs?.deletes, diffDeletes)
+        insertIntoIdMap(projection.inserts, capturedInserts)
+        insertIntoIdMap(projection.deletes, capturedDeletes)
+        insertIntoIdSet(projection.attributed, diffInserts)
+        insertIntoIdSet(projection.attributed, diffDeletes)
+      } catch {
+        // The document has already changed when beforeObserverCalls runs. Retire a renderer whose
+        // projection cannot publish atomically, but do not abort the document's observer pipeline.
+        this.destroy()
+        return
+      }
+      invalidateRendererLifecycle(this)
       // @todo fire update ranges on `diffInserts` and `diffDeletes`
     })
     this._prevBOH = prevDoc.on('beforeObserverCalls', tr => {
@@ -398,30 +440,34 @@ export class DiffRenderer extends ObservableV2 {
       insertIntoIdSet(prevDocDeletes, tr.deleteSet)
       if (tr.insertSet.clients.size < 2) {
         tr.insertSet.forEach((attrRange, client) => {
-          this.inserts.delete(client, attrRange.clock, attrRange.len)
+          projection.inserts.delete(client, attrRange.clock, attrRange.len)
         })
       } else {
-        this.inserts = diffIdMap(this.inserts, tr.insertSet)
+        projection.inserts = diffIdMap(projection.inserts, tr.insertSet)
       }
       // insertIntoIdMap(this.deletes, createIdMapFromIdSet(intersectSets(tr.deleteSet, this.deletes), [createAttributionItem('acceptDelete', 'unknown')]))
       if (tr.deleteSet.clients.size < 2) {
         tr.deleteSet.forEach((attrRange, client) => {
-          this.deletes.delete(client, attrRange.clock, attrRange.len)
+          projection.deletes.delete(client, attrRange.clock, attrRange.len)
         })
       } else {
-        this.deletes = diffIdMap(this.deletes, tr.deleteSet)
+        projection.deletes = diffIdMap(projection.deletes, tr.deleteSet)
       }
       // evict the accepted/rejected ranges from the coverage set, then re-add whatever the maps
       // still claim: `tr.insertSet` only evicts insert-attributions and `tr.deleteSet` only evicts
       // delete-attributions, but a single range can be covered by both maps (e.g. an accepted
       // insert with a still-pending delete suggestion on the same ids must stay attributed).
       const evicted = mergeIdSets([tr.insertSet, tr.deleteSet])
-      this.attributed = diffIdSet(this.attributed, evicted)
-      insertIntoIdSet(this.attributed, intersectSets(evicted, this.inserts))
-      insertIntoIdSet(this.attributed, intersectSets(evicted, this.deletes))
+      projection.attributed = diffIdSet(projection.attributed, evicted)
+      insertIntoIdSet(projection.attributed, intersectSets(evicted, projection.inserts))
+      insertIntoIdSet(projection.attributed, intersectSets(evicted, projection.deletes))
+      if (tr.insertSet.clients.size > 0 || tr.deleteSet.clients.size > 0) {
+        invalidateRendererLifecycle(this)
+      }
       // fire event of "changed" attributions. exclude items that were added & deleted in the same
       // transaction
-      this.emit('change', [diffIdSet(mergeIdSets([tr.insertSet, tr.deleteSet]), intersectSets(tr.insertSet, tr.deleteSet)), tr.origin, tr.local])
+      const changed = diffIdSet(mergeIdSets([tr.insertSet, tr.deleteSet]), intersectSets(tr.insertSet, tr.deleteSet))
+      this.emit('change', [cloneRendererIdSet(changed), tr.origin, tr.local])
     })
     // changes from prevDoc should always flow into suggestionDoc
     // changes from suggestionDoc only flow into ydoc if suggestion-mode is disabled
@@ -465,32 +511,57 @@ export class DiffRenderer extends ObservableV2 {
   get $type () { return $renderer }
 
   /**
+   * A detached snapshot of pending insert attributions.
+   *
+   * @return {IdMap<any>}
+   */
+  get inserts () { return cloneRendererIdMap(getDiffRendererProjection(this).inserts) }
+
+  /**
+   * A detached snapshot of pending delete attributions.
+   *
+   * @return {IdMap<any>}
+   */
+  get deletes () { return cloneRendererIdMap(getDiffRendererProjection(this).deletes) }
+
+  /**
+   * A detached snapshot of the raw attribution coverage.
+   *
+   * @return {IdSet}
+   */
+  get attributed () { return cloneRendererIdSet(getDiffRendererProjection(this).attributed) }
+
+  /**
    * @param {Item} item
    * @return {boolean}
    */
   hasItem (item) {
-    return this.attributed.intersects(item.id.client, item.id.clock, item.length)
+    return getDiffRendererProjection(this).attributed.intersects(item.id.client, item.id.clock, item.length)
   }
 
   destroy () {
+    const projection = getDiffRendererProjection(this)
+    destroyRendererLifecycle(this)
     super.destroy()
-    this._nextDoc.off('destroy', this._destroyHandler)
-    this._prevDoc.off('destroy', this._destroyHandler)
-    this._nextDoc.off('beforeObserverCalls', this._nextBOH)
-    this._prevDoc.off('beforeObserverCalls', this._prevBOH)
-    this._prevDoc.off('update', this._prevUpdateListener)
-    this._nextDoc.off('update', this._ndUpdateListener)
-    this._nextDoc.off('afterTransaction', this._afterTrListener)
+    projection.nextDoc.off('destroy', this._destroyHandler)
+    projection.prevDoc.off('destroy', this._destroyHandler)
+    projection.nextDoc.off('beforeObserverCalls', this._nextBOH)
+    projection.prevDoc.off('beforeObserverCalls', this._prevBOH)
+    projection.prevDoc.off('update', this._prevUpdateListener)
+    projection.nextDoc.off('update', this._ndUpdateListener)
+    projection.nextDoc.off('afterTransaction', this._afterTrListener)
   }
 
   acceptAllChanges () {
-    applyUpdate(this._prevDoc, encodeStateAsUpdate(this._nextDoc))
+    const { prevDoc, nextDoc } = getDiffRendererProjection(this)
+    applyUpdate(prevDoc, encodeStateAsUpdate(nextDoc))
   }
 
   rejectAllChanges () {
-    this._prevDoc.transact(tr => {
-      applyUpdate(this._prevDoc, encodeStateAsUpdate(this._nextDoc))
-      const um = new UndoManager(this._prevDoc)
+    const { prevDoc, nextDoc } = getDiffRendererProjection(this)
+    prevDoc.transact(tr => {
+      applyUpdate(prevDoc, encodeStateAsUpdate(nextDoc))
+      const um = new UndoManager(prevDoc)
       um.undoStack.push(new StackItem(tr.insertSet, tr.deleteSet))
       um.undo()
       um.destroy()
@@ -502,11 +573,12 @@ export class DiffRenderer extends ObservableV2 {
    * @param {ID} end
    */
   acceptChanges (start, end = start) {
+    const { prevDoc, nextDoc } = getDiffRendererProjection(this)
     const { inserts, deletes } = collectSuggestedChanges(null, this, start, end, true)
     const encoder = new UpdateEncoderV1()
-    writeStructsFromIdSet(encoder, this._nextDoc.store, inserts)
+    writeStructsFromIdSet(encoder, nextDoc.store, inserts)
     writeIdSet(encoder, deletes)
-    applyUpdate(this._prevDoc, encoder.toUint8Array())
+    applyUpdate(prevDoc, encoder.toUint8Array())
   }
 
   /**
@@ -514,12 +586,13 @@ export class DiffRenderer extends ObservableV2 {
    * @param {ID} end
    */
   rejectChanges (start, end = start) {
-    this._nextDoc.transact(tr => {
+    const { nextDoc } = getDiffRendererProjection(this)
+    nextDoc.transact(tr => {
       const { inserts, deletes } = collectSuggestedChanges(tr, this, start, end, false)
       const encoder = new UpdateEncoderV1()
-      writeStructsFromIdSet(encoder, this._nextDoc.store, inserts)
+      writeStructsFromIdSet(encoder, nextDoc.store, inserts)
       writeIdSet(encoder, deletes)
-      const um = new UndoManager(this._nextDoc)
+      const um = new UndoManager(nextDoc)
       um.undoStack.push(new StackItem(inserts, deletes))
       um.undo()
       um.destroy()
@@ -537,6 +610,7 @@ export class DiffRenderer extends ObservableV2 {
   resolveContentIds (ids, disposition, origin) {
     if (disposition !== 'accept' && disposition !== 'reject') throw new Error('Invalid diff resolution disposition')
     const requested = copyContentIds(ids)
+    const projection = getDiffRendererProjection(this)
     const receipts = /** @type {{accepted:ContentIds,rejected:ContentIds}} */ (diffResolutionReceipts.get(this))
     const receipt = disposition === 'accept' ? receipts.accepted : receipts.rejected
     const opposite = disposition === 'accept' ? receipts.rejected : receipts.accepted
@@ -549,24 +623,24 @@ export class DiffRenderer extends ObservableV2 {
       deletes: diffIdSet(requested.deletes, receipt.deletes)
     }
     if (actionable.inserts.isEmpty() && actionable.deletes.isEmpty()) return
-    if (!isSubset(actionable.inserts, this.inserts) || !isSubset(actionable.deletes, this.deletes)) {
+    if (!isSubset(actionable.inserts, projection.inserts) || !isSubset(actionable.deletes, projection.deletes)) {
       throw new Error('ContentIds are unknown or outside this renderer')
     }
-    if (this._prevDoc.store !== this._prevDocStore) throw new Error('Canonical base store mismatch')
+    if (projection.prevDoc.store !== projection.prevDocStore) throw new Error('Canonical base store mismatch')
 
     const inserts = diffIdSet(actionable.inserts, actionable.deletes)
     const deletes = diffIdSet(actionable.deletes, actionable.inserts)
-    assertStructCoverage(this._nextDoc.store, actionable.inserts, struct => struct.isItem ? isIntegratedItem(/** @type {Item} */ (struct), this._nextDoc) : disposition === 'reject', 'Missing or out-of-scope suggestion source')
-    assertStructCoverage(this._nextDoc.store, actionable.deletes, struct => struct.deleted && (!struct.isItem || isIntegratedItem(/** @type {Item} */ (struct), this._nextDoc)), 'Missing or out-of-scope suggestion deletion')
+    assertStructCoverage(projection.nextDoc.store, actionable.inserts, struct => struct.isItem ? isIntegratedItem(/** @type {Item} */ (struct), projection.nextDoc) : disposition === 'reject', 'Missing or out-of-scope suggestion source')
+    assertStructCoverage(projection.nextDoc.store, actionable.deletes, struct => struct.deleted && (!struct.isItem || isIntegratedItem(/** @type {Item} */ (struct), projection.nextDoc)), 'Missing or out-of-scope suggestion deletion')
     if (disposition === 'accept') {
-      assertStructCoverage(this._nextDoc.store, inserts, struct => isIntegratedItem(/** @type {Item} */ (struct), this._nextDoc) && !struct.deleted && !(/** @type {Item} */ (struct).content instanceof ContentDeleted), 'Missing suggested insertion payload')
+      assertStructCoverage(projection.nextDoc.store, inserts, struct => isIntegratedItem(/** @type {Item} */ (struct), projection.nextDoc) && !struct.deleted && !(/** @type {Item} */ (struct).content instanceof ContentDeleted), 'Missing suggested insertion payload')
     }
-    assertStructCoverage(this._prevDocStore, deletes, struct => isIntegratedItem(/** @type {Item} */ (struct), this._prevDoc) && !struct.deleted && !(/** @type {Item} */ (struct).content instanceof ContentDeleted), 'Missing canonical deletion preimage')
+    assertStructCoverage(projection.prevDocStore, deletes, struct => isIntegratedItem(/** @type {Item} */ (struct), projection.prevDoc) && !struct.deleted && !(/** @type {Item} */ (struct).content instanceof ContentDeleted), 'Missing canonical deletion preimage')
 
     const encoder = new UpdateEncoderV1()
     let update
     if (disposition === 'accept') {
-      writeStructsFromIdSet(encoder, this._nextDoc.store, actionable.inserts)
+      writeStructsFromIdSet(encoder, projection.nextDoc.store, actionable.inserts)
       writeIdSet(encoder, actionable.deletes)
       update = encoder.toUint8Array()
     } else {
@@ -576,11 +650,11 @@ export class DiffRenderer extends ObservableV2 {
     insertIntoIdSet(receipt.inserts, actionable.inserts)
     insertIntoIdSet(receipt.deletes, actionable.deletes)
     if (disposition === 'accept') {
-      applyUpdate(this._prevDoc, update, origin)
+      applyUpdate(projection.prevDoc, update, origin)
     } else {
-      this._nextDoc.transact(tr => {
-        applyUpdate(this._nextDoc, update)
-        applyUpdate(this._prevDoc, update, origin)
+      projection.nextDoc.transact(tr => {
+        applyUpdate(projection.nextDoc, update)
+        applyUpdate(projection.prevDoc, update, origin)
         // `applyUpdate` forces an enclosing transaction remote. This is still the local reject
         // transaction; restoring the flag also prevents the scratch-generated ids from rotating
         // the suggestion document's client id during cleanup.
@@ -598,7 +672,8 @@ export class DiffRenderer extends ObservableV2 {
    * @param {0|1|2|3} shouldRender - whether this should render or just result in a `retain` operation (see AbstractRenderer#readContent)
    */
   readContent (contents, client, clock, deleted, _content, shouldRender) {
-    const slice = (deleted ? this.deletes : this.inserts).slice(client, clock, _content.getLength())
+    const projection = getDiffRendererProjection(this)
+    const slice = (deleted ? projection.deletes : projection.inserts).slice(client, clock, _content.getLength())
     /**
      * @type {AbstractContent?}
      */
@@ -606,11 +681,11 @@ export class DiffRenderer extends ObservableV2 {
     for (let i = 0; i < slice.length; i++) {
       const s = slice[i]
       if (content == null || content instanceof ContentDeleted) {
-        if ((!shouldRender && s.attrs == null) || this.inserts.has(client, s.clock)) {
+        if ((!shouldRender && s.attrs == null) || projection.inserts.has(client, s.clock)) {
           continue
         }
         // Retrieved item is never more fragmented than the newer item.
-        const prevItem = this._prevDocStore.getItem(createID(client, s.clock))
+        const prevItem = projection.prevDocStore.getItem(createID(client, s.clock))
         const diffStart = s.clock - prevItem.id.clock
         content = prevItem.length > 1 ? prevItem.content.copy() : prevItem.content
         // trim itemContent to the correct size.
@@ -630,7 +705,7 @@ export class DiffRenderer extends ObservableV2 {
       // *nothing* (there is nothing to insert, and a `delete` op would misapply: the consuming
       // state has never seen this content)
       if (!deleted || s.attrs != null || (shouldRender !== 0 && shouldRender !== 3)) {
-        contents.push(new AttributedContent(c, s.clock, deleted, s.attrs, shouldRender))
+        contents.push(new AttributedContent(c, s.clock, deleted, s.attrs?.map(cloneRendererContentAttribute) ?? null, shouldRender))
       }
     }
   }

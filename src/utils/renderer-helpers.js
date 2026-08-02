@@ -2,7 +2,200 @@ import * as s from 'lib0/schema'
 import * as error from 'lib0/error'
 import { ObservableV2 } from 'lib0/observable'
 
-import { createIdSet } from './ids.js'
+import { createContentAttribute, createIdMap, createIdSet } from './ids.js'
+
+/**
+ * @typedef {{ revision: number, active: boolean }} RendererLifecycleSnapshot
+ */
+
+/**
+ * Renderer lifecycle state is deliberately kept outside renderer instances. Consumers can retain
+ * the frozen snapshot as an identity token, but cannot mutate or replace the current state.
+ *
+ * @type {WeakMap<object, Readonly<RendererLifecycleSnapshot>>}
+ */
+const rendererLifecycles = new WeakMap()
+
+/**
+ * @param {object} renderer
+ */
+export const initializeRendererLifecycle = renderer => {
+  error.assert(!rendererLifecycles.has(renderer))
+  rendererLifecycles.set(renderer, Object.freeze({ revision: 0, active: true }))
+}
+
+/**
+ * @param {object} renderer
+ * @return {Readonly<RendererLifecycleSnapshot>?}
+ */
+export const readRendererLifecycle = renderer => rendererLifecycles.get(renderer) ?? null
+
+/**
+ * @param {object} renderer
+ * @return {Readonly<RendererLifecycleSnapshot>}
+ */
+const requireRendererLifecycle = renderer => {
+  const lifecycle = rendererLifecycles.get(renderer)
+  if (lifecycle === undefined) error.unexpectedCase()
+  return lifecycle
+}
+
+/**
+ * @param {object} renderer
+ */
+export const invalidateRendererLifecycle = renderer => {
+  const lifecycle = requireRendererLifecycle(renderer)
+  rendererLifecycles.set(renderer, Object.freeze({
+    revision: lifecycle.revision + 1,
+    active: lifecycle.active
+  }))
+}
+
+/**
+ * @param {object} renderer
+ */
+export const destroyRendererLifecycle = renderer => {
+  const lifecycle = requireRendererLifecycle(renderer)
+  if (!lifecycle.active) return
+  rendererLifecycles.set(renderer, Object.freeze({
+    revision: lifecycle.revision + 1,
+    active: false
+  }))
+}
+
+/**
+ * Snapshot attribution data without retaining caller-owned mutable values. Cyclic references and
+ * values outside the wire-data domain become `undefined`; supported primitives retain exact JS
+ * semantics, and shared-memory bytes are copied to isolated backing storage.
+ *
+ * @param {any} value
+ */
+const cloneRendererAttributionValue = value => {
+  /** @type {Map<object, any>} */
+  const clones = new Map()
+  /** @type {Set<object>} */
+  const active = new Set()
+  /**
+   * @param {any} current
+   * @return {any}
+   */
+  const clone = current => {
+    if ((typeof current !== 'object' || current === null) && typeof current !== 'function') {
+      return typeof current === 'symbol' ? undefined : current
+    }
+    if (typeof current === 'function' || active.has(current)) return undefined
+    if (clones.has(current)) return clones.get(current)
+    active.add(current)
+    try {
+      if (current instanceof Uint8Array) {
+        let copiedBuffer = clones.get(current.buffer)
+        if (copiedBuffer === undefined) {
+          const shared = typeof SharedArrayBuffer !== 'undefined' && current.buffer instanceof SharedArrayBuffer
+          copiedBuffer = shared ? new SharedArrayBuffer(current.buffer.byteLength) : new ArrayBuffer(current.buffer.byteLength)
+          new Uint8Array(copiedBuffer).set(new Uint8Array(current.buffer))
+          clones.set(current.buffer, copiedBuffer)
+        }
+        const copied = new Uint8Array(copiedBuffer, current.byteOffset, current.byteLength)
+        clones.set(current, copied)
+        return copied
+      }
+      if (current instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && current instanceof SharedArrayBuffer)) {
+        const shared = typeof SharedArrayBuffer !== 'undefined' && current instanceof SharedArrayBuffer
+        const copied = shared ? new SharedArrayBuffer(current.byteLength) : new ArrayBuffer(current.byteLength)
+        new Uint8Array(copied).set(new Uint8Array(current))
+        clones.set(current, copied)
+        return copied
+      }
+      if (current instanceof Date) {
+        const copied = new Date(current.getTime())
+        clones.set(current, copied)
+        return copied
+      }
+      if (current instanceof RegExp) {
+        const copied = new RegExp(current.source, current.flags)
+        copied.lastIndex = current.lastIndex
+        clones.set(current, copied)
+        return copied
+      }
+      if (current instanceof Map) {
+        const copied = new Map()
+        clones.set(current, copied)
+        current.forEach((entryValue, entryKey) => copied.set(clone(entryKey), clone(entryValue)))
+        return copied
+      }
+      if (current instanceof Set) {
+        const copied = new Set()
+        clones.set(current, copied)
+        current.forEach(entry => copied.add(clone(entry)))
+        return copied
+      }
+      if (Array.isArray(current)) {
+        const copied = new Array(current.length)
+        clones.set(current, copied)
+        for (let index = 0; index < current.length; index++) {
+          const descriptor = Object.getOwnPropertyDescriptor(current, index)
+          if (descriptor?.enumerable) {
+            let item
+            try { item = current[index] } catch {}
+            copied[index] = clone(item)
+          }
+        }
+        return copied
+      }
+      const copied = Object.create(Object.getPrototypeOf(current) === null ? null : Object.prototype)
+      clones.set(current, copied)
+      Object.keys(current).forEach(key => {
+        let propertyValue
+        try { propertyValue = current[key] } catch {}
+        Object.defineProperty(copied, key, {
+          configurable: true,
+          enumerable: true,
+          value: clone(propertyValue),
+          writable: true
+        })
+      })
+      return copied
+    } catch {
+      clones.set(current, undefined)
+      return undefined
+    } finally {
+      active.delete(current)
+    }
+  }
+  return clone(value)
+}
+
+/** @param {ContentAttribute<any>} attr */
+export const cloneRendererContentAttribute = attr => createContentAttribute(attr.name, cloneRendererAttributionValue(attr.val))
+
+/**
+ * @param {IdMap<any>} idmap
+ */
+export const cloneRendererIdMap = idmap => {
+  const clone = createIdMap()
+  /** @type {Map<ContentAttribute<any>, ContentAttribute<any>>} */
+  const attributes = new Map()
+  idmap.forEach((range, client) => {
+    clone.add(client, range.clock, range.len, range.attrs.map(attr => {
+      let cloned = attributes.get(attr)
+      if (cloned === undefined) {
+        cloned = cloneRendererContentAttribute(attr)
+        attributes.set(attr, cloned)
+      }
+      return cloned
+    }))
+  })
+  return clone
+}
+
+/** @param {IdSet} idset */
+export const cloneRendererIdSet = idset => {
+  const clone = createIdSet()
+  idset.forEach((range, client) => {
+    clone.add(client, range.clock, range.len)
+  })
+  return clone
+}
 
 export const attributionJsonSchema = s.$object({
   insert: s.$array(s.$string).optional,

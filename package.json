@@ -1,6 +1,6 @@
 {
-  "name": "@y/y",
-  "version": "14.0.0-rc.23",
+  "name": "@pproenca/y",
+  "version": "14.0.0-rc.23-y001.0",
   "description": "Shared Editing Library",
   "type": "module",
   "sideEffects": false,
@@ -13,6 +13,8 @@
     "test": "NODE_ENV=development node ./tests/index.js --repetition-time 50",
     "test-extensive": "node ./tests/index.js --production --repetition-time 10000",
     "dist": "npm run clean && PRODUCTION=1 tsc --noEmit false && test -e dist/src/index.d.ts",
+    "verify:pack": "node ./scripts/verify-pack.mjs",
+    "prepack": "npm run dist && npm run verify:pack",
     "lint": "markdownlint README.md && standard && tsc && npx dpdm --exit-code circular:1 --warning false --tree false src/index.js",
     "debug": "npm run gentesthtml && 0serve -o test.html",
     "debug:node": "node --inspect-brk tests/index.js",
@@ -29,16 +31,11 @@
       "types": "./dist/src/utils/meta.d.ts",
       "default": "./src/utils/meta.js"
     },
-    "./testHelper": {
-      "types": "./dist/tests/testHelper.d.ts",
-      "default": "./tests/testHelper.js"
-    },
     "./package.json": "./package.json"
   },
   "files": [
     "src",
     "dist/src",
-    "tests/testHelper.js",
     "global.d.ts"
   ],
   "dictionaries": {
@@ -52,7 +49,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/yjs/yjs.git"
+    "url": "https://github.com/pproenca/yjs.git"
   },
   "keywords": [
     "Yjs",
@@ -67,7 +64,7 @@
   "email": "kevin.jahns@protonmail.com",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/yjs/yjs/issues"
+    "url": "https://github.com/pproenca/yjs/issues"
   },
   "homepage": "https://docs.yjs.dev",
   "dependencies": {
