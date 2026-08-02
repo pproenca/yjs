@@ -11,7 +11,7 @@ import { UpdateEncoderV1 } from './UpdateEncoder.js'
 import { transact } from './Transaction.js'
 import { UndoManager, StackItem } from './UndoManager.js'
 
-import { $renderer, AttributedContent } from './renderer-helpers.js'
+import { $renderer, AttributedContent, destroyRendererLifecycle, initializeRendererLifecycle, invalidateRendererLifecycle } from './renderer-helpers.js'
 
 export { baseRenderer, AbstractRenderer, rendererContentLength, $renderer } from './renderer-helpers.js'
 
@@ -225,6 +225,7 @@ export class DiffRenderer extends ObservableV2 {
    */
   constructor (prevDoc, nextDoc, { attrs = null } = {}) {
     super()
+    initializeRendererLifecycle(this)
     const _nextDocInserts = createInsertSetFromStructStore(nextDoc.store, false) // unmaintained
     const _prevDocInserts = createInsertSetFromStructStore(prevDoc.store, false) // unmaintained
     const nextDocDeletes = createDeleteSetFromStructStore(nextDoc.store) // maintained
@@ -253,6 +254,9 @@ export class DiffRenderer extends ObservableV2 {
       insertIntoIdMap(this.deletes, extractAttributions(attrs?.deletes, diffDeletes))
       insertIntoIdSet(this.attributed, diffInserts)
       insertIntoIdSet(this.attributed, diffDeletes)
+      if (diffInserts.clients.size > 0 || diffDeletes.clients.size > 0) {
+        invalidateRendererLifecycle(this)
+      }
       // @todo fire update ranges on `diffInserts` and `diffDeletes`
     })
     this._prevBOH = prevDoc.on('beforeObserverCalls', tr => {
@@ -281,6 +285,9 @@ export class DiffRenderer extends ObservableV2 {
       this.attributed = diffIdSet(this.attributed, evicted)
       insertIntoIdSet(this.attributed, intersectSets(evicted, this.inserts))
       insertIntoIdSet(this.attributed, intersectSets(evicted, this.deletes))
+      if (tr.insertSet.clients.size > 0 || tr.deleteSet.clients.size > 0) {
+        invalidateRendererLifecycle(this)
+      }
       // fire event of "changed" attributions. exclude items that were added & deleted in the same
       // transaction
       this.emit('change', [diffIdSet(mergeIdSets([tr.insertSet, tr.deleteSet]), intersectSets(tr.insertSet, tr.deleteSet)), tr.origin, tr.local])
@@ -335,6 +342,7 @@ export class DiffRenderer extends ObservableV2 {
   }
 
   destroy () {
+    destroyRendererLifecycle(this)
     super.destroy()
     this._nextDoc.off('destroy', this._destroyHandler)
     this._prevDoc.off('destroy', this._destroyHandler)

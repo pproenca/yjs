@@ -12,6 +12,16 @@ import * as prng from 'lib0/prng'
 import * as math from 'lib0/math'
 import { bind, $rdt } from 'lib0/delta/rdt'
 import { init } from './testHelper.js' // eslint-disable-line
+import { readRendererLifecycle } from '../src/utils/renderer-helpers.js'
+
+/**
+ * @param {object} renderer
+ */
+const mustReadRendererLifecycle = renderer => {
+  const lifecycle = readRendererLifecycle(renderer)
+  if (lifecycle === null) throw new Error('Expected a tracked renderer')
+  return lifecycle
+}
 
 /**
  * @param {t.TestCase} _tc
@@ -216,6 +226,60 @@ export const testAttributionChange = () => {
   })
   Y.applyUpdate(ydocClone, Y.encodeStateAsUpdate(ydoc))
   t.assert(calledHandler)
+}
+
+export const testRendererLifecycleRevision = () => {
+  const base = new Y.Doc()
+  base.get('text').insert(0, 'a')
+  const next = Y.cloneDoc(base)
+  const renderer = Y.createDiffRenderer(base, next)
+  const initial = mustReadRendererLifecycle(renderer)
+
+  t.assert(initial === mustReadRendererLifecycle(renderer), 'an unchanged renderer keeps its snapshot identity')
+  t.assert(Object.isFrozen(initial), 'renderer lifecycle snapshots are immutable')
+  t.assert(Reflect.set(initial, 'revision', 42) === false, 'callers cannot mutate a lifecycle snapshot')
+  t.assert(initial.revision === 0 && initial.active, 'a new renderer starts live at revision zero')
+  next.transact(() => {})
+  t.assert(initial === mustReadRendererLifecycle(renderer), 'an empty transaction keeps a stable projection snapshot')
+
+  const otherBase = new Y.Doc()
+  const otherNext = new Y.Doc()
+  const other = Y.createDiffRenderer(otherBase, otherNext)
+  const otherInitial = mustReadRendererLifecycle(other)
+  const forged = Object.freeze({ revision: initial.revision, active: initial.active })
+  t.assert(otherInitial !== initial, 'renderers never share lifecycle authority')
+  t.assert(readRendererLifecycle(forged) === null, 'an equal value cannot forge a tracked renderer')
+  t.assert(readRendererLifecycle({}) === null, 'custom renderers are unsupported until explicitly tracked')
+  t.assert(readRendererLifecycle(new Y.TwosetRenderer(Y.createIdMap(), Y.createIdMap())) === null, 'nonparticipating renderers stay untracked')
+  t.assert(readRendererLifecycle(Y.createSnapshotRenderer(Y.snapshot(base))) === null, 'snapshot renderers stay untracked')
+
+  next.get('text').insert(1, 'b')
+  const nextChanged = mustReadRendererLifecycle(renderer)
+  t.assert(nextChanged !== initial && nextChanged.revision > initial.revision, 'next projection changes invalidate snapshots')
+
+  const beforeAttributionChange = nextChanged
+  Y.applyUpdate(base, Y.encodeStateAsUpdate(next))
+  const attributionChanged = mustReadRendererLifecycle(renderer)
+  t.assert(attributionChanged !== beforeAttributionChange && attributionChanged.revision > beforeAttributionChange.revision, 'base attribution changes invalidate snapshots')
+
+  const beforeDeletion = attributionChanged
+  next.get('text').delete(0, 1)
+  const deletionChanged = mustReadRendererLifecycle(renderer)
+  t.assert(deletionChanged !== beforeDeletion && deletionChanged.revision > beforeDeletion.revision, 'deletion-only changes invalidate snapshots')
+
+  renderer.destroy()
+  const destroyed = mustReadRendererLifecycle(renderer)
+  t.assert(destroyed !== deletionChanged && destroyed.revision > deletionChanged.revision, 'destroy invalidates snapshots')
+  t.assert(!destroyed.active, 'destroyed renderers stay inactive')
+
+  next.get('text').insert(0, 'x')
+  t.assert(mustReadRendererLifecycle(renderer) === destroyed, 'destroy removes projection listeners')
+
+  other.destroy()
+  otherBase.destroy()
+  otherNext.destroy()
+  base.destroy()
+  next.destroy()
 }
 
 /**

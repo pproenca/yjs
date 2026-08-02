@@ -4,6 +4,64 @@ import { ObservableV2 } from 'lib0/observable'
 
 import { createIdSet } from './ids.js'
 
+/**
+ * @typedef {{ revision: number, active: boolean }} RendererLifecycleSnapshot
+ */
+
+/**
+ * Renderer lifecycle state is deliberately kept outside renderer instances. Consumers can retain
+ * the frozen snapshot as an identity token, but cannot mutate or replace the current state.
+ *
+ * @type {WeakMap<object, Readonly<RendererLifecycleSnapshot>>}
+ */
+const rendererLifecycles = new WeakMap()
+
+/**
+ * @param {object} renderer
+ */
+export const initializeRendererLifecycle = renderer => {
+  error.assert(!rendererLifecycles.has(renderer))
+  rendererLifecycles.set(renderer, Object.freeze({ revision: 0, active: true }))
+}
+
+/**
+ * @param {object} renderer
+ * @return {Readonly<RendererLifecycleSnapshot>?}
+ */
+export const readRendererLifecycle = renderer => rendererLifecycles.get(renderer) ?? null
+
+/**
+ * @param {object} renderer
+ * @return {Readonly<RendererLifecycleSnapshot>}
+ */
+const requireRendererLifecycle = renderer => {
+  const lifecycle = rendererLifecycles.get(renderer)
+  if (lifecycle === undefined) error.unexpectedCase()
+  return lifecycle
+}
+
+/**
+ * @param {object} renderer
+ */
+export const invalidateRendererLifecycle = renderer => {
+  const lifecycle = requireRendererLifecycle(renderer)
+  rendererLifecycles.set(renderer, Object.freeze({
+    revision: lifecycle.revision + 1,
+    active: lifecycle.active
+  }))
+}
+
+/**
+ * @param {object} renderer
+ */
+export const destroyRendererLifecycle = renderer => {
+  const lifecycle = requireRendererLifecycle(renderer)
+  rendererLifecycles.set(renderer, Object.freeze({
+    revision: lifecycle.revision + 1,
+    active: false
+  }))
+}
+
 export const attributionJsonSchema = s.$object({
   insert: s.$array(s.$string).optional,
   insertAt: s.$number.optional,
