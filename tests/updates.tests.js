@@ -93,7 +93,7 @@ const encoders = [encV1, encV2, encDoc]
 /**
  * @typedef {Enc & {
  *   convert: function(Uint8Array<ArrayBuffer>):Uint8Array<ArrayBuffer>,
- *   decodeUpdate: function(Uint8Array<ArrayBuffer>):{structs:Array<Y.GC|Y.Item|Y.Skip|CausalHole|import('../src/structs/TerminalCausalHole.js').TerminalCausalHole>},
+ *   decodeUpdate: function(Uint8Array<ArrayBuffer>):{structs:Array<Y.GC|Y.Item|Y.Skip|CausalHole|import('../src/structs/TerminalCausalHole.js').TerminalCausalHole|import('../src/structs/ProvenanceGC.js').ProvenanceGC>},
  *   intersectUpdate: function(Uint8Array<ArrayBuffer>,Y.ContentIds):Uint8Array<ArrayBuffer>
  * }} SparseEnc
  */
@@ -115,11 +115,11 @@ const sparseEncoders = [
 ]
 
 const createLaterSparseFixture = () => {
-  const base = new Y.Doc({ gc: false })
+  const base = new Y.Doc({ gc: false, sparseExactResolution: true })
   base.clientID = 1
   base.get('text').insert(0, 'a')
   const baseline = Y.encodeStateAsUpdate(base)
-  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true, sparseExactResolution: true })
   suggestion.clientID = 2
   const renderer = Y.createDiffRenderer(base, suggestion)
   /** @type {Array<Uint8Array<ArrayBuffer>>} */
@@ -143,10 +143,10 @@ const createLaterSparseFixture = () => {
 }
 
 const createSplitSparseFixture = () => {
-  const base = new Y.Doc({ gc: false })
+  const base = new Y.Doc({ gc: false, sparseExactResolution: true })
   base.clientID = 1
   base.get('text').insert(0, 'a')
-  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true, sparseExactResolution: true })
   suggestion.clientID = 2
   const renderer = Y.createDiffRenderer(base, suggestion)
   /** @type {Uint8Array<ArrayBuffer>|null} */
@@ -173,8 +173,8 @@ const createVirtualAnchorFixture = (anchorSide, sourceClient, concurrentClient) 
   seed.clientID = 10
   seed.get('text').insert(0, 'a')
   const baseline = Y.encodeStateAsUpdate(seed)
-  const base = Y.cloneDoc(seed, { gc: false })
-  const suggestion = Y.cloneDoc(seed, { gc: false, isSuggestionDoc: true })
+  const base = Y.cloneDoc(seed, { gc: false, sparseExactResolution: true })
+  const suggestion = Y.cloneDoc(seed, { gc: false, isSuggestionDoc: true, sparseExactResolution: true })
   suggestion.clientID = sourceClient
   const renderer = Y.createDiffRenderer(base, suggestion)
   /** @type {Array<Uint8Array<ArrayBuffer>>} */
@@ -227,8 +227,8 @@ const createInteriorConsumerFixture = () => {
   seed.clientID = 10
   seed.get('text').insert(0, 'a')
   const baseline = Y.encodeStateAsUpdate(seed)
-  const base = Y.cloneDoc(seed, { gc: false })
-  const suggestion = Y.cloneDoc(seed, { gc: false, isSuggestionDoc: true })
+  const base = Y.cloneDoc(seed, { gc: false, sparseExactResolution: true })
+  const suggestion = Y.cloneDoc(seed, { gc: false, isSuggestionDoc: true, sparseExactResolution: true })
   suggestion.clientID = 2
   const renderer = Y.createDiffRenderer(base, suggestion)
   /** @type {Array<Uint8Array<ArrayBuffer>>} */
@@ -361,7 +361,7 @@ export const testSparseCausalHoleCodecMatrix = () => {
       t.assert((Y.decodeStateVector(enc.encodeStateVector(doc)).get(2) ?? 0) === 0, `${enc.description} ${label} requests the hole`)
     }
 
-    const incremental = new Y.Doc({ gc: false })
+    const incremental = new Y.Doc({ gc: false, sparseExactResolution: true })
     enc.applyUpdate(incremental, baseline)
     let updateCount = 0
     /** @type {Y.Transaction|null} */
@@ -374,21 +374,21 @@ export const testSparseCausalHoleCodecMatrix = () => {
     t.assert(Y.equalIdSets(/** @type {Y.Transaction} */ (/** @type {unknown} */ (sparseTransaction)).insertSet, selected.inserts), `${enc.description} transaction ids exclude the envelope`)
 
     const full = enc.encodeStateAsUpdate(fixture.base)
-    const fullReload = new Y.Doc({ gc: false })
+    const fullReload = new Y.Doc({ gc: false, sparseExactResolution: true })
     enc.applyUpdate(fullReload, full)
     assertSparse(fullReload, 'full reload')
     const fullIds = enc.readUpdateToContentIds(full)
     t.assert(!fullIds.inserts.has(2, 0) && fullIds.inserts.has(2, 1), `${enc.description} full content ids exclude holes`)
 
     const merged = enc.mergeUpdates([baseline, sparse])
-    const mergedReload = new Y.Doc({ gc: false })
+    const mergedReload = new Y.Doc({ gc: false, sparseExactResolution: true })
     enc.applyUpdate(mergedReload, merged)
     assertSparse(mergedReload, 'merged reload')
 
-    const baselineDoc = new Y.Doc({ gc: false })
+    const baselineDoc = new Y.Doc({ gc: false, sparseExactResolution: true })
     enc.applyUpdate(baselineDoc, baseline)
     const diff = enc.diffUpdate(merged, enc.encodeStateVector(baselineDoc))
-    const diffReload = new Y.Doc({ gc: false })
+    const diffReload = new Y.Doc({ gc: false, sparseExactResolution: true })
     enc.applyUpdate(diffReload, baseline)
     enc.applyUpdate(diffReload, diff)
     assertSparse(diffReload, 'diff reload')
@@ -417,7 +417,7 @@ export const testSparseCausalHoleSplitArrivalMatrix = () => {
     const sourceRange = fixture.sourceIds.inserts.clients.get(2)?.getIds()[0]
     if (sourceRange === undefined) throw new Error('Missing split source range')
 
-    const residual = new Y.Doc({ gc: false })
+    const residual = new Y.Doc({ gc: false, sparseExactResolution: true })
     enc.applyUpdate(residual, sparse)
     const initialHole = residual.store.getCausalHole(Y.createID(2, sourceRange.clock))
     if (initialHole === null) throw new Error('Missing initial causal hole')
@@ -435,7 +435,7 @@ export const testSparseCausalHoleSplitArrivalMatrix = () => {
     t.assert((Y.decodeStateVector(enc.encodeStateVector(residual)).get(2) ?? 0) === 0)
 
     permutations.forEach(order => {
-      const target = new Y.Doc({ gc: false })
+      const target = new Y.Doc({ gc: false, sparseExactResolution: true })
       enc.applyUpdate(target, sparse)
       order.forEach(offset => {
         const selected = Y.createIdSet()
@@ -448,7 +448,7 @@ export const testSparseCausalHoleSplitArrivalMatrix = () => {
       t.assert(Y.decodeStateVector(enc.encodeStateVector(target)).get(2) === 4)
     })
 
-    const realPreferred = new Y.Doc({ gc: false })
+    const realPreferred = new Y.Doc({ gc: false, sparseExactResolution: true })
     enc.applyUpdate(realPreferred, enc.mergeUpdates([sparse, source]))
     t.assert(realPreferred.get('text').toString() === 'aXYZW', `${enc.description} merge prefers real content`)
     t.assert(realPreferred.store.causalHoles.isEmpty())
@@ -470,14 +470,14 @@ export const testSparseCausalHoleVirtualAnchorConvergenceMatrix = () => {
         const sparseIds = enc.readUpdateToContentIds(sparse)
         t.assert(Y.equalIdSets(sparseIds.inserts, fixture.changes[1].inserts) && Y.equalIdSets(sparseIds.deletes, fixture.changes[1].deletes), `${enc.description} ${anchorSide} sparse ids do not expand`)
 
-        const target = new Y.Doc({ gc: false })
+        const target = new Y.Doc({ gc: false, sparseExactResolution: true })
         enc.applyUpdate(target, enc.convert(fixture.baseline))
         enc.applyUpdate(target, enc.convert(fixture.concurrentUpdate))
         enc.applyUpdate(target, sparse)
         t.assert(target.get('text').toString() === expectedSparse, `${enc.description} ${anchorSide} sparse order matches canonical projection`)
         t.assert(target.store.pendingStructs === null && target.store.pendingDs === null)
 
-        const reloaded = new Y.Doc({ gc: false })
+        const reloaded = new Y.Doc({ gc: false, sparseExactResolution: true })
         enc.applyUpdate(reloaded, enc.encodeStateAsUpdate(target))
         t.assert(reloaded.get('text').toString() === expectedSparse, `${enc.description} ${anchorSide} reload preserves virtual placement`)
         enc.applyUpdate(reloaded, enc.convert(fixture.sourceUpdates[0]))
@@ -507,13 +507,13 @@ export const testSparseCausalHoleInteriorConsumerConvergenceMatrix = () => {
     })
     t.assert(canonical.get('text').toString() === 'aAlkBmC')
 
-    const sparseDoc = new Y.Doc({ gc: false })
+    const sparseDoc = new Y.Doc({ gc: false, sparseExactResolution: true })
     enc.applyUpdate(sparseDoc, enc.convert(fixture.baseline))
     enc.applyUpdate(sparseDoc, enc.convert(fixture.concurrentUpdate))
     enc.applyUpdate(sparseDoc, sparse)
     t.assert(sparseDoc.get('text').toString() === 'alkmC', `${enc.description} interior sparse order matches canonical projection`)
 
-    const reloaded = new Y.Doc({ gc: false })
+    const reloaded = new Y.Doc({ gc: false, sparseExactResolution: true })
     enc.applyUpdate(reloaded, enc.encodeStateAsUpdate(sparseDoc))
     t.assert(reloaded.get('text').toString() === 'alkmC')
     enc.applyUpdate(reloaded, source)
@@ -530,10 +530,10 @@ export const testSparseCausalHoleInteriorConsumerConvergenceMatrix = () => {
 
 export const testSparseCausalHoleLargeRangeCoalescing = () => {
   const length = 100000
-  const base = new Y.Doc({ gc: false })
+  const base = new Y.Doc({ gc: false, sparseExactResolution: true })
   base.clientID = 1
   base.get('text').insert(0, 'a')
-  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true, sparseExactResolution: true })
   suggestion.clientID = 2
   const renderer = Y.createDiffRenderer(base, suggestion)
   suggestion.get('text').insert(1, 'X'.repeat(length - 1) + 'Z')

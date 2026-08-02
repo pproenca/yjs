@@ -17,10 +17,11 @@ import {
 import * as Y from '../src/index.js'
 import { CausalHole, sameCausalHoleMetadata } from '../src/structs/CausalHole.js'
 import { TerminalCausalHole } from '../src/structs/TerminalCausalHole.js'
+import { ProvenanceGC } from '../src/structs/ProvenanceGC.js'
 import { writeStructsFromIdSetWithCausalHoles } from '../src/utils/encoding-helpers.js'
 
 /**
- * @param {Array<Y.GC|Y.Item|Y.Skip|CausalHole|TerminalCausalHole>} structs
+ * @param {Array<Y.GC|Y.Item|Y.Skip|CausalHole|TerminalCausalHole|ProvenanceGC>} structs
  * @param {typeof Y.UpdateEncoderV1|typeof Y.UpdateEncoderV2} Encoder
  */
 const encodeStructs = (structs, Encoder) => {
@@ -42,7 +43,7 @@ const encodeStructs = (structs, Encoder) => {
 }
 
 /**
- * @param {Array<Array<Y.GC|Y.Item|Y.Skip|CausalHole|TerminalCausalHole>>} groups
+ * @param {Array<Array<Y.GC|Y.Item|Y.Skip|CausalHole|TerminalCausalHole|ProvenanceGC>>} groups
  * @param {typeof Y.UpdateEncoderV1|typeof Y.UpdateEncoderV2} Encoder
  */
 const encodeStructGroups = (groups, Encoder) => {
@@ -82,7 +83,7 @@ const encodeDeleteSet = (deleteSet, Encoder) => {
 }
 
 const createCausalHoleBase = () => {
-  const doc = new Y.Doc({ gc: false })
+  const doc = new Y.Doc({ gc: false, sparseExactResolution: true })
   doc.clientID = 1
   doc.get('text').insert(0, 'a')
   return doc
@@ -179,7 +180,7 @@ export const testCausalHoleTransportOnlyUpdateRoundtrip = () => {
       const ids = contentIds(update)
       t.assert(ids.inserts.isEmpty() && ids.deletes.isEmpty(), `${Encoder.name} transport update has no semantic ids`)
       t.assert(decode(update).structs.some(struct => struct.constructor === CausalHole), `${Encoder.name} emitted update carries the hole`)
-      const replay = new Y.Doc({ gc: false })
+      const replay = new Y.Doc({ gc: false, sparseExactResolution: true })
       apply(replay, prior)
       replayApply(replay, update)
       const replayHole = replay.store.getCausalHole(Y.createID(2, 0))
@@ -203,7 +204,7 @@ export const testCausalHoleSnapshotsFailClosed = () => {
     t.assert((state.get(2) ?? 0) === 0, `${Encoder.name} scalar state stops before the hole`)
     t.fails(() => Y.snapshot(doc))
 
-    const restored = new Y.Doc({ gc: false })
+    const restored = new Y.Doc({ gc: false, sparseExactResolution: true })
     t.fails(() => Y.createDocFromSnapshot(doc, denseSnapshot, restored))
     t.assert(restored.store.clients.size === 0 && restored.share.size === 0, `${Encoder.name} sparse restore fails before writes`)
   })
@@ -300,7 +301,7 @@ export const testCausalHoleParentMetadataValidation = () => {
       encodeCausalHoles([new CausalHole(Y.createID(2, 0), 1, Y.createID(1, 0), null, 'map', 'forged')], Encoder)
     )
 
-    const consumer = new Y.Doc({ gc: false })
+    const consumer = new Y.Doc({ gc: false, sparseExactResolution: true })
     consumer.clientID = 1
     consumer.get('left').insert(0, 'a')
     consumer.get('right').insert(0, 'b')
@@ -551,7 +552,7 @@ export const testUnrelatedCausalHoleDoesNotChangeLateChildUnderGc = () => {
     plain.on(/** @type {'update'|'updateV2'} */ (event), update => { plainEvent = update })
     apply(plain, lateChild)
 
-    const sparse = new Y.Doc({ gc: false })
+    const sparse = new Y.Doc({ gc: false, sparseExactResolution: true })
     sparse.clientID = 99
     apply(sparse, parentGc)
     apply(sparse, unrelatedHole)
@@ -577,7 +578,7 @@ export const testCausalHoleTransportRotatesDuplicateClientBeforeLocalAllocation 
     { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, decode: Y.decodeUpdate, event: 'update' },
     { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, decode: Y.decodeUpdateV2, event: 'updateV2' }
   ].forEach(({ Encoder, apply, decode, event }) => {
-    const live = new Y.Doc({ gc: false })
+    const live = new Y.Doc({ gc: false, sparseExactResolution: true })
     live.clientID = 2
     apply(live, encodeCausalHoles([
       new CausalHole(Y.createID(2, 0), 1, null, null, 'text', null)
@@ -597,8 +598,14 @@ export const testCausalHoleTransportRotatesDuplicateClientBeforeLocalAllocation 
     t.assert(live.get('text').toString().includes('L') && live.get('text').toString().includes('X'))
     t.assert(live.store.causalHoles.isEmpty() && live.store.pendingStructs === null && live.store.pendingDs === null)
 
-    const terminal = new Y.Doc({ gc: false })
-    apply(terminal, encodeStructs([new Y.GC(Y.createID(1, 0), 1)], Encoder))
+    const terminal = new Y.Doc({ gc: true, gcFilter: () => false, sparseExactResolution: true })
+    apply(terminal, encodeStructs([
+      new Y.Item(Y.createID(1, 0), null, null, null, null, 'parent', null, new Y.ContentType(new Y.Type()))
+    ], Encoder))
+    const parentDeletion = Y.createIdSet()
+    parentDeletion.add(1, 0, 1)
+    apply(terminal, encodeDeleteSet(parentDeletion, Encoder))
+    terminal.gcFilter = () => true
     terminal.clientID = 2
     apply(terminal, encodeCausalHoles([
       new CausalHole(Y.createID(2, 0), 1, null, null, Y.createID(1, 0), null)
@@ -614,7 +621,7 @@ export const testCausalHoleTransportRotatesDuplicateClientBeforeLocalAllocation 
     apply(terminal, encodeStructs([
       new Y.Item(Y.createID(2, 0), null, null, null, null, Y.createID(1, 0), null, new Y.ContentString('late'))
     ], Encoder))
-    t.assert(terminal.store.getStruct(Y.createID(2, 0))?.constructor === TerminalCausalHole)
+    t.assert(terminal.store.getStruct(Y.createID(2, 0))?.constructor === ProvenanceGC)
     t.assert(terminal.get('local').toString() === 'T')
     t.assert(terminal.store.pendingStructs === null && terminal.store.pendingDs === null)
   })
@@ -625,7 +632,7 @@ export const testCausalHoleStructuralParentDominanceAndDependency = () => {
     { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },
     { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, event: 'updateV2' }
   ].forEach(({ Encoder, apply }) => {
-    const target = new Y.Doc({ gc: false })
+    const target = new Y.Doc({ gc: false, sparseExactResolution: true })
     apply(target, encodeCausalHoles([
       new CausalHole(Y.createID(1, 0), 1, null, null, 'root', null)
     ], Encoder))
@@ -652,7 +659,7 @@ export const testCausalHoleExplicitStoredParentRequiresBundledType = () => {
     { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, merge: Y.mergeUpdatesV2 }
   ].forEach(({ Encoder, apply, encode, merge }) => {
     const createTarget = () => {
-      const target = new Y.Doc({ gc: false })
+      const target = new Y.Doc({ gc: false, sparseExactResolution: true })
       apply(target, encodeCausalHoles([
         new CausalHole(Y.createID(1, 0), 1, null, null, 'root', null)
       ], Encoder))
@@ -954,7 +961,7 @@ export const testCausalHoleReverseDiscoveryCollectsOnce = () => {
    * @param {typeof Y.UpdateEncoderV1|typeof Y.UpdateEncoderV2} Encoder
    * @param {(doc:Y.Doc,update:Uint8Array<ArrayBuffer>)=>void} apply
    * @param {(doc:Y.Doc)=>Uint8Array<ArrayBuffer>} encode
-   * @param {function(Uint8Array<ArrayBuffer>):{structs:Array<Y.GC|Y.Item|Y.Skip|CausalHole|TerminalCausalHole>}} decode
+   * @param {function(Uint8Array<ArrayBuffer>):{structs:Array<Y.GC|Y.Item|Y.Skip|CausalHole|TerminalCausalHole|import('../src/structs/ProvenanceGC.js').ProvenanceGC>}} decode
    */
   const run = (length, Encoder, apply, encode, decode) => {
     const anchors = Array.from({ length }, (_, clock) => new Y.Item(
@@ -970,9 +977,9 @@ export const testCausalHoleReverseDiscoveryCollectsOnce = () => {
       null,
       new Y.ContentString('x')
     ))
-    const source = new Y.Doc({ gc: false })
+    const source = new Y.Doc({ gc: false, sparseExactResolution: true })
     apply(source, encodeStructGroups([anchors, items], Encoder))
-    const known = new Y.Doc({ gc: false })
+    const known = new Y.Doc({ gc: false, sparseExactResolution: true })
     apply(known, encodeStructs(anchors.map((_, clock) => new Y.Item(
       Y.createID(3, clock), null, null, null, null, 'text', null, new Y.ContentString('a')
     )), Encoder))
@@ -1060,7 +1067,7 @@ export const testCausalHoleIncomingTerminalLookupIsIndexed = () => {
       }
       return Reflect.apply(originalFilter, this, arguments)
     }
-    const doc = new Y.Doc({ gc: true })
+    const doc = new Y.Doc({ gc: true, sparseExactResolution: true })
     // eslint-disable-next-line no-extend-native
     Array.prototype.filter = /** @type {typeof Array.prototype.filter} */ (countedFilter)
     try {
@@ -1091,7 +1098,7 @@ export const testCausalHoleStoreIndexesAvoidGlobalApplyScans = () => {
     { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate },
     { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2 }
   ].forEach(({ Encoder, apply }) => {
-    const doc = new Y.Doc({ gc: false })
+    const doc = new Y.Doc({ gc: false, sparseExactResolution: true })
     apply(doc, encodeStructGroups(Array.from({ length: stored }, (_, index) => [
       new CausalHole(Y.createID(1000 + index, 0), 1, null, null, `unrelated-${index}`, null)
     ]), Encoder))
@@ -1148,7 +1155,7 @@ export const testCausalHoleNestedParentGcFinalizationMatrix = () => {
     ], Encoder)
 
     for (const gc of [false, true]) {
-      const doc = new Y.Doc({ gc })
+      const doc = new Y.Doc({ gc, sparseExactResolution: true })
       apply(doc, parents)
       apply(doc, hole)
       apply(doc, dependentHole)
@@ -1164,7 +1171,7 @@ export const testCausalHoleNestedParentGcFinalizationMatrix = () => {
         t.assert(doc.store.causalHoles.has(2, 0) && doc.store.causalHoles.has(4, 0) && doc.store.causalHolesByParent.size === 2, `${Encoder.name} gc:false preserves nested holes`)
       }
 
-      const reloaded = new Y.Doc({ gc })
+      const reloaded = new Y.Doc({ gc, sparseExactResolution: true })
       apply(reloaded, encode(doc))
       t.assert(reloaded.store.pendingStructs === null && reloaded.store.pendingDs === null)
       t.assert(reloaded.get('root').length === 0)
@@ -1174,7 +1181,7 @@ export const testCausalHoleNestedParentGcFinalizationMatrix = () => {
       t.assert(reloaded.store.pendingStructs === null && reloaded.store.pendingDs === null)
       t.assert(reloaded.get('root').length === 0)
       t.assert(reloaded.store.causalHoles.isEmpty(), `${Encoder.name} gc:${gc} late source is materialized or GC-equivalent`)
-      if (gc) t.assert(reloaded.store.getStruct(Y.createID(2, 0))?.constructor === TerminalCausalHole)
+      if (gc) t.assert(reloaded.store.getStruct(Y.createID(2, 0))?.constructor === ProvenanceGC)
     }
   })
 }
@@ -1186,6 +1193,7 @@ export const testCausalHoleTerminalGcTransportOrdering = () => {
       apply: Y.applyUpdate,
       encode: Y.encodeStateAsUpdate,
       merge: Y.mergeUpdates,
+      diff: Y.diffUpdate,
       decode: Y.decodeUpdate,
       contentIds: Y.createContentIdsFromUpdate,
       event: 'update'
@@ -1195,6 +1203,7 @@ export const testCausalHoleTerminalGcTransportOrdering = () => {
       apply: Y.applyUpdateV2,
       encode: Y.encodeStateAsUpdateV2,
       merge: Y.mergeUpdatesV2,
+      diff: Y.diffUpdateV2,
       decode: Y.decodeUpdateV2,
       contentIds: Y.createContentIdsFromUpdateV2,
       event: 'updateV2'
@@ -1215,7 +1224,7 @@ export const testCausalHoleTerminalGcTransportOrdering = () => {
     const terminalSignature = doc => (doc.store.clients.get(2) ?? []).map(struct => [struct.constructor.name, struct.id.clock, struct.length])
     /** @param {Y.Doc} expected @param {Uint8Array<ArrayBuffer>} prior @param {Uint8Array<ArrayBuffer>} update @param {string} label */
     const assertReplay = (expected, prior, update, label) => {
-      const replay = new Y.Doc({ gc: true })
+      const replay = new Y.Doc({ gc: true, sparseExactResolution: true })
       apply(replay, prior)
       apply(replay, update)
       t.compare(terminalSignature(replay), terminalSignature(expected), `${Encoder.name} ${label} replay coverage`)
@@ -1223,7 +1232,7 @@ export const testCausalHoleTerminalGcTransportOrdering = () => {
       t.assert(replay.store.pendingStructs === null && replay.store.pendingDs === null)
     }
 
-    const holeThenDelete = new Y.Doc({ gc: true })
+    const holeThenDelete = new Y.Doc({ gc: true, sparseExactResolution: true })
     apply(holeThenDelete, parents)
     apply(holeThenDelete, hole)
     const holeThenDeletePrior = encode(holeThenDelete)
@@ -1237,7 +1246,7 @@ export const testCausalHoleTerminalGcTransportOrdering = () => {
     t.assert(!contentIds(firstEvent).inserts.has(2, 0), `${Encoder.name} retired terminal coverage is not a semantic insert`)
     assertReplay(holeThenDelete, holeThenDeletePrior, firstEvent, 'parent-hole-delete')
 
-    const deleteThenHole = new Y.Doc({ gc: true })
+    const deleteThenHole = new Y.Doc({ gc: true, sparseExactResolution: true })
     apply(deleteThenHole, parents)
     apply(deleteThenHole, deletion)
     const deleteThenHolePrior = encode(deleteThenHole)
@@ -1260,7 +1269,7 @@ export const testCausalHoleTerminalGcTransportOrdering = () => {
     )
     assertReplay(deleteThenHole, deleteThenHolePrior, secondEvent, 'parent-delete-hole')
 
-    const combined = new Y.Doc({ gc: true })
+    const combined = new Y.Doc({ gc: true, sparseExactResolution: true })
     apply(combined, parents)
     const combinedPrior = encode(combined)
     /** @type {Uint8Array<ArrayBuffer>|null} */
@@ -1373,11 +1382,11 @@ export const testCausalHoleTerminalDurabilityAndSourceDominance = () => {
       new Y.Item(Y.createID(2, 0), null, null, null, null, Y.createID(1, 0), null, new Y.ContentString('xy'))
     ], Encoder)
 
-    const terminal = new Y.Doc({ gc: true })
+    const terminal = new Y.Doc({ gc: true, sparseExactResolution: true })
     apply(terminal, parent)
     apply(terminal, merge([hole, deletion]))
     t.assert(terminal.store.getStruct(Y.createID(2, 0))?.constructor === TerminalCausalHole)
-    t.assert((Y.decodeStateVector(Y.encodeStateVector(terminal)).get(2) ?? 0) === 2, `${Encoder.name} terminal coverage advances state`)
+    t.assert((Y.decodeStateVector(Y.encodeStateVector(terminal)).get(2) ?? 0) === 0, `${Encoder.name} retired coverage keeps the source request floor`)
     t.assert(!Y.createInsertSetFromStructStore(terminal.store, false).has(2, 0))
     t.assert(!terminal.store.ds.has(2, 0))
     t.fails(() => Y.snapshot(terminal))
@@ -1387,26 +1396,26 @@ export const testCausalHoleTerminalDurabilityAndSourceDominance = () => {
     t.assert(fullStructs.some(struct => struct.constructor === TerminalCausalHole && struct.id.client === 2))
     t.assert(!fullStructs.some(struct => struct.constructor === Y.GC && struct.id.client === 2))
     t.assert(!contentIds(full).inserts.has(2, 0) && !contentIds(full).deletes.has(2, 0))
-    t.assert((Y.decodeStateVector(state(full)).get(2) ?? 0) === 2)
+    t.assert((Y.decodeStateVector(state(full)).get(2) ?? 0) === 0)
     const converted = convert(full)
     t.assert(decodeConverted(converted).structs.some(struct => struct.constructor === TerminalCausalHole && struct.id.client === 2))
     t.assert(decode(roundtrip(converted)).structs.some(struct => struct.constructor === TerminalCausalHole && struct.id.client === 2))
 
-    const reloaded = new Y.Doc({ gc: true })
+    const reloaded = new Y.Doc({ gc: true, sparseExactResolution: true })
     apply(reloaded, full)
     t.assert(reloaded.store.getStruct(Y.createID(2, 0))?.constructor === TerminalCausalHole)
     const relayed = encode(reloaded)
     t.assert(decode(relayed).structs.some(struct => struct.constructor === TerminalCausalHole && struct.id.client === 2))
     const diff = encode(reloaded, Y.encodeStateVector(terminal))
-    t.assert(!decode(diff).structs.some(struct => struct.id.client === 2), `${Encoder.name} acknowledged terminal source is not resent`)
+    t.assert(decode(diff).structs.some(struct => struct.constructor === TerminalCausalHole && struct.id.client === 2), `${Encoder.name} retired coverage remains transportable without acknowledging source`)
 
     apply(reloaded, source)
-    t.assert(reloaded.store.getStruct(Y.createID(2, 0))?.constructor === TerminalCausalHole, `${Encoder.name} matching late source cannot replace terminal coverage`)
+    t.assert(reloaded.store.getStruct(Y.createID(2, 0))?.constructor === ProvenanceGC, `${Encoder.name} matching late source materializes semantic provenance`)
     const terminalDeletes = Y.createIdSet()
     terminalDeletes.add(2, 0, 2)
     apply(reloaded, encodeDeleteSet(terminalDeletes, Encoder))
-    t.assert(reloaded.store.getStruct(Y.createID(2, 0))?.constructor === TerminalCausalHole)
-    t.assert(reloaded.store.pendingDs === null && !reloaded.store.ds.has(2, 0), `${Encoder.name} terminal coverage consumes non-semantic DS`)
+    t.assert(reloaded.store.getStruct(Y.createID(2, 0))?.constructor === ProvenanceGC)
+    t.assert(reloaded.store.pendingDs === null && reloaded.store.ds.has(2, 0), `${Encoder.name} provenance remains semantically deleted`)
     const before = encode(reloaded)
     const forgedSource = encodeStructs([
       new Y.Item(Y.createID(2, 0), null, null, null, Y.createID(9, 0), Y.createID(1, 0), null, new Y.ContentString('xy'))
@@ -1434,7 +1443,7 @@ export const testCausalHoleTerminalForgeryAndArrivalOrdering = () => {
       new Y.Item(Y.createID(2, 0), null, null, null, null, Y.createID(1, 0), null, new Y.ContentString('xy'))
     ], Encoder)
 
-    const live = new Y.Doc({ gc: true })
+    const live = new Y.Doc({ gc: true, sparseExactResolution: true })
     apply(live, parent)
     apply(live, hole)
     const liveBefore = encode(live)
@@ -1448,7 +1457,7 @@ export const testCausalHoleTerminalForgeryAndArrivalOrdering = () => {
     t.fails(() => merge([terminal, bareGc]))
     t.fails(() => merge([bareGc, terminal]))
 
-    const conflictingParent = new Y.Doc({ gc: true })
+    const conflictingParent = new Y.Doc({ gc: true, sparseExactResolution: true })
     apply(conflictingParent, parent)
     const storedParent = conflictingParent.store.getStruct(Y.createID(1, 0))
     const conflictingBefore = encode(conflictingParent)
@@ -1467,14 +1476,14 @@ export const testCausalHoleTerminalForgeryAndArrivalOrdering = () => {
     const unprovedTerminal = encodeStructs([
       new TerminalCausalHole(Y.createID(7, 0), 1, null, null, Y.createID(9, 0), null)
     ], Encoder)
-    t.fails(() => apply(new Y.Doc({ gc: true }), merge([
+    t.fails(() => apply(new Y.Doc({ gc: true, sparseExactResolution: true }), merge([
       unprovedTerminal,
       encodeDeleteSet(missingParentDeletion, Encoder)
     ])))
     const rootTerminal = encodeStructs([
       new TerminalCausalHole(Y.createID(6, 0), 1, null, null, 'root', null)
     ], Encoder)
-    t.fails(() => apply(new Y.Doc({ gc: true }), rootTerminal))
+    t.fails(() => apply(new Y.Doc({ gc: true, sparseExactResolution: true }), rootTerminal))
     t.fails(() => merge([rootTerminal, encodeStructs([
       new Y.Item(Y.createID(6, 0), null, null, null, null, 'root', null, new Y.ContentString('x'))
     ], Encoder)]))
@@ -1483,16 +1492,17 @@ export const testCausalHoleTerminalForgeryAndArrivalOrdering = () => {
     deletionIds.add(1, 0, 1)
     const deletion = encodeDeleteSet(deletionIds, Encoder)
     const createDeadParent = () => {
-      const doc = new Y.Doc({ gc: true })
+      const doc = new Y.Doc({ gc: true, gcFilter: () => false, sparseExactResolution: true })
       apply(doc, parent)
       apply(doc, deletion)
+      doc.gcFilter = () => true
       return doc
     }
     const sourceFirst = createDeadParent()
     apply(sourceFirst, source)
-    t.assert(sourceFirst.store.getStruct(Y.createID(2, 0))?.constructor === Y.GC)
+    t.assert(sourceFirst.store.getStruct(Y.createID(2, 0))?.constructor === ProvenanceGC, `source-first: ${sourceFirst.store.getStruct(Y.createID(2, 0))?.constructor.name}`)
     const sourceFirstBefore = encode(sourceFirst)
-    t.fails(() => apply(sourceFirst, terminal))
+    apply(sourceFirst, terminal)
     t.compareArrays(Array.from(encode(sourceFirst)), Array.from(sourceFirstBefore))
 
     const terminalFirst = createDeadParent()
@@ -1504,10 +1514,10 @@ export const testCausalHoleTerminalForgeryAndArrivalOrdering = () => {
     ].forEach(update => {
       const merged = createDeadParent()
       apply(merged, update)
-      t.assert(merged.store.getStruct(Y.createID(2, 0))?.constructor === TerminalCausalHole)
+      t.assert(merged.store.getStruct(Y.createID(2, 0))?.constructor === ProvenanceGC)
       t.compareArrays(Array.from(encode(merged)), Array.from(encode(terminalFirst)))
     })
-    t.assert(sourceFirst.store.getStruct(Y.createID(2, 0))?.constructor === Y.GC)
+    t.assert(sourceFirst.store.getStruct(Y.createID(2, 0))?.constructor === ProvenanceGC)
   })
 }
 
@@ -1516,7 +1526,7 @@ export const testCausalHoleTerminalPreservesRetainedMaterializedBoundaries = () 
     { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate },
     { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2 }
   ].forEach(({ Encoder, apply }) => {
-    const doc = new Y.Doc({ gc: false })
+    const doc = new Y.Doc({ gc: false, sparseExactResolution: true })
     apply(doc, encodeStructGroups([
       [new Y.Item(Y.createID(1, 0), null, null, null, null, 'root', null, new Y.ContentType(new Y.Type()))],
       [new Y.Item(Y.createID(2, 0), null, null, null, null, Y.createID(1, 0), null, new Y.ContentString('abcd'))]
@@ -1555,7 +1565,7 @@ export const testCausalHoleTerminalWaitsForIntegrableDeletedParent = () => {
       encodeStructGroups([[blockedParent], [terminal]], Encoder),
       encodeDeleteSet(deletionIds, Encoder)
     ])
-    const doc = new Y.Doc({ gc: true })
+    const doc = new Y.Doc({ gc: true, sparseExactResolution: true })
     /** @type {Array<Uint8Array<ArrayBuffer>>} */
     const events = []
     doc.on(/** @type {'update'|'updateV2'} */ (event), update => events.push(update))
@@ -1573,7 +1583,7 @@ export const testCausalHoleTerminalWaitsForIntegrableDeletedParent = () => {
       new Y.Item(Y.createID(9, 0), null, null, null, null, 'root', null, new Y.ContentType(new Y.Type()))
     ], Encoder))
     t.assert(doc.store.getStruct(Y.createID(2, 0))?.constructor === TerminalCausalHole, `${Encoder.name} terminalizes after parent integration and GC`)
-    t.assert((Y.decodeStateVector(Y.encodeStateVector(doc)).get(2) ?? 0) === 1)
+    t.assert((Y.decodeStateVector(Y.encodeStateVector(doc)).get(2) ?? 0) === 0)
     t.assert(doc.store.pendingStructs === null && doc.store.pendingDs === null)
   })
 }
@@ -1602,7 +1612,7 @@ export const testCausalHoleRetainedParentArrivalPermutations = () => {
     /** @type {Array<number>|null} */
     let canonical = null
     orders.forEach(order => {
-      const doc = new Y.Doc({ gc: false })
+      const doc = new Y.Doc({ gc: false, sparseExactResolution: true })
       apply(doc, parent)
       order.forEach(index => apply(doc, updates[index]))
       const materialized = doc.store.getStruct(Y.createID(2, 0))
@@ -1670,7 +1680,7 @@ export const testCausalHoleTerminalMayUseDisjointGcEndpoint = () => {
     { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, decode: Y.decodeUpdate },
     { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, decode: Y.decodeUpdateV2 }
   ].forEach(({ Encoder, apply, encode, decode }) => {
-    const doc = new Y.Doc({ gc: true })
+    const doc = new Y.Doc({ gc: true, sparseExactResolution: true })
     apply(doc, encodeStructGroups([
       [new Y.GC(Y.createID(1, 0), 1)],
       [new Y.GC(Y.createID(2, 0), 1)]
@@ -1687,7 +1697,7 @@ export const testCausalHoleTerminalMayUseDisjointGcEndpoint = () => {
     const structs = decode(full).structs.filter(struct => struct.id.client === 2)
     t.assert(structs.some(struct => struct.constructor === Y.GC && struct.id.clock === 0))
     t.assert(structs.some(struct => struct.constructor === TerminalCausalHole && struct.id.clock === 1))
-    const reloaded = new Y.Doc({ gc: true })
+    const reloaded = new Y.Doc({ gc: true, sparseExactResolution: true })
     apply(reloaded, full)
     t.compare(
       (reloaded.store.clients.get(2) ?? []).map(struct => [struct.constructor.name, struct.id.clock, struct.length]),
@@ -1741,15 +1751,16 @@ export const testCausalHoleSplitTerminalMergeUsesSparseParentProof = () => {
     /** @type {Array<number>|null} */
     let canonical = null
     ;[[source, terminal], [terminal, source]].forEach(parts => {
-      const doc = new Y.Doc({ gc: true })
+      const doc = new Y.Doc({ gc: true, gcFilter: () => false, sparseExactResolution: true })
       apply(doc, encodeStructs([
         new Y.Item(Y.createID(1, 0), null, null, null, null, 'root', null, new Y.ContentType(new Y.Type()))
       ], Encoder))
       const deletionIds = Y.createIdSet()
       deletionIds.add(1, 0, 1)
       apply(doc, encodeDeleteSet(deletionIds, Encoder))
-      apply(doc, merge(parts))
-      t.assert(doc.store.getStruct(Y.createID(2, 0))?.constructor === TerminalCausalHole)
+      doc.gcFilter = () => true
+      apply(doc, merge([...parts, encodeDeleteSet(deletionIds, Encoder)]))
+      t.assert(doc.store.getStruct(Y.createID(2, 0))?.constructor === ProvenanceGC, `split merge: ${doc.store.getStruct(Y.createID(2, 0))?.constructor.name}`)
       const encoded = Array.from(encode(doc))
       if (canonical === null) canonical = encoded
       else t.compareArrays(encoded, canonical)
@@ -1763,16 +1774,17 @@ export const testCausalHoleSplitTerminalMergeUsesSparseParentProof = () => {
       new TerminalCausalHole(Y.createID(2, 0), 1, null, Y.createID(3, 0), Y.createID(1, 0), null)
     ], Encoder)
     ;[[rightProof, rightTerminal], [rightTerminal, rightProof]].forEach(parts => {
-      const doc = new Y.Doc({ gc: true })
+      const doc = new Y.Doc({ gc: true, gcFilter: () => false, sparseExactResolution: true })
       apply(doc, encodeStructs([
         new Y.Item(Y.createID(1, 0), null, null, null, null, 'root', null, new Y.ContentType(new Y.Type()))
       ], Encoder))
       const deletionIds = Y.createIdSet()
       deletionIds.add(1, 0, 1)
       apply(doc, encodeDeleteSet(deletionIds, Encoder))
-      apply(doc, merge(parts))
-      t.assert(doc.store.getStruct(Y.createID(2, 0))?.constructor === TerminalCausalHole)
-      t.assert(doc.store.getStruct(Y.createID(3, 0))?.constructor === TerminalCausalHole)
+      doc.gcFilter = () => true
+      apply(doc, merge([...parts, encodeDeleteSet(deletionIds, Encoder)]))
+      t.assert(doc.store.getStruct(Y.createID(2, 0))?.constructor === ProvenanceGC)
+      t.assert(doc.store.getStruct(Y.createID(3, 0))?.constructor === CausalHole)
     })
   })
 }
@@ -1820,13 +1832,13 @@ export const testCausalHoleTerminalParentProofIsStackSafeOnReload = () => {
       null
     ))
     const update = encodeStructGroups([[new Y.GC(Y.createID(1, 0), 1)], terminals], Encoder)
-    const doc = new Y.Doc({ gc: true })
+    const doc = new Y.Doc({ gc: true, sparseExactResolution: true })
     apply(doc, update)
     t.assert(doc.store.getStruct(Y.createID(2, 0))?.constructor === TerminalCausalHole)
     t.assert(doc.store.getStruct(Y.createID(2, length - 1))?.constructor === TerminalCausalHole)
-    const reloaded = new Y.Doc({ gc: true })
+    const reloaded = new Y.Doc({ gc: true, sparseExactResolution: true })
     apply(reloaded, encode(doc))
-    t.assert((Y.decodeStateVector(Y.encodeStateVector(reloaded)).get(2) ?? 0) === length)
+    t.assert((Y.decodeStateVector(Y.encodeStateVector(reloaded)).get(2) ?? 0) === 0)
     t.assert(reloaded.store.pendingStructs === null && reloaded.store.pendingDs === null)
   })
 }
@@ -2094,6 +2106,146 @@ export const testOrdinaryUpdateEncodingExcludesCausalHoles = () => {
   reload.on('update', () => { updateCount++ })
   Y.applyUpdate(reload, roundtrip)
   t.assert(reload.get('text').toString() === 'ordinary' && updateCount === 1)
+}
+
+export const testCausalHoleRetiredProvenanceConvergenceMatrix = () => {
+  ;[
+    {
+      apply: Y.applyUpdate,
+      encode: Y.encodeStateAsUpdate,
+      decode: Y.decodeUpdate,
+      merge: Y.mergeUpdates,
+      diff: Y.diffUpdate,
+      ids: Y.createContentIdsFromUpdate,
+      event: 'update'
+    },
+    {
+      apply: Y.applyUpdateV2,
+      encode: Y.encodeStateAsUpdateV2,
+      decode: Y.decodeUpdateV2,
+      merge: Y.mergeUpdatesV2,
+      diff: Y.diffUpdateV2,
+      ids: Y.createContentIdsFromUpdateV2,
+      event: 'updateV2'
+    }
+  ].forEach(({ apply, encode, decode, merge, diff, ids, event }) => {
+    const base = new Y.Doc({ gc: true, sparseExactResolution: true })
+    base.clientID = 1
+    const child = new Y.Type()
+    base.get('root').insert(0, [child])
+    child.insert(0, 'a')
+    const baseline = encode(base)
+
+    const suggestion = Y.cloneDoc(base, { gc: true, isSuggestionDoc: true, sparseExactResolution: true })
+    suggestion.clientID = 2
+    const renderer = Y.createDiffRenderer(base, suggestion)
+    /** @type {Array<Uint8Array<ArrayBuffer>>} */
+    const sources = []
+    suggestion.on(/** @type {'update'|'updateV2'} */ (event), (update, _origin, _doc, transaction) => {
+      if (transaction.local) sources.push(update)
+    })
+    const suggestionChild = /** @type {Y.Type} */ (suggestion.get('root').slice(0, 1)[0])
+    suggestionChild.insert(1, 'X')
+    suggestionChild.insert(2, 'Y')
+
+    /** @type {Uint8Array<ArrayBuffer>|null} */
+    let sparse = null
+    base.on(/** @type {'update'|'updateV2'} */ (event), update => {
+      if (decode(update).structs.some(struct => struct.constructor === CausalHole)) sparse = update
+    })
+    renderer.resolveContentIds(ids(sources[1]), 'accept')
+    const sparseUpdate = /** @type {Uint8Array<ArrayBuffer>} */ (/** @type {unknown} */ (sparse))
+
+    /** @type {Uint8Array<ArrayBuffer>|null} */
+    let retirement = null
+    base.on(/** @type {'update'|'updateV2'} */ (event), update => {
+      if (decode(update).structs.some(struct => struct.constructor === TerminalCausalHole)) retirement = update
+    })
+    base.get('root').delete(0, 1)
+    const retiredUpdate = /** @type {Uint8Array<ArrayBuffer>} */ (/** @type {unknown} */ (retirement))
+    const retiredStructs = decode(retiredUpdate).structs
+    t.assert(retiredStructs.some(struct => struct.constructor === TerminalCausalHole && struct.id.client === 2 && struct.id.clock === 0))
+    t.assert(retiredStructs.some(struct => struct.constructor === ProvenanceGC && struct.id.client === 2 && struct.id.clock === 1))
+    const retiredPrefix = /** @type {TerminalCausalHole} */ (retiredStructs.find(struct => struct.constructor === TerminalCausalHole && struct.id.client === 2 && struct.id.clock === 0))
+    const provenance = /** @type {ProvenanceGC} */ (retiredStructs.find(struct => struct.constructor === ProvenanceGC && struct.id.client === 2 && struct.id.clock === 1))
+    const Encoder = event === 'update' ? Y.UpdateEncoderV1 : Y.UpdateEncoderV2
+    const liveAtProvenance = new CausalHole(provenance.id, provenance.length, provenance.origin, provenance.rightOrigin, provenance.parent, provenance.parentSub)
+    const retiredAtProvenance = new TerminalCausalHole(provenance.id, provenance.length, provenance.origin, provenance.rightOrigin, provenance.parent, provenance.parentSub)
+    const directOrders = [
+      [encodeStructs([retiredPrefix, liveAtProvenance], Encoder), encodeStructs([provenance], Encoder)],
+      [encodeStructs([retiredPrefix, provenance], Encoder), encodeStructs([liveAtProvenance], Encoder)],
+      [encodeStructs([retiredPrefix, retiredAtProvenance], Encoder), encodeStructs([provenance], Encoder)],
+      [encodeStructs([retiredPrefix, provenance], Encoder), encodeStructs([retiredAtProvenance], Encoder)]
+    ]
+    directOrders.forEach((order, index) => {
+      const target = new Y.Doc({ gc: true, sparseExactResolution: true })
+      apply(target, baseline)
+      target.get('root').delete(0, 1)
+      order.forEach(update => apply(target, update))
+      const installed = target.store.getStruct(Y.createID(2, 1))
+      t.assert(installed?.constructor === ProvenanceGC && installed.id.clock === 1 && installed.length === 1, `${event} direct sparse/provenance order ${index}: ${installed?.constructor.name}`)
+    })
+    const retiredIds = ids(retiredUpdate)
+    t.assert(!retiredIds.inserts.has(2, 0) && !retiredIds.deletes.has(2, 0))
+    t.assert(retiredIds.inserts.has(2, 1) && retiredIds.deletes.has(2, 1))
+
+    const retiredOnly = new Y.Doc({ gc: true, sparseExactResolution: true })
+    apply(retiredOnly, baseline)
+    apply(retiredOnly, sparseUpdate)
+    apply(retiredOnly, retiredUpdate)
+    t.assert((Y.decodeStateVector(Y.encodeStateVector(retiredOnly)).get(2) ?? 0) === 0)
+    const source = sources[0]
+    const requested = diff(source, Y.encodeStateVector(retiredOnly))
+    t.assert(decode(requested).structs.some(struct => struct.constructor === Y.Item && struct.id.client === 2 && struct.id.clock === 0))
+
+    const mergedLeft = merge([source, retiredUpdate])
+    const mergedRight = merge([retiredUpdate, source])
+    t.compareArrays(Array.from(mergedLeft), Array.from(mergedRight))
+    t.compareArrays(Array.from(merge([mergedLeft, mergedLeft])), Array.from(mergedLeft))
+
+    for (const gc of [false, true]) {
+      /** @type {Array<Array<Uint8Array<ArrayBuffer>>>} */
+      const orders = [[source, retiredUpdate], [retiredUpdate, source], [mergedLeft]]
+      const signatures = orders.map(order => {
+        const target = new Y.Doc({ gc, sparseExactResolution: true })
+        apply(target, baseline)
+        apply(target, sparseUpdate)
+        order.forEach(update => apply(target, update))
+        const sourceStructs = target.store.clients.get(2) ?? []
+        t.assert(sourceStructs.length === 1)
+        t.assert(sourceStructs[0].constructor === (gc ? ProvenanceGC : Y.Item))
+        t.assert(sourceStructs[0].deleted && sourceStructs[0].length === 2)
+        t.assert((Y.decodeStateVector(Y.encodeStateVector(target)).get(2) ?? 0) === 2)
+        const full = encode(target)
+        const reloaded = new Y.Doc({ gc, sparseExactResolution: true })
+        apply(reloaded, full)
+        return (reloaded.store.clients.get(2) ?? []).map(struct => [struct.constructor.name, struct.id.clock, struct.length, struct.deleted])
+      })
+      t.compare(signatures[0], signatures[1])
+      t.compare(signatures[1], signatures[2])
+    }
+
+    const disabled = new Y.Doc({ gc: true })
+    apply(disabled, baseline)
+    const before = encode(disabled)
+    t.fails(() => apply(disabled, retiredUpdate))
+    t.compareArrays(Array.from(encode(disabled)), Array.from(before))
+
+    const forged = encodeStructs([
+      new ProvenanceGC(Y.createID(2, 0), 1, null, null, Y.createID(9, 0), null)
+    ], event === 'update' ? Y.UpdateEncoderV1 : Y.UpdateEncoderV2)
+    t.fails(() => merge([source, forged]))
+    const plainGc = encodeStructs([new Y.GC(Y.createID(2, 0), 1)], event === 'update' ? Y.UpdateEncoderV1 : Y.UpdateEncoderV2)
+    t.fails(() => merge([retiredUpdate, plainGc]))
+  })
+
+  const ordinary = new Y.Doc()
+  const enabled = new Y.Doc({ sparseExactResolution: true })
+  ordinary.clientID = enabled.clientID = 42
+  ordinary.get('text').insert(0, 'same')
+  enabled.get('text').insert(0, 'same')
+  t.compareArrays(Array.from(Y.encodeStateAsUpdate(ordinary)), Array.from(Y.encodeStateAsUpdate(enabled)))
+  t.compareArrays(Array.from(Y.encodeStateAsUpdateV2(ordinary)), Array.from(Y.encodeStateAsUpdateV2(enabled)))
 }
 
 /**

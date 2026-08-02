@@ -25,6 +25,7 @@ import { $ydoc } from './schemas.js'
  * @property {boolean} [DocOpts.isSuggestionDoc] Set to true if this document merely suggests
  * changes. If this flag is not set in a suggestion document, automatic formatting changes will be
  * displayed as suggestions, which might not be intended.
+ * @property {boolean} [DocOpts.sparseExactResolution] Enable fork sparse-resolution wire refs.
  */
 
 /**
@@ -51,7 +52,7 @@ export class Doc extends ObservableV2 {
   /**
    * @param {DocOpts} opts configuration
    */
-  constructor ({ guid = random.uuidv4(), collectionid = null, gc = true, gcFilter = () => true, meta = null, autoLoad = false, shouldLoad = true, isSuggestionDoc = false } = {}) {
+  constructor ({ guid = random.uuidv4(), collectionid = null, gc = true, gcFilter = () => true, meta = null, autoLoad = false, shouldLoad = true, isSuggestionDoc = false, sparseExactResolution = false } = {}) {
     super()
     this.gc = gc
     this.gcFilter = gcFilter
@@ -59,6 +60,7 @@ export class Doc extends ObservableV2 {
     this.guid = guid
     this.collectionid = collectionid
     this.isSuggestionDoc = isSuggestionDoc
+    this.sparseExactResolution = sparseExactResolution
     this.cleanupFormatting = !isSuggestionDoc
     /**
      * @type {Map<string, YType>}

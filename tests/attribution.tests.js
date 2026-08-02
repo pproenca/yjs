@@ -2573,10 +2573,10 @@ export const testAttributionResolveContentIdsAcceptObserverFailureReceipt = () =
  * causally blocked; encoding its origin too would resolve adjacent content outside the union.
  */
 export const testAttributionResolveContentIdsLaterAdjacentAccept = () => {
-  const base = new Y.Doc({ gc: false })
+  const base = new Y.Doc({ gc: false, sparseExactResolution: true })
   base.clientID = 1
   base.get('text').insert(0, 'a')
-  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true, sparseExactResolution: true })
   suggestion.clientID = 2
   const renderer = Y.createDiffRenderer(base, suggestion)
   /** @type {Array<Y.ContentIds>} */
@@ -2595,10 +2595,10 @@ export const testAttributionResolveContentIdsLaterAdjacentAccept = () => {
 }
 
 export const testAttributionResolveContentIdsLaterAdjacentReject = () => {
-  const base = new Y.Doc({ gc: false })
+  const base = new Y.Doc({ gc: false, sparseExactResolution: true })
   base.clientID = 1
   base.get('text').insert(0, 'a')
-  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true, sparseExactResolution: true })
   suggestion.clientID = 2
   const renderer = Y.createDiffRenderer(base, suggestion)
   /** @type {Array<Y.ContentIds>} */
@@ -2629,10 +2629,10 @@ export const testAttributionResolveContentIdsLaterAdjacentReject = () => {
 }
 
 export const testAttributionResolveContentIdsLaterThenEarlierConverges = () => {
-  const base = new Y.Doc({ gc: false })
+  const base = new Y.Doc({ gc: false, sparseExactResolution: true })
   base.clientID = 1
   base.get('text').insert(0, 'a')
-  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true, sparseExactResolution: true })
   suggestion.clientID = 2
   const renderer = Y.createDiffRenderer(base, suggestion)
   /** @type {Array<Y.ContentIds>} */
@@ -2654,10 +2654,10 @@ export const testAttributionResolveContentIdsLaterThenEarlierConverges = () => {
 }
 
 export const testAttributionResolveContentIdsSameStructPartialSlice = () => {
-  const base = new Y.Doc({ gc: false })
+  const base = new Y.Doc({ gc: false, sparseExactResolution: true })
   base.clientID = 1
   base.get('text').insert(0, 'a')
-  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true, sparseExactResolution: true })
   suggestion.clientID = 2
   const renderer = Y.createDiffRenderer(base, suggestion)
   /** @type {Y.ContentIds?} */
@@ -2715,10 +2715,10 @@ export const testAttributionResolveContentIdsLaterReplacementAccept = () => {
 }
 
 export const testAttributionResolveContentIdsLaterReplacementReject = () => {
-  const base = new Y.Doc({ gc: false })
+  const base = new Y.Doc({ gc: false, sparseExactResolution: true })
   base.clientID = 1
   base.get('text').insert(0, 'ab')
-  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true, sparseExactResolution: true })
   suggestion.clientID = 2
   const renderer = Y.createDiffRenderer(base, suggestion)
   /** @type {Array<Y.ContentIds>} */
@@ -2766,10 +2766,10 @@ export const testAttributionResolveContentIdsLaterDelete = () => {
 }
 
 export const testAttributionResolveContentIdsLaterFormat = () => {
-  const base = new Y.Doc({ gc: false })
+  const base = new Y.Doc({ gc: false, sparseExactResolution: true })
   base.clientID = 1
   base.get('text').insert(0, 'ab')
-  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true, sparseExactResolution: true })
   suggestion.clientID = 2
   const renderer = Y.createDiffRenderer(base, suggestion)
   /** @type {Array<Y.ContentIds>} */
@@ -2788,9 +2788,9 @@ export const testAttributionResolveContentIdsLaterFormat = () => {
 }
 
 export const testAttributionResolveContentIdsNestedSiblingLaterFirst = () => {
-  const base = new Y.Doc({ gc: false })
+  const base = new Y.Doc({ gc: false, sparseExactResolution: true })
   base.clientID = 1
-  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true })
+  const suggestion = Y.cloneDoc(base, { gc: false, isSuggestionDoc: true, sparseExactResolution: true })
   suggestion.clientID = 2
   const renderer = Y.createDiffRenderer(base, suggestion)
   /** @type {Array<Y.ContentIds>} */

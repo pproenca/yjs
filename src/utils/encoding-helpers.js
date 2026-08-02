@@ -8,13 +8,14 @@ import { Item } from '../structs/Item.js'
 import { GC } from '../structs/GC.js'
 import { CausalHole, CausalHoleIndex, createCausalHoleFromItem, sameCausalHoleMetadata } from '../structs/CausalHole.js'
 import { TerminalCausalHole, sameTerminalCausalHoleMetadata } from '../structs/TerminalCausalHole.js'
+import { ProvenanceGC } from '../structs/ProvenanceGC.js'
 import { createID } from './ID.js'
 import { createIdSet, intersectSets, mergeIdSets, writeIdSet } from './ids.js'
 import { forEachLiveCausalHole, forEachTerminalCausalHole } from './sparse-transport.js'
 
 /**
  * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
- * @param {Array<GC|Item|Skip|CausalHole|TerminalCausalHole>} structs All structs by `client`
+ * @param {Array<GC|Item|Skip|CausalHole|TerminalCausalHole|ProvenanceGC>} structs All structs by `client`
  * @param {number} client
  * @param {Array<IdRange>} idranges
  *
@@ -245,10 +246,10 @@ const assertAcyclicCausalHoles = holes => {
  * @param {Array<TerminalCausalHole>} [terminalHoles]
  */
 const writeSparseSelection = (encoder, sourceStore, selected, holes, terminalHoles = []) => {
-  /** @type {Map<number,Array<{struct:Item|CausalHole|TerminalCausalHole|GC,start:number,end:number}>>} */
+  /** @type {Map<number,Array<{struct:Item|CausalHole|TerminalCausalHole|ProvenanceGC|GC,start:number,end:number}>>} */
   const blocks = new Map()
   /**
-   * @param {Item|CausalHole|TerminalCausalHole|GC} struct
+   * @param {Item|CausalHole|TerminalCausalHole|ProvenanceGC|GC} struct
    * @param {number} start
    * @param {number} end
    */
@@ -267,9 +268,9 @@ const writeSparseSelection = (encoder, sourceStore, selected, holes, terminalHol
     let clock = range.clock
     while (clock < end) {
       const struct = structs[index++]
-      if (struct === undefined || (struct.constructor !== Item && struct.constructor !== GC) || struct.id.clock > clock) throw new Error('Selected content is not materialized')
+      if (struct === undefined || (struct.constructor !== Item && struct.constructor !== GC && struct.constructor !== ProvenanceGC) || struct.id.clock > clock) throw new Error('Selected content is not materialized')
       const sliceEnd = Math.min(end, struct.id.clock + struct.length)
-      add(/** @type {Item|GC} */ (struct), clock, sliceEnd)
+      add(/** @type {Item|GC|ProvenanceGC} */ (struct), clock, sliceEnd)
       clock = sliceEnd
     }
   })
@@ -295,7 +296,7 @@ const writeSparseSelection = (encoder, sourceStore, selected, holes, terminalHol
         result.push(block)
       }
       return result
-    }, /** @type {Array<{struct:Item|CausalHole|TerminalCausalHole|GC,start:number,end:number}>} */ ([]))
+    }, /** @type {Array<{struct:Item|CausalHole|TerminalCausalHole|ProvenanceGC|GC,start:number,end:number}>} */ ([]))
     let count = clientBlocks.length
     let clock = clientBlocks[0].start
     for (let i = 1; i < clientBlocks.length; i++) {
