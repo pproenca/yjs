@@ -9,7 +9,7 @@ import { createID } from './ID.js'
 import { writeStructsFromIdSet } from './encoding-helpers.js'
 import { applyUpdate, encodeStateAsUpdate } from './encoding.js'
 import { UpdateEncoderV1 } from './UpdateEncoder.js'
-import { transact } from './Transaction.js'
+import { isReservedMutationTransaction, transact } from './Transaction.js'
 import { UndoManager, StackItem } from './UndoManager.js'
 
 import { $renderer, AttributedContent, cloneRendererContentAttribute, cloneRendererIdMap, cloneRendererIdSet, destroyRendererLifecycle, initializeRendererLifecycle, invalidateRendererLifecycle, registerRendererExecutionAdapter } from './renderer-helpers.js'
@@ -29,6 +29,8 @@ export { baseRenderer, AbstractRenderer, rendererContentLength, $renderer } from
 
 /** @type {WeakMap<DiffRenderer, DiffRendererProjection>} */
 const diffRendererProjections = new WeakMap()
+/** @type {WeakMap<DiffRenderer,{suggestionMode:boolean,suggestionOrigins:ReadonlyArray<any>|null}>} */
+const diffRendererPolicies = new WeakMap()
 
 /**
  * @param {DiffRenderer} renderer
@@ -37,6 +39,32 @@ const getDiffRendererProjection = renderer => {
   const projection = diffRendererProjections.get(renderer)
   if (projection === undefined) throw new Error('DiffRenderer projection is not initialized')
   return projection
+}
+
+/** @param {DiffRenderer} renderer */
+const getDiffRendererPolicy = renderer => {
+  const policy = diffRendererPolicies.get(renderer)
+  if (policy === undefined) throw new Error('DiffRenderer policy is not initialized')
+  return policy
+}
+
+/** @param {ReadonlyArray<any>|null} origins @param {any} origin */
+const policyAllowsOrigin = (origins, origin) => {
+  if (origins === null) return true
+  for (let index = 0; index < origins.length; index++) {
+    if (origins[index] === origin) return true
+  }
+  return false
+}
+
+/** @param {ReadonlyArray<any>|null} origins */
+const captureSuggestionOrigins = origins => {
+  if (origins === null) return null
+  if (!Array.isArray(origins)) throw new TypeError('suggestionOrigins must be an array or null')
+  /** @type {any[]} */
+  const captured = []
+  for (let index = 0; index < origins.length; index++) appendDense(captured, origins[index])
+  return Object.freeze(captured)
 }
 
 const objectDefineProperty = Object.defineProperty
@@ -408,7 +436,7 @@ export class DiffRenderer extends ObservableV2 {
         readDiffRendererContent(this, contents, client, clock, deleted, content, shouldRender)
       },
       contentLength: (/** @type {Item} */ item) => diffRendererContentLength(this, item)
-    }))
+    }), [prevDoc, nextDoc])
     // update before observer calls fired
     this._nextBOH = nextDoc.on('beforeObserverCalls', tr => {
       const diffInserts = diffIdSet(tr.insertSet, _prevDocInserts)
@@ -472,15 +500,19 @@ export class DiffRenderer extends ObservableV2 {
       origin !== this && applyUpdate(nextDoc, update)
     })
     this._ndUpdateListener = nextDoc.on('update', (update, origin, _doc, tr) => {
+      if (isReservedMutationTransaction(tr)) return
+      const policy = getDiffRendererPolicy(this)
       // only if event is local and suggestion mode is enabled
-      if (!this.suggestionMode && tr.local && (this.suggestionOrigins == null || this.suggestionOrigins.some(o => o === origin))) {
+      if (!policy.suggestionMode && tr.local && policyAllowsOrigin(policy.suggestionOrigins, origin)) {
         applyUpdate(prevDoc, update, this)
       }
     })
     this._afterTrListener = nextDoc.on('afterTransaction', (tr) => {
+      if (isReservedMutationTransaction(tr)) return
+      const policy = getDiffRendererPolicy(this)
       // apply deletes on attributed deletes (content that is already deleted, but is rendered by
       // the renderer)
-      if (!this.suggestionMode && tr.local && (this.suggestionOrigins == null || this.suggestionOrigins.some(o => o === tr.origin))) {
+      if (!policy.suggestionMode && tr.local && policyAllowsOrigin(policy.suggestionOrigins, tr.origin)) {
         const attributedDeletes = tr.meta.get('attributedDeletes')
         if (attributedDeletes != null) {
           transact(prevDoc, () => {
@@ -493,19 +525,32 @@ export class DiffRenderer extends ObservableV2 {
         }
       }
     })
-    this.suggestionMode = true
-    /**
-     * Optionally limit origins that may sync changes to the main doc if suggestion-mode is
-     * disabled.
-     *
-     * @type {Array<any>?}
-     */
-    this.suggestionOrigins = null
+    diffRendererPolicies.set(this, { suggestionMode: true, suggestionOrigins: null })
     this._destroyHandler = nextDoc.on('destroy', this.destroy.bind(this))
     prevDoc.on('destroy', this._destroyHandler)
   }
 
   get $type () { return $renderer }
+
+  get suggestionMode () { return getDiffRendererPolicy(this).suggestionMode }
+
+  /** @param {boolean} value */
+  set suggestionMode (value) {
+    if (typeof value !== 'boolean') throw new TypeError('suggestionMode must be a boolean')
+    const policy = getDiffRendererPolicy(this)
+    policy.suggestionMode = value
+    invalidateRendererLifecycle(this)
+  }
+
+  /** @return {ReadonlyArray<any>|null} */
+  get suggestionOrigins () { return getDiffRendererPolicy(this).suggestionOrigins }
+
+  /** @param {ReadonlyArray<any>|null} value */
+  set suggestionOrigins (value) {
+    const policy = getDiffRendererPolicy(this)
+    policy.suggestionOrigins = captureSuggestionOrigins(value)
+    invalidateRendererLifecycle(this)
+  }
 
   /**
    * A detached snapshot of pending insert attributions.

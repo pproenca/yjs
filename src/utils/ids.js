@@ -11,6 +11,41 @@ import { iterateStructs, findIndexSS, iterateStructsWithoutSplits, tryGc } from 
 import { UpdateEncoderV2, IdSetEncoderV2 } from './UpdateEncoder.js'
 import { IdSetDecoderV2 } from './UpdateDecoder.js'
 
+const objectCreate = Object.create
+const objectDefineProperty = Object.defineProperty
+const objectFreeze = Object.freeze
+const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
+const objectGetPrototypeOf = Object.getPrototypeOf
+const objectHasOwnProperty = Object.prototype.hasOwnProperty
+const reflectApply = Reflect.apply
+const mapForEach = Map.prototype.forEach
+const mapGet = Map.prototype.get
+const mapSet = Map.prototype.set
+const mapSize = /** @type {() => number} */ (/** @type {PropertyDescriptor} */ (objectGetOwnPropertyDescriptor(Map.prototype, 'size')).get)
+const arraySort = Array.prototype.sort
+
+/** @param {object} value @param {PropertyKey} key */
+const hasOwn = (value, key) => reflectApply(objectHasOwnProperty, value, [key])
+
+/** @param {object} value @param {PropertyKey} key */
+const readCanonicalOwnData = (value, key) => {
+  const descriptor = objectGetOwnPropertyDescriptor(value, key)
+  if (descriptor === undefined || !hasOwn(descriptor, 'value')) {
+    throw new Error('Invalid canonical ID-set state')
+  }
+  return descriptor.value
+}
+
+/** @param {any[]} values @param {any} value */
+const appendDense = (values, value) => {
+  objectDefineProperty(values, values.length, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true
+  })
+}
+
 /**
  * @typedef {{ inserts: IdSet, deletes: IdSet }} ContentIds
  */
@@ -673,6 +708,303 @@ export const _intersectSets = (setA, setB) => {
 export const intersectSets = _intersectSets
 
 export const createIdSet = () => new IdSet()
+
+/** @param {IdSet} idSet */
+const readCanonicalClients = idSet => {
+  if (objectGetPrototypeOf(idSet) !== IdSet.prototype) throw new Error('Invalid canonical IdSet')
+  const clients = readCanonicalOwnData(idSet, 'clients')
+  if (objectGetPrototypeOf(clients) !== Map.prototype) throw new Error('Invalid canonical IdSet clients')
+  return /** @type {Map<number,IdRanges>} */ (clients)
+}
+
+/** @param {IdRanges} ranges */
+const readCanonicalRanges = ranges => {
+  if (objectGetPrototypeOf(ranges) !== IdRanges.prototype) throw new Error('Invalid canonical IdRanges')
+  const ids = readCanonicalOwnData(ranges, '_ids')
+  const sorted = readCanonicalOwnData(ranges, 'sorted')
+  const lastIsUsed = readCanonicalOwnData(ranges, '_lastIsUsed')
+  if (objectGetPrototypeOf(ids) !== Array.prototype || typeof sorted !== 'boolean' || typeof lastIsUsed !== 'boolean') {
+    throw new Error('Invalid canonical IdRanges state')
+  }
+  return /** @type {{ids:Array<IdRange>,sorted:boolean,lastIsUsed:boolean}} */ ({ ids, sorted, lastIsUsed })
+}
+
+/** @param {IdRange} range */
+const readCanonicalRange = range => {
+  if (objectGetPrototypeOf(range) !== IdRange.prototype) throw new Error('Invalid canonical IdRange')
+  const clock = readCanonicalOwnData(range, 'clock')
+  const len = readCanonicalOwnData(range, 'len')
+  if (!Number.isSafeInteger(clock) || clock < 0 || !Number.isSafeInteger(len) || len < 0) {
+    throw new Error('Invalid canonical IdRange bounds')
+  }
+  return { clock, len }
+}
+
+/** @param {number} clock @param {number} len */
+const createCanonicalRange = (clock, len) => {
+  const range = /** @type {IdRange} */ (objectCreate(IdRange.prototype))
+  objectDefineProperty(range, 'clock', { configurable: true, enumerable: true, value: clock, writable: true })
+  objectDefineProperty(range, 'len', { configurable: true, enumerable: true, value: len, writable: true })
+  return range
+}
+
+/** @param {Array<IdRange>} ids @param {boolean} sorted */
+const createCanonicalRanges = (ids, sorted) => {
+  const ranges = /** @type {IdRanges} */ (objectCreate(IdRanges.prototype))
+  objectDefineProperty(ranges, 'sorted', { configurable: true, enumerable: true, value: sorted, writable: true })
+  objectDefineProperty(ranges, '_lastIsUsed', { configurable: true, enumerable: true, value: false, writable: true })
+  objectDefineProperty(ranges, '_ids', { configurable: true, enumerable: true, value: ids, writable: true })
+  return ranges
+}
+
+const createCanonicalIdSet = () => {
+  const idSet = /** @type {IdSet} */ (objectCreate(IdSet.prototype))
+  objectDefineProperty(idSet, 'clients', {
+    configurable: true,
+    enumerable: true,
+    value: new Map(),
+    writable: true
+  })
+  return idSet
+}
+
+/** @param {IdRanges} ranges */
+const normalizeCanonicalRanges = ranges => {
+  const state = readCanonicalRanges(ranges)
+  const ids = state.ids
+  if (!state.sorted) {
+    for (let index = 0; index < ids.length; index++) readCanonicalRange(ids[index])
+    reflectApply(arraySort, ids, [(left, right) => readCanonicalRange(left).clock - readCanonicalRange(right).clock])
+    let write = 0
+    for (let read = 0; read < ids.length; read++) {
+      const current = readCanonicalRange(ids[read])
+      if (current.len === 0) continue
+      if (write === 0) {
+        objectDefineProperty(ids, write++, { configurable: true, enumerable: true, value: ids[read], writable: true })
+        continue
+      }
+      const previousRange = ids[write - 1]
+      const previous = readCanonicalRange(previousRange)
+      if (previous.clock + previous.len >= current.clock) {
+        const end = Math.max(previous.clock + previous.len, current.clock + current.len)
+        if (end !== previous.clock + previous.len) {
+          objectDefineProperty(ids, write - 1, {
+            configurable: true,
+            enumerable: true,
+            value: createCanonicalRange(previous.clock, end - previous.clock),
+            writable: true
+          })
+        }
+      } else {
+        objectDefineProperty(ids, write++, { configurable: true, enumerable: true, value: ids[read], writable: true })
+      }
+    }
+    ids.length = write
+    objectDefineProperty(ranges, 'sorted', { configurable: true, enumerable: true, value: true, writable: true })
+  } else {
+    for (let index = 0; index < ids.length; index++) readCanonicalRange(ids[index])
+  }
+  objectDefineProperty(ranges, '_lastIsUsed', { configurable: true, enumerable: true, value: true, writable: true })
+  return ids
+}
+
+/** @param {IdSet} idSet @param {number} client @param {number} clock @param {number} len */
+const addCanonicalRange = (idSet, client, clock, len) => {
+  if (!Number.isSafeInteger(client) || client < 0 || !Number.isSafeInteger(clock) || clock < 0 || !Number.isSafeInteger(len) || len < 0) {
+    throw new Error('Invalid canonical ID range')
+  }
+  if (len === 0) return
+  const clients = readCanonicalClients(idSet)
+  const ranges = /** @type {IdRanges|undefined} */ (reflectApply(mapGet, clients, [client]))
+  if (ranges === undefined) {
+    /** @type {IdRange[]} */
+    const ids = []
+    appendDense(ids, createCanonicalRange(clock, len))
+    reflectApply(mapSet, clients, [client, createCanonicalRanges(ids, true)])
+    return
+  }
+  const state = readCanonicalRanges(ranges)
+  const ids = state.ids
+  const last = ids.length === 0 ? null : ids[ids.length - 1]
+  if (last !== null) {
+    const bounds = readCanonicalRange(last)
+    if (bounds.clock + bounds.len === clock) {
+      if (state.lastIsUsed) {
+        objectDefineProperty(ids, ids.length - 1, {
+          configurable: true,
+          enumerable: true,
+          value: createCanonicalRange(bounds.clock, bounds.len + len),
+          writable: true
+        })
+        objectDefineProperty(ranges, '_lastIsUsed', { configurable: true, enumerable: true, value: false, writable: true })
+      } else {
+        objectDefineProperty(last, 'len', { configurable: true, enumerable: true, value: bounds.len + len, writable: true })
+      }
+      return
+    }
+  }
+  appendDense(ids, createCanonicalRange(clock, len))
+  objectDefineProperty(ranges, 'sorted', { configurable: true, enumerable: true, value: false, writable: true })
+}
+
+/** @param {IdSet} idSet @param {(ranges:IdRanges,client:number) => void} callback */
+const forEachCanonicalClient = (idSet, callback) => {
+  const clients = readCanonicalClients(idSet)
+  reflectApply(mapForEach, clients, [(ranges, client) => {
+    if (!Number.isSafeInteger(client) || client < 0) throw new Error('Invalid canonical client ID')
+    readCanonicalRanges(ranges)
+    callback(ranges, client)
+  }])
+}
+
+/** @param {IdSet} idSet @param {ID} id */
+const hasCanonicalId = (idSet, id) => {
+  const client = readCanonicalOwnData(id, 'client')
+  const clock = readCanonicalOwnData(id, 'clock')
+  const ranges = /** @type {IdRanges|undefined} */ (reflectApply(mapGet, readCanonicalClients(idSet), [client]))
+  if (ranges === undefined) return false
+  const ids = normalizeCanonicalRanges(ranges)
+  let left = 0
+  let right = ids.length - 1
+  while (left <= right) {
+    const middle = Math.floor((left + right) / 2)
+    const range = readCanonicalRange(ids[middle])
+    if (clock < range.clock) right = middle - 1
+    else if (clock >= range.clock + range.len) left = middle + 1
+    else return true
+  }
+  return false
+}
+
+/** @param {IdSet} idSet */
+const isCanonicalIdSetEmpty = idSet => reflectApply(mapSize, readCanonicalClients(idSet), []) === 0
+
+/** @param {IdSet} idSet */
+const cloneCanonicalIdSet = idSet => {
+  const clone = createCanonicalIdSet()
+  forEachCanonicalClient(idSet, (ranges, client) => {
+    const ids = normalizeCanonicalRanges(ranges)
+    for (let index = 0; index < ids.length; index++) {
+      const range = readCanonicalRange(ids[index])
+      addCanonicalRange(clone, client, range.clock, range.len)
+    }
+  })
+  return clone
+}
+
+/** @param {IdSet} idSet @param {IdSet} excluded */
+const differenceCanonicalIdSet = (idSet, excluded) => {
+  const result = createCanonicalIdSet()
+  const excludedClients = readCanonicalClients(excluded)
+  forEachCanonicalClient(idSet, (ranges, client) => {
+    const source = normalizeCanonicalRanges(ranges)
+    const excludedRanges = /** @type {IdRanges|undefined} */ (reflectApply(mapGet, excludedClients, [client]))
+    if (excludedRanges === undefined) {
+      for (let index = 0; index < source.length; index++) {
+        const range = readCanonicalRange(source[index])
+        addCanonicalRange(result, client, range.clock, range.len)
+      }
+      return
+    }
+    const exclude = normalizeCanonicalRanges(excludedRanges)
+    let excludeIndex = 0
+    for (let sourceIndex = 0; sourceIndex < source.length; sourceIndex++) {
+      const sourceRange = readCanonicalRange(source[sourceIndex])
+      let clock = sourceRange.clock
+      const end = sourceRange.clock + sourceRange.len
+      while (excludeIndex < exclude.length && readCanonicalRange(exclude[excludeIndex]).clock + readCanonicalRange(exclude[excludeIndex]).len <= clock) excludeIndex++
+      let currentExclude = excludeIndex
+      while (currentExclude < exclude.length) {
+        const excludedRange = readCanonicalRange(exclude[currentExclude])
+        if (excludedRange.clock >= end) break
+        if (clock < excludedRange.clock) addCanonicalRange(result, client, clock, Math.min(end, excludedRange.clock) - clock)
+        clock = Math.max(clock, excludedRange.clock + excludedRange.len)
+        if (clock >= end) break
+        currentExclude++
+      }
+      if (clock < end) addCanonicalRange(result, client, clock, end - clock)
+    }
+  })
+  return result
+}
+
+/** @param {IdSet} left @param {IdSet} right */
+const canonicalSetsIntersect = (left, right) => {
+  const rightClients = readCanonicalClients(right)
+  let intersects = false
+  forEachCanonicalClient(left, (leftRanges, client) => {
+    if (intersects) return
+    const rightRanges = /** @type {IdRanges|undefined} */ (reflectApply(mapGet, rightClients, [client]))
+    if (rightRanges === undefined) return
+    const leftIds = normalizeCanonicalRanges(leftRanges)
+    const rightIds = normalizeCanonicalRanges(rightRanges)
+    let leftIndex = 0
+    let rightIndex = 0
+    while (leftIndex < leftIds.length && rightIndex < rightIds.length) {
+      const leftRange = readCanonicalRange(leftIds[leftIndex])
+      const rightRange = readCanonicalRange(rightIds[rightIndex])
+      if (leftRange.clock < rightRange.clock + rightRange.len && rightRange.clock < leftRange.clock + leftRange.len) {
+        intersects = true
+        return
+      }
+      if (leftRange.clock + leftRange.len <= rightRange.clock) leftIndex++
+      else rightIndex++
+    }
+  })
+  return intersects
+}
+
+/** @param {IdSet} idSet */
+const countCanonicalRanges = idSet => {
+  let count = 0
+  forEachCanonicalClient(idSet, ranges => { count += normalizeCanonicalRanges(ranges).length })
+  return count
+}
+
+/** @param {IdSet} idSet */
+const snapshotCanonicalRanges = idSet => {
+  /** @type {Array<{client:number,ranges:IdRange[]}>} */
+  const buckets = []
+  forEachCanonicalClient(idSet, (ranges, client) => appendDense(buckets, { client, ranges: normalizeCanonicalRanges(ranges) }))
+  reflectApply(arraySort, buckets, [(left, right) => left.client - right.client])
+  /** @type {Array<{readonly client:number,readonly clock:number,readonly length:number}>} */
+  const snapshot = []
+  for (let bucketIndex = 0; bucketIndex < buckets.length; bucketIndex++) {
+    const bucket = buckets[bucketIndex]
+    for (let rangeIndex = 0; rangeIndex < bucket.ranges.length; rangeIndex++) {
+      const range = readCanonicalRange(bucket.ranges[rangeIndex])
+      appendDense(snapshot, objectFreeze({ client: bucket.client, clock: range.clock, length: range.len }))
+    }
+  }
+  return objectFreeze(snapshot)
+}
+
+/**
+ * Reserved mutation ID accounting. This is intentionally not re-exported from a package barrel.
+ * Every operation closes over module-captured kernels and validates canonical own-data state.
+ *
+ * @internal
+ */
+export const reservedMutationIdSetRuntime = objectFreeze({
+  create: createCanonicalIdSet,
+  add: addCanonicalRange,
+  hasId: hasCanonicalId,
+  isEmpty: isCanonicalIdSetEmpty,
+  clone: cloneCanonicalIdSet,
+  difference: differenceCanonicalIdSet,
+  hasIntersection: canonicalSetsIntersect,
+  countRanges: countCanonicalRanges,
+  snapshotRanges: snapshotCanonicalRanges
+})
+
+/** @internal @param {IdSet} idSet @param {number} client @param {number} clock @param {number} len */
+export const addToIdSetCanonical = (idSet, client, clock, len) => addCanonicalRange(idSet, client, clock, len)
+
+/** @internal @param {IdSet} idSet */
+export const isIdSetEmptyCanonical = idSet => isCanonicalIdSetEmpty(idSet)
+
+/** @internal @param {IdRanges} ranges */
+export const normalizeIdRangesCanonical = ranges => normalizeCanonicalRanges(ranges)
 
 /**
  * @param {StructStore} ss

@@ -2,7 +2,8 @@ import * as Y from '../src/index.js'
 import * as delta from 'lib0/delta'
 import * as t from 'lib0/testing'
 import * as s from 'lib0/schema'
-import { ContentType, Item } from '../src/structs/Item.js'
+import { ContentString, ContentType, Item } from '../src/structs/Item.js'
+import { IdRanges, IdSet, reservedMutationIdSetRuntime } from '../src/utils/ids.js'
 import { cloneRendererContentAttribute } from '../src/utils/renderer-helpers.js'
 
 /**
@@ -818,6 +819,73 @@ export const testReservedDeltaMutationSealsRendererExecution = () => {
   }
 }
 
+export const testReservedDeltaMutationSnapshotsRendererDependenciesAndPolicy = () => {
+  {
+    const base = new Y.Doc({ gc: false })
+    const suggestion = new Y.Doc({ gc: false })
+    base.on('beforeObserverCalls', () => { throw new Error('base listener failed before renderer projection') })
+    const renderer = Y.createDiffRenderer(base, suggestion, { attrs: new Y.Attributions() })
+    const type = suggestion.get('content')
+    const prepared = type.reserveDeltaMutation(delta.create().insert('reserved').done(), null, { renderer })
+    t.fails(() => base.get('base').applyDelta(delta.create().insert('changed').done()))
+    assertNamedFailure(() => prepared.apply(), 'DeltaMutationStaleError')
+    t.assert(type.toString() === '', 'direct base dependency revision rejects despite a throwing listener')
+  }
+
+  {
+    const base = new Y.Doc({ gc: false })
+    const suggestion = new Y.Doc({ gc: false })
+    const renderer = Y.createDiffRenderer(base, suggestion, { attrs: new Y.Attributions() })
+    const origin = { trusted: true }
+    /** @type {Array<object>} */
+    const origins = [origin]
+    renderer.suggestionOrigins = origins
+    const type = suggestion.get('content')
+    const staleMode = type.reserveDeltaMutation(delta.create().insert('stale').done(), origin, { renderer })
+    renderer.suggestionMode = false
+    assertNamedFailure(() => staleMode.apply(), 'DeltaMutationStaleError')
+
+    renderer.suggestionMode = true
+    const prepared = type.reserveDeltaMutation(delta.create().insert('owned').done(), origin, { renderer })
+    origins[0] = { forged: true }
+    t.assert(Object.isFrozen(renderer.suggestionOrigins) && renderer.suggestionOrigins?.[0] === origin, 'origin policy is a frozen defensive copy')
+    prepared.apply({
+      afterMutation: () => {
+        renderer.suggestionMode = false
+        renderer.suggestionOrigins = [origin]
+      }
+    })
+    t.assert(type.toString() === 'owned' && base.get('content').toString() === '', 'reserved update never forwards after cleanup policy flip')
+  }
+}
+
+export const testReservedDeltaMutationNeverForwardsAttributedDeletes = () => {
+  /** @param {boolean} throwing */
+  const run = throwing => {
+    const base = new Y.Doc({ gc: false })
+    base.clientID = 1
+    const suggestion = new Y.Doc({ gc: false })
+    suggestion.clientID = 2
+    const renderer = Y.createDiffRenderer(base, suggestion, { attrs: new Y.Attributions() })
+    base.get('content').applyDelta(delta.create().insert('base').done())
+    const type = suggestion.get('content')
+    type.useRenderer(renderer)
+    type.applyDelta(delta.create().delete(4).done())
+    const prepared = type.reserveDeltaMutation(delta.create().delete(4).done(), null, { renderer })
+    const apply = () => prepared.apply({
+      afterMutation: () => {
+        renderer.suggestionMode = false
+        if (throwing) throw new Error('trusted cleanup callback failed')
+      }
+    })
+    if (throwing) assertNamedFailure(apply, 'DeltaMutationInvariantError')
+    else apply()
+    t.assert(base.get('content').toString() === 'base', `reserved attributed deletes stay private${throwing ? ' after callback failure' : ''}`)
+  }
+  run(false)
+  run(true)
+}
+
 export const testReservedDeltaMutationUsesCanonicalNestedIntegration = () => {
   const typeDescriptor = Object.getOwnPropertyDescriptor(ContentType.prototype, 'type')
   const contentIntegrateDescriptor = Object.getOwnPropertyDescriptor(ContentType.prototype, 'integrate')
@@ -877,6 +945,94 @@ export const testReservedDeltaMutationUsesCanonicalNestedIntegration = () => {
   }
   t.assert(failure === null && itemIntegrateCalls === 0, 'reserved inserts use the private Item integration kernel')
   t.assert(/** @type {Y.Type} */ (itemType.get(0)).toString() === '<child>owned</child>')
+}
+
+export const testReservedDeltaMutationRejectsPoisonedExecutionKernelsPrewrite = () => {
+  /** @type {Array<[object, PropertyKey, boolean]>} */
+  const cases = [
+    [IdSet.prototype, 'add', false],
+    [IdSet.prototype, 'forEach', false],
+    [IdSet.prototype, 'isEmpty', false],
+    [IdRanges.prototype, 'getIds', false],
+    [Item.prototype, 'delete', true],
+    [ContentString.prototype, 'getLength', false]
+  ]
+  for (let index = 0; index < cases.length; index++) {
+    const [prototype, key, deleting] = cases[index]
+    const doc = new Y.Doc()
+    const type = doc.get('content')
+    type.applyDelta(delta.create().insert('a').done())
+    const createMutation = () => deleting ? delta.create().delete(1).done() : delta.create().insert('x').done()
+    const rejected = type.reserveDeltaMutation(createMutation())
+    const survivor = type.reserveDeltaMutation(createMutation())
+    const staleAfterCommit = type.reserveDeltaMutation(createMutation())
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, key)
+    let rejectedCallback = false
+    /** @type {any} */
+    let survivorCapture = null
+    let updates = 0
+    doc.on('update', () => { updates++ })
+    try {
+      Object.defineProperty(prototype, key, {
+        configurable: true,
+        value: () => { throw new Error(`poisoned ${String(key)}`) }
+      })
+      assertNamedFailure(
+        () => rejected.apply({ afterMutation: () => { rejectedCallback = true } }),
+        'DeltaMutationStaleError'
+      )
+    } finally {
+      Object.defineProperty(prototype, key, /** @type {PropertyDescriptor} */ (descriptor))
+    }
+    t.assert(!rejectedCallback && updates === 0 && type.toString() === 'a', `${String(key)} poisoning is zero-write`)
+    survivor.apply({ afterMutation: content => { survivorCapture = content } })
+    assertReservedContent(survivorCapture, survivor.reservation)
+    t.assert(updates === 1 && type.toString() === (deleting ? '' : 'xa'), `${String(key)} rejection preserves capture, update, and revision accounting`)
+    assertNamedFailure(() => staleAfterCommit.apply(), 'DeltaMutationStaleError')
+  }
+}
+
+export const testReservedDeltaMutationOwnsNestedIntegrationAndGuardsChildFields = () => {
+  const doc = new Y.Doc()
+  const type = doc.get('content')
+  const integrateDescriptor = Object.getOwnPropertyDescriptor(Y.Type.prototype, '_integrate')
+  /** @type {any} */
+  let prepared
+  try {
+    Object.defineProperty(Y.Type.prototype, '_integrate', {
+      configurable: true,
+      value: () => { throw new Error('mutable nested integration') }
+    })
+    prepared = type.reserveDeltaMutation(delta.create().insert([delta.create('child').insert('owned')]).done())
+  } finally {
+    Object.defineProperty(Y.Type.prototype, '_integrate', /** @type {PropertyDescriptor} */ (integrateDescriptor))
+  }
+  prepared.apply()
+  const child = /** @type {Y.Type} */ (type.get(0))
+  t.assert(child.doc === doc && child.toString() === '<child>owned</child>', 'prepared nested types use the captured YType integration kernel')
+
+  const guarded = type.reserveDeltaMutation(delta.create().modify(delta.create().insert('x')).done())
+  const itemDescriptor = Object.getOwnPropertyDescriptor(child, '_item')
+  let getterCalls = 0
+  let callbackCalls = 0
+  let updates = 0
+  doc.on('update', () => { updates++ })
+  try {
+    Object.defineProperty(child, '_item', {
+      configurable: true,
+      get: () => {
+        getterCalls++
+        throw new Error('guarded child getter')
+      }
+    })
+    assertNamedFailure(
+      () => guarded.apply({ afterMutation: () => { callbackCalls++ } }),
+      'DeltaMutationStaleError'
+    )
+  } finally {
+    Object.defineProperty(child, '_item', /** @type {PropertyDescriptor} */ (itemDescriptor))
+  }
+  t.assert(getterCalls === 0 && callbackCalls === 0 && updates === 0 && child.toString() === '<child>owned</child>', 'own-data guards reject without invoking child accessors')
 }
 
 export const testReservedDeltaMutationAvoidsInheritedArraySetters = () => {
@@ -1152,6 +1308,12 @@ export const testReservedDeltaMutationRejectsMalformedNamesKeysAndOversizeGraphs
     'DeltaMutationPreparationError'
   )
 
+  const primitiveInsert = new Array(250000).fill(0)
+  assertNamedFailure(
+    () => type.reserveDeltaMutation(delta.create().insert(primitiveInsert).done()),
+    'DeltaMutationPreparationError'
+  )
+
   /** @type {any} */
   let shared = delta.create('leaf').insert('x').done()
   for (let depth = 0; depth < 16; depth++) {
@@ -1344,6 +1506,28 @@ export const testReservedDeltaMutationScaleProbes = () => {
   formatting.apply({ afterMutation: content => { exact = content } })
   assertReservedContent(exact, formatting.reservation)
   t.assert(formatting.reservation.rangeCountUpperBound === 1 && exact.inserts.length === 1 && exact.inserts[0].length === 2)
+}
+
+export const testReservedDeltaMutationRangeSnapshotScaling = () => {
+  const sizes = [2000, 4000, 8000]
+  /** @type {number[]} */
+  const durations = []
+  for (let sizeIndex = 0; sizeIndex < sizes.length; sizeIndex++) {
+    const size = sizes[sizeIndex]
+    const ids = reservedMutationIdSetRuntime.create()
+    for (let client = size; client > 0; client--) {
+      reservedMutationIdSetRuntime.add(ids, client, 0, 1)
+      reservedMutationIdSetRuntime.add(ids, client, 1, 1)
+    }
+    const started = performance.now()
+    const snapshot = reservedMutationIdSetRuntime.snapshotRanges(ids)
+    durations.push(performance.now() - started)
+    t.assert(snapshot.length === size && snapshot[0].client === 1 && snapshot[size - 1].client === size)
+    for (let index = 1; index < snapshot.length; index++) {
+      t.assert(snapshot[index - 1].client < snapshot[index].client, 'range snapshot has deterministic client ordering')
+    }
+  }
+  t.assert(durations[2] < (durations[1] + 1) * 3.5 && durations[1] < (durations[0] + 1) * 3.5, `range snapshot scaling is nonquadratic: ${durations.join(', ')}`)
 }
 
 export const testReservedDeltaMutationDeterministicFuzz = () => {

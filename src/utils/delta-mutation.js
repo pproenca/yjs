@@ -1,9 +1,9 @@
 import * as delta from 'lib0/delta'
 
-import { ContentFormat, ContentType, createContentTypeCanonical } from '../structs/Item.js'
-import { createIdSet, diffIdSet, intersectSets } from './ids.js'
-import { readRendererExecutionAdapter, readRendererLifecycle, rendererContentLength } from './renderer-helpers.js'
-import { readDocumentStructuralRevision, transact } from './Transaction.js'
+import { ContentFormat, ContentString, ContentType, Item, reservedMutationItemRuntime } from '../structs/Item.js'
+import { IdRanges, IdSet, reservedMutationIdSetRuntime } from './ids.js'
+import { readRendererExecutionAdapter, readRendererLifecycle } from './renderer-helpers.js'
+import { assertReservedMutationTransaction, readDocumentStructuralRevision, transactReservedMutation } from './Transaction.js'
 
 /**
  * @typedef {{ readonly client: number, readonly clock: number, readonly length: number }} StructuralIdRange
@@ -20,7 +20,7 @@ import { readDocumentStructuralRevision, transact } from './Transaction.js'
  *   apply: (options?: DeltaMutationApplyOptions) => delta.DeltaBuilder<any>?,
  *   discard: () => void
  * }} PreparedDeltaMutation
- * @typedef {(transaction: Transaction, mutation: object, renderer: AbstractRenderer?) => delta.DeltaBuilder<any>?} DeltaMutationExecutor
+ * @typedef {(transaction: Transaction, mutation: object, renderer: AbstractRenderer?, runtime: ReservedMutationRuntime) => delta.DeltaBuilder<any>?} DeltaMutationExecutor
  * @typedef {(type:YType<any>, renderer:AbstractRenderer?) => DeltaMutationPlan} DeltaMutationPlanRenderer
  * @typedef {{
  *   status: 'prepared'|'applying'|'consumed'|'discarded',
@@ -29,13 +29,15 @@ import { readDocumentStructuralRevision, transact } from './Transaction.js'
  *   renderer: AbstractRenderer?,
  *   executionRenderer: AbstractRenderer?,
  *   rendererLifecycle: Readonly<{revision:number,active:boolean}>?,
+ *   rendererDependencyRevisions: readonly {doc:Doc,revision:number}[],
  *   documentRevision: number,
  *   mutation: object,
  *   origin: any,
  *   rangeCountUpperBound: number,
  *   executor: DeltaMutationExecutor,
  *   canonicalApplyDelta: CanonicalDeltaApply,
- *   guardedTypes: Set<YType<any>>
+ *   guardedTypes: Map<YType<any>,Readonly<Record<string,PropertyDescriptor>>>,
+ *   runtime: ReservedMutationRuntime
  * }} PreparedDeltaMutationState
  * @typedef {{ item: Item?, offset: number }} StructuralCursor
  * @typedef {{
@@ -44,11 +46,23 @@ import { readDocumentStructuralRevision, transact } from './Transaction.js'
  *   allocates: boolean,
  *   doc: Doc,
  *   canonicalApplyDelta: CanonicalDeltaApply,
- *   guardedTypes: Set<YType<any>>,
+ *   guardedTypes: Map<YType<any>,Readonly<Record<string,PropertyDescriptor>>>,
+ *   runtime: ReservedMutationRuntime,
  *   createNestedType: (name:null|string) => YType<any>,
  *   renderDeltaPlan: DeltaMutationPlanRenderer
  * }} ReservationScan
  * @typedef {{ readonly name: null|string, readonly children: readonly any[], readonly attrs: readonly any[], readonly preparedFix?: delta.DeltaBuilder<any>? }} DeltaMutationPlan
+ * @typedef {{
+ *   readonly idSets: typeof reservedMutationIdSetRuntime,
+ *   readonly items: typeof reservedMutationItemRuntime,
+ *   readonly integrateType: (type:YType<any>,doc:Doc,item:Item) => void,
+ *   readonly mapGet: (map:Map<any,any>,key:any) => any,
+ *   readonly mapSet: (map:Map<any,any>,key:any,value:any) => void,
+ *   readonly mapForEach: (map:Map<any,any>,callback:(value:any,key:any) => void) => void,
+ *   readonly rendererContentLength: (renderer:AbstractRenderer?,item:Item) => number,
+ *   readonly rendererHasItem: (renderer:AbstractRenderer?,item:Item) => boolean,
+ *   readonly rendererReadContent: (renderer:AbstractRenderer,contents:any[],item:Item,behavior:0|1|2|3) => void
+ * }} ReservedMutationRuntime
  */
 
 // Reserved mutation preparation is deliberately finite. These bounds apply only to the privately
@@ -57,6 +71,7 @@ const maxDeltaMutationDepth = 256
 const maxDeltaMutationNodes = 4096
 const maxDeltaMutationPayloadDepth = 64
 const maxDeltaMutationPayloadNodes = 8192
+const maxDeltaMutationPayloadUnits = 200000
 
 const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
 const objectGetPrototypeOf = Object.getPrototypeOf
@@ -64,9 +79,13 @@ const objectKeys = Object.keys
 const objectFreeze = Object.freeze
 const objectCreate = Object.create
 const objectDefineProperty = Object.defineProperty
+const objectIs = Object.is
 const reflectApply = Reflect.apply
 const arrayPop = Array.prototype.pop
 const objectHasOwnProperty = Object.prototype.hasOwnProperty
+const mapForEach = Map.prototype.forEach
+const mapGet = Map.prototype.get
+const mapSet = Map.prototype.set
 /** @param {object} value @param {PropertyKey} key */
 const objectHasOwn = (value, key) => reflectApply(objectHasOwnProperty, value, [key])
 /** @param {any[]} values @param {number} index @param {any} value */
@@ -81,6 +100,79 @@ const defineDenseIndex = (values, index, value) => {
 /** @param {any[]} values @param {any} value */
 const appendDense = (values, value) => defineDenseIndex(values, values.length, value)
 const privateDeltaPlans = new WeakSet()
+/** @type {WeakMap<object,{integrateType:Function}>} */
+const reservedMutationRuntimeStates = new WeakMap()
+const itemDeletedGetter = /** @type {() => boolean} */ (/** @type {PropertyDescriptor} */ (objectGetOwnPropertyDescriptor(Item.prototype, 'deleted')).get)
+
+/** @type {Array<[object,PropertyKey,PropertyDescriptor]>} */
+const guardedRuntimeKernels = [
+  [IdSet.prototype, 'add', /** @type {PropertyDescriptor} */ (objectGetOwnPropertyDescriptor(IdSet.prototype, 'add'))],
+  [IdSet.prototype, 'forEach', /** @type {PropertyDescriptor} */ (objectGetOwnPropertyDescriptor(IdSet.prototype, 'forEach'))],
+  [IdSet.prototype, 'isEmpty', /** @type {PropertyDescriptor} */ (objectGetOwnPropertyDescriptor(IdSet.prototype, 'isEmpty'))],
+  [IdRanges.prototype, 'getIds', /** @type {PropertyDescriptor} */ (objectGetOwnPropertyDescriptor(IdRanges.prototype, 'getIds'))],
+  [Item.prototype, 'delete', /** @type {PropertyDescriptor} */ (objectGetOwnPropertyDescriptor(Item.prototype, 'delete'))],
+  [ContentString.prototype, 'getLength', /** @type {PropertyDescriptor} */ (objectGetOwnPropertyDescriptor(ContentString.prototype, 'getLength'))]
+]
+
+/** @param {PropertyDescriptor|undefined} left @param {PropertyDescriptor} right */
+const descriptorsEqual = (left, right) => left !== undefined &&
+  left.configurable === right.configurable &&
+  left.enumerable === right.enumerable &&
+  left.writable === right.writable &&
+  left.value === right.value &&
+  left.get === right.get &&
+  left.set === right.set
+
+const runtimeKernelsAreFresh = () => {
+  for (let index = 0; index < guardedRuntimeKernels.length; index++) {
+    const [target, key, descriptor] = guardedRuntimeKernels[index]
+    if (!descriptorsEqual(objectGetOwnPropertyDescriptor(target, key), descriptor)) return false
+  }
+  return true
+}
+
+/** @param {(this:YType<any>,doc:Doc,item:Item|null) => void} integrateType */
+const createReservedMutationRuntime = integrateType => {
+  /** @type {ReservedMutationRuntime} */
+  const runtime = objectFreeze({
+    idSets: reservedMutationIdSetRuntime,
+    items: reservedMutationItemRuntime,
+    integrateType: (type, doc, item) => reflectApply(integrateType, type, [doc, item]),
+    mapGet: (target, key) => {
+      if (objectGetPrototypeOf(target) !== Map.prototype) throw new DeltaMutationInvariantError('Reserved mutation encountered a noncanonical Map')
+      return reflectApply(mapGet, target, [key])
+    },
+    mapSet: (target, key, value) => {
+      if (objectGetPrototypeOf(target) !== Map.prototype) throw new DeltaMutationInvariantError('Reserved mutation encountered a noncanonical Map')
+      reflectApply(mapSet, target, [key, value])
+    },
+    mapForEach: (target, callback) => {
+      if (objectGetPrototypeOf(target) !== Map.prototype) throw new DeltaMutationInvariantError('Reserved mutation encountered a noncanonical Map')
+      reflectApply(mapForEach, target, [callback])
+    },
+    rendererHasItem: (renderer, item) => renderer !== null && reflectApply(renderer.hasItem, renderer, [item]),
+    rendererReadContent: (renderer, contents, item, behavior) => {
+      reflectApply(renderer.readContent, renderer, [contents, item.id.client, item.id.clock, reflectApply(itemDeletedGetter, item, []), item.content, behavior])
+    },
+    rendererContentLength: (renderer, item) => renderer !== null && reflectApply(renderer.hasItem, renderer, [item])
+      ? reflectApply(renderer.contentLength, renderer, [item])
+      : ((reflectApply(itemDeletedGetter, item, []) || !reservedMutationItemRuntime.isContentCountable(item.content)) ? 0 : item.length)
+  })
+  reservedMutationRuntimeStates.set(runtime, { integrateType })
+  return runtime
+}
+
+/** @param {ReservedMutationRuntime} runtime */
+const assertReservedMutationRuntimeIntegrity = runtime => {
+  if (
+    reservedMutationRuntimeStates.get(runtime) === undefined ||
+    runtime.idSets !== reservedMutationIdSetRuntime ||
+    runtime.items !== reservedMutationItemRuntime ||
+    !runtimeKernelsAreFresh()
+  ) {
+    throw new DeltaMutationStaleError('Reserved mutation runtime integrity changed')
+  }
+}
 
 /** @param {any} value */
 const isRecord = value => {
@@ -537,49 +629,61 @@ export class DeltaMutationInvariantError extends Error {
 
 /** @type {WeakMap<object, PreparedDeltaMutationState>} */
 const preparedMutations = new WeakMap()
+const guardedTypeFields = objectFreeze(['doc', '_item', '_start', '_map', '_length', '_searchMarker', '_hasFormatting', '_renderer', '_prelim'])
 
-/**
- * @param {IdSet} ids
- */
-const cloneIdSet = ids => {
-  const clone = createIdSet()
-  ids.forEach((range, client) => clone.add(client, range.clock, range.len))
-  return clone
-}
-
-/**
- * @param {IdSet} ids
- */
-const countRanges = ids => {
-  let count = 0
-  ids.clients.forEach(ranges => { count += ranges.getIds().length })
-  return count
-}
-
-/**
- * @param {IdSet} ids
- * @return {readonly StructuralIdRange[]}
- */
-const freezeRanges = ids => {
-  /** @type {StructuralIdRange[]} */
-  const result = []
-  ids.forEach((range, client) => {
-    appendDense(result, objectFreeze({ client, clock: range.clock, length: range.len }))
-  })
-  for (let index = 1; index < result.length; index++) {
-    const range = result[index]
-    let insertion = index
-    while (
-      insertion > 0 &&
-      (result[insertion - 1].client > range.client ||
-        (result[insertion - 1].client === range.client && result[insertion - 1].clock > range.clock))
-    ) {
-      defineDenseIndex(result, insertion, result[insertion - 1])
-      insertion--
+/** @param {YType<any>} type */
+const captureGuardedType = type => {
+  const snapshot = objectCreate(null)
+  for (let index = 0; index < guardedTypeFields.length; index++) {
+    const key = guardedTypeFields[index]
+    const descriptor = objectGetOwnPropertyDescriptor(type, key)
+    if (descriptor === undefined || !objectHasOwn(descriptor, 'value')) {
+      throw new DeltaMutationPreparationError(`Reserved delta target has an accessor or missing ${key} field`)
     }
-    defineDenseIndex(result, insertion, range)
+    if (key === '_map' && objectGetPrototypeOf(descriptor.value) !== Map.prototype) {
+      throw new DeltaMutationPreparationError('Reserved delta target has a noncanonical map')
+    }
+    objectDefineProperty(snapshot, key, {
+      configurable: false,
+      enumerable: true,
+      value: objectFreeze({
+        configurable: descriptor.configurable,
+        enumerable: descriptor.enumerable,
+        value: descriptor.value,
+        writable: descriptor.writable
+      }),
+      writable: false
+    })
   }
-  return objectFreeze(result)
+  return objectFreeze(snapshot)
+}
+
+/** @param {ReservationScan} scan @param {YType<any>} type */
+const guardType = (scan, type) => {
+  let snapshot = scan.runtime.mapGet(scan.guardedTypes, type)
+  if (snapshot === undefined) {
+    snapshot = captureGuardedType(type)
+    scan.runtime.mapSet(scan.guardedTypes, type, snapshot)
+  }
+  return snapshot
+}
+
+/** @param {YType<any>} type @param {Readonly<Record<string,PropertyDescriptor>>} snapshot */
+const guardedTypeIsFresh = (type, snapshot) => {
+  for (let index = 0; index < guardedTypeFields.length; index++) {
+    const key = guardedTypeFields[index]
+    const expected = snapshot[key]
+    const descriptor = objectGetOwnPropertyDescriptor(type, key)
+    if (
+      descriptor === undefined ||
+      !objectHasOwn(descriptor, 'value') ||
+      descriptor.configurable !== expected.configurable ||
+      descriptor.enumerable !== expected.enumerable ||
+      descriptor.writable !== expected.writable ||
+      !objectIs(descriptor.value, expected.value)
+    ) return false
+  }
+  return true
 }
 
 /**
@@ -587,17 +691,17 @@ const freezeRanges = ids => {
  * @param {ReservationScan} scan
  */
 const addDeletedTypeContents = (item, scan) => {
-  if (item.content.constructor !== ContentType) return
+  if (objectGetPrototypeOf(item.content) !== ContentType.prototype) return
   const type = /** @type {ContentType} */ (item.content).type
   for (let child = type._start; child !== null; child = child.right) {
     if (!child.deleted) {
-      scan.deletes.add(child.id.client, child.id.clock, child.length)
+      scan.runtime.idSets.add(scan.deletes, child.id.client, child.id.clock, child.length)
       addDeletedTypeContents(child, scan)
     }
   }
-  type._map.forEach(child => {
+  scan.runtime.mapForEach(type._map, child => {
     if (!child.deleted) {
-      scan.deletes.add(child.id.client, child.id.clock, child.length)
+      scan.runtime.idSets.add(scan.deletes, child.id.client, child.id.clock, child.length)
       addDeletedTypeContents(child, scan)
     }
   })
@@ -611,7 +715,7 @@ const addDeletedTypeContents = (item, scan) => {
  */
 const addDeleteSlice = (item, offset, length, scan) => {
   if (item.deleted || length === 0) return
-  scan.deletes.add(item.id.client, item.id.clock + offset, length)
+  scan.runtime.idSets.add(scan.deletes, item.id.client, item.id.clock + offset, length)
   if (offset === 0 && length === item.length) addDeletedTypeContents(item, scan)
 }
 
@@ -641,7 +745,7 @@ const advanceStructuralCursor = (cursor, length, renderer, scan, deleting, forma
   while (length > 0) {
     const item = cursor.item
     if (item === null) throw new DeltaMutationPreparationError('Delta exceeds the rendered content range')
-    const renderedLength = rendererContentLength(renderer, item)
+    const renderedLength = scan.runtime.rendererContentLength(renderer, item)
     if (renderedLength === 0) {
       if (deleting || formatting) addFormatHazard(item, scan)
       cursor.item = item.right
@@ -667,7 +771,7 @@ const advanceStructuralCursor = (cursor, length, renderer, scan, deleting, forma
  * @param {ReservationScan} scan
  */
 const collectTrailingFormatHazards = (cursor, renderer, scan) => {
-  for (let item = cursor.item; item !== null && rendererContentLength(renderer, item) === 0; item = item.right) {
+  for (let item = cursor.item; item !== null && scan.runtime.rendererContentLength(renderer, item) === 0; item = item.right) {
     addFormatHazard(item, scan)
   }
 }
@@ -675,10 +779,11 @@ const collectTrailingFormatHazards = (cursor, renderer, scan) => {
 /**
  * @param {StructuralCursor} cursor
  * @param {AbstractRenderer?} renderer
+ * @param {ReservedMutationRuntime} runtime
  */
-const findRenderedItem = (cursor, renderer) => {
+const findRenderedItem = (cursor, renderer, runtime) => {
   let item = cursor.item
-  while (item !== null && rendererContentLength(renderer, item) === 0) item = item.right
+  while (item !== null && runtime.rendererContentLength(renderer, item) === 0) item = item.right
   return item
 }
 
@@ -718,7 +823,8 @@ const prepareInsertedTypes = (mutation, scan) => {
       if (entry.kind === 'nested') {
         const value = prepareInsertedTypes(entry.value, scan)
         const type = scan.createNestedType(value.name)
-        defineDenseIndex(insert, insertIndex, objectFreeze({ kind: entry.kind, value, type, content: createContentTypeCanonical(type) }))
+        guardType(scan, type)
+        defineDenseIndex(insert, insertIndex, objectFreeze({ kind: entry.kind, value, type, content: scan.runtime.items.createContentType(type) }))
       } else {
         defineDenseIndex(insert, insertIndex, entry)
       }
@@ -740,14 +846,14 @@ const prepareInsertedTypes = (mutation, scan) => {
  * @param {ReservationScan} scan
  */
 const scanDeltaMutation = (type, mutation, renderer, scan) => {
-  if (type.doc !== scan.doc || !hasCanonicalApplyDelta(type, scan.canonicalApplyDelta)) {
+  const guarded = guardType(scan, type)
+  if (guarded.doc.value !== scan.doc || !hasCanonicalApplyDelta(type, scan.canonicalApplyDelta)) {
     throw new DeltaMutationPreparationError('Reserved delta mutation requires canonical target types')
   }
-  scan.guardedTypes.add(type)
-  const typeItem = type._item
+  const typeItem = guarded._item.value
   if (typeItem !== null && typeItem.deleted) {
     let preparedFix = null
-    if (rendererContentLength(renderer, typeItem) > 0) {
+    if (scan.runtime.rendererContentLength(renderer, typeItem) > 0) {
       const rendered = scan.renderDeltaPlan(type, renderer)
       const inverse = invertDeltaMutationPlan(mutation, rendered)
       if (inverse.children.length > 0 || inverse.attrs.length > 0) {
@@ -780,7 +886,7 @@ const scanDeltaMutation = (type, mutation, renderer, scan) => {
   }
   const children = new Array(mutation.children.length)
   /** @type {StructuralCursor} */
-  const cursor = { item: type._start, offset: 0 }
+  const cursor = { item: guarded._start.value, offset: 0 }
   for (let index = 0; index < mutation.children.length; index++) {
     const op = mutation.children[index]
     if (op.kind === 'text' || op.kind === 'insert') {
@@ -799,8 +905,8 @@ const scanDeltaMutation = (type, mutation, renderer, scan) => {
       collectTrailingFormatHazards(cursor, renderer, scan)
       defineDenseIndex(children, index, op)
     } else if (op.kind === 'modify') {
-      const item = findRenderedItem(cursor, renderer)
-      if (item === null || item.content.constructor !== ContentType || cursor.offset !== 0) {
+      const item = findRenderedItem(cursor, renderer, scan.runtime)
+      if (item === null || objectGetPrototypeOf(item.content) !== ContentType.prototype || cursor.offset !== 0) {
         throw new DeltaMutationPreparationError('Delta modify target is not a structural child type')
       }
       const value = scanDeltaMutation(/** @type {ContentType} */ (item.content).type, op.value, renderer, scan)
@@ -831,25 +937,25 @@ const scanDeltaMutation = (type, mutation, renderer, scan) => {
   const attrs = new Array(mutation.attrs.length)
   for (let index = 0; index < mutation.attrs.length; index++) {
     const op = mutation.attrs[index]
-    const item = type._map.get(op.key)
+    const item = scan.runtime.mapGet(guarded._map.value, op.key)
     if (op.kind === 'set') {
       scan.allocates = true
       if (item !== undefined && !item.deleted) {
-        scan.deletes.add(item.id.client, item.id.clock, item.length)
+        scan.runtime.idSets.add(scan.deletes, item.id.client, item.id.clock, item.length)
         addDeletedTypeContents(item, scan)
       }
       defineDenseIndex(attrs, index, op)
     } else if (op.kind === 'delete') {
       if (item !== undefined && !item.deleted) {
-        scan.deletes.add(item.id.client, item.id.clock, item.length)
+        scan.runtime.idSets.add(scan.deletes, item.id.client, item.id.clock, item.length)
         addDeletedTypeContents(item, scan)
       }
       defineDenseIndex(attrs, index, op)
     } else if (op.kind === 'modify') {
       if (
         item === undefined ||
-        item.content.constructor !== ContentType ||
-        (item.deleted && rendererContentLength(renderer, item) === 0)
+        objectGetPrototypeOf(item.content) !== ContentType.prototype ||
+        (item.deleted && scan.runtime.rendererContentLength(renderer, item) === 0)
       ) {
         throw new DeltaMutationPreparationError('Delta modifyAttr target is not a structural child type')
       }
@@ -884,23 +990,25 @@ const scanDeltaMutation = (type, mutation, renderer, scan) => {
  * @param {CanonicalDeltaApply} canonicalApplyDelta
  * @param {(name:null|string) => YType<any>} createNestedType
  * @param {DeltaMutationPlanRenderer} renderDeltaPlan
+ * @param {ReservedMutationRuntime} runtime
  */
-const reserveRangeCount = (type, mutation, renderer, doc, canonicalApplyDelta, createNestedType, renderDeltaPlan) => {
+const reserveRangeCount = (type, mutation, renderer, doc, canonicalApplyDelta, createNestedType, renderDeltaPlan, runtime) => {
   /** @type {ReservationScan} */
   const scan = {
-    deletes: createIdSet(),
+    deletes: runtime.idSets.create(),
     formatHazards: new Set(),
     allocates: false,
     doc,
     canonicalApplyDelta,
-    guardedTypes: new Set(),
+    guardedTypes: new Map(),
+    runtime,
     createNestedType,
     renderDeltaPlan
   }
   const plan = scanDeltaMutation(type, mutation, renderer, scan)
-  let rangeCount = countRanges(scan.deletes)
+  let rangeCount = runtime.idSets.countRanges(scan.deletes)
   scan.formatHazards.forEach(item => {
-    if (!scan.deletes.hasId(item.id)) rangeCount++
+    if (!runtime.idSets.hasId(scan.deletes, item.id)) rangeCount++
   })
   return {
     rangeCountUpperBound: rangeCount + (scan.allocates ? 1 : 0),
@@ -929,9 +1037,19 @@ const hasCanonicalApplyDelta = (type, canonicalApplyDelta) => {
 
 /** @param {PreparedDeltaMutationState} state */
 const assertGuardedTypesFresh = state => {
-  for (const type of state.guardedTypes) {
-    if (type.doc !== state.doc || !hasCanonicalApplyDelta(type, state.canonicalApplyDelta)) {
-      throw new DeltaMutationStaleError('Prepared delta mutation target dispatch changed')
+  let stale = false
+  state.runtime.mapForEach(state.guardedTypes, (snapshot, type) => {
+    if (!guardedTypeIsFresh(type, snapshot) || !hasCanonicalApplyDelta(type, state.canonicalApplyDelta)) stale = true
+  })
+  if (stale) throw new DeltaMutationStaleError('Prepared delta mutation target state or dispatch changed')
+}
+
+/** @param {PreparedDeltaMutationState} state @param {string} suffix */
+const assertRendererDependenciesFresh = (state, suffix) => {
+  for (let index = 0; index < state.rendererDependencyRevisions.length; index++) {
+    const dependency = state.rendererDependencyRevisions[index]
+    if (readDocumentStructuralRevision(dependency.doc) !== dependency.revision) {
+      throw new DeltaMutationStaleError(`Prepared delta mutation renderer dependency changed${suffix}`)
     }
   }
 }
@@ -943,6 +1061,7 @@ const assertFresh = state => {
   if (state.doc.isDestroyed || state.doc._transaction !== null || state.doc._transactionCleanups.length !== 0) {
     throw new DeltaMutationStaleError('Prepared delta mutation requires a quiescent live document')
   }
+  assertReservedMutationRuntimeIntegrity(state.runtime)
   assertGuardedTypesFresh(state)
   if (!deltaConstructorsHaveSafeAssignments()) {
     throw new DeltaMutationStaleError('Prepared delta mutation constructor dispatch changed')
@@ -953,6 +1072,7 @@ const assertFresh = state => {
       throw new DeltaMutationStaleError('Prepared delta mutation renderer revision changed')
     }
   }
+  assertRendererDependenciesFresh(state, '')
   if (
     state.doc.isDestroyed ||
     state.doc._transaction !== null ||
@@ -968,12 +1088,16 @@ const assertFresh = state => {
  * @param {PreparedDeltaMutationState} state
  */
 const assertFreshInsideTransaction = (transaction, state) => {
-  if (state.doc.isDestroyed || state.type.doc !== state.doc) {
+  if (state.doc.isDestroyed) {
     throw new DeltaMutationStaleError('Prepared delta mutation target changed before execution')
   }
   if (transaction.doc !== state.doc || state.doc._transaction !== transaction || transaction._done) {
     throw new DeltaMutationInvariantError('Prepared delta mutation lost its reserved transaction')
   }
+  if (!assertReservedMutationTransaction(transaction, state.runtime)) {
+    throw new DeltaMutationInvariantError('Prepared delta mutation runtime identity changed')
+  }
+  assertReservedMutationRuntimeIntegrity(state.runtime)
   assertGuardedTypesFresh(state)
   if (!deltaConstructorsHaveSafeAssignments()) {
     throw new DeltaMutationStaleError('Prepared delta mutation constructor dispatch changed before execution')
@@ -984,6 +1108,7 @@ const assertFreshInsideTransaction = (transaction, state) => {
       throw new DeltaMutationStaleError('Prepared delta mutation renderer revision changed before execution')
     }
   }
+  assertRendererDependenciesFresh(state, ' before execution')
   if (readDocumentStructuralRevision(state.doc) !== state.documentRevision) {
     throw new DeltaMutationStaleError('Prepared delta mutation document revision changed before execution')
   }
@@ -996,19 +1121,26 @@ const assertFreshInsideTransaction = (transaction, state) => {
  */
 const applyInTransaction = (transaction, state, afterMutation) => {
   assertFreshInsideTransaction(transaction, state)
-  if (transaction.insertSet.clients.size !== 0 || transaction.deleteSet.clients.size !== 0) {
+  const runtime = state.runtime
+  if (!runtime.idSets.isEmpty(transaction.insertSet) || !runtime.idSets.isEmpty(transaction.deleteSet)) {
     throw new DeltaMutationInvariantError('beforeTransaction mutated the reserved document before delta execution')
   }
-  const beforeInserts = cloneIdSet(transaction.insertSet)
-  const beforeDeletes = cloneIdSet(transaction.deleteSet)
-  const fix = state.executor(transaction, state.mutation, state.executionRenderer)
-  const inserts = diffIdSet(transaction.insertSet, beforeInserts)
-  const deletes = diffIdSet(transaction.deleteSet, beforeDeletes)
-  if (intersectSets(inserts, deletes).clients.size !== 0) {
+  const beforeInserts = runtime.idSets.clone(transaction.insertSet)
+  const beforeDeletes = runtime.idSets.clone(transaction.deleteSet)
+  let fix
+  runtime.items.begin(transaction, runtime)
+  try {
+    fix = state.executor(transaction, state.mutation, state.executionRenderer, runtime)
+  } finally {
+    runtime.items.end(transaction)
+  }
+  const inserts = runtime.idSets.difference(transaction.insertSet, beforeInserts)
+  const deletes = runtime.idSets.difference(transaction.deleteSet, beforeDeletes)
+  if (runtime.idSets.hasIntersection(inserts, deletes)) {
     throw new DeltaMutationInvariantError('Reserved delta inserted and deleted the same structural IDs')
   }
-  const frozenInserts = freezeRanges(inserts)
-  const frozenDeletes = freezeRanges(deletes)
+  const frozenInserts = runtime.idSets.snapshotRanges(inserts)
+  const frozenDeletes = runtime.idSets.snapshotRanges(deletes)
   const rangeCount = frozenInserts.length + frozenDeletes.length
   if (rangeCount > state.rangeCountUpperBound) {
     throw new DeltaMutationInvariantError(`Reserved delta range underbound: ${rangeCount} > ${state.rangeCountUpperBound}`)
@@ -1050,7 +1182,7 @@ class PreparedDeltaMutationCapability {
         throw new DeltaMutationCapabilityError('afterMutation must be a function')
       }
       assertFresh(state)
-      return transact(state.doc, transaction => applyInTransaction(transaction, state, afterMutation), state.origin)
+      return transactReservedMutation(state.doc, transaction => applyInTransaction(transaction, state, afterMutation), state.origin, state.runtime)
     } finally {
       state.status = 'consumed'
       preparedMutations.delete(this)
@@ -1102,6 +1234,16 @@ const ownDeltaMutation = mutation => {
   /** @type {Map<object, 1|2>} */
   const valueStates = new Map()
   let payloadNodeCount = 0
+  let payloadUnits = 0
+
+  /** @param {number} units */
+  const chargePayload = units => {
+    if (!Number.isSafeInteger(units) || units < 0) throw new DeltaMutationPreparationError('Delta payload has an invalid size')
+    payloadUnits = Math.min(maxDeltaMutationPayloadUnits + 1, payloadUnits + units)
+    if (payloadUnits > maxDeltaMutationPayloadUnits) {
+      throw new DeltaMutationPreparationError(`Delta payload exceeds unit limit ${maxDeltaMutationPayloadUnits}`)
+    }
+  }
 
   /** @param {object} target @param {PropertyKey} key @param {any} value */
   const assignValue = (target, key, value) => {
@@ -1132,6 +1274,7 @@ const ownDeltaMutation = mutation => {
       }
       if (source === null || (typeof source !== 'object' && typeof source !== 'function')) {
         if (typeof source === 'symbol') throw new DeltaMutationPreparationError('Delta contains an unsupported symbol value')
+        chargePayload(typeof source === 'string' ? source.length : 1)
         assignValue(frame.target, frame.key, source)
         continue
       }
@@ -1154,6 +1297,7 @@ const ownDeltaMutation = mutation => {
       }
       const prototype = objectGetPrototypeOf(source)
       if (prototype === Uint8Array.prototype) {
+        chargePayload(source.byteLength)
         const owned = new Uint8Array(source)
         valueCopies.set(source, owned)
         valueStates.set(source, 2)
@@ -1177,6 +1321,7 @@ const ownDeltaMutation = mutation => {
       if (isArray) {
         const length = readOwnData(source, 'length')
         if (!Number.isSafeInteger(length) || length < 0) throw new DeltaMutationPreparationError('Delta contains an invalid array value')
+        chargePayload(length)
         owned = new Array(length)
         keys = objectKeys(source)
         for (let index = 0; index < keys.length; index++) {
@@ -1257,6 +1402,7 @@ const ownDeltaMutation = mutation => {
     }
     const length = readOwnData(value, 'length')
     assertPositiveLength(length)
+    chargePayload(length)
     /** @type {any[]} */
     const result = new Array(length)
     for (let index = 0; index < length; index++) {
@@ -1302,6 +1448,7 @@ const ownDeltaMutation = mutation => {
         const insert = readOwnData(node, 'insert')
         if (typeof insert !== 'string') throw new DeltaMutationPreparationError('Delta contains invalid text content')
         assertPositiveLength(insert.length)
+        chargePayload(insert.length)
         childLength += insert.length
         appendDense(children, {
           kind,
@@ -1586,12 +1733,13 @@ export const readDeltaMutationPlan = token => {
  * @param {AbstractRenderer?} renderer
  * @param {DeltaMutationExecutor} executor
  * @param {CanonicalDeltaApply} canonicalApplyDelta
+ * @param {(this:YType<any>,doc:Doc,item:Item|null) => void} integrateType
  * @param {(name:null|string) => YType<any>} createNestedType
  * @param {DeltaMutationPlanRenderer} renderDeltaPlan
  * @return {PreparedDeltaMutation}
  */
-export const createPreparedDeltaMutation = (type, mutation, origin, renderer, executor, canonicalApplyDelta, createNestedType, renderDeltaPlan) => {
-  const doc = type.doc
+export const createPreparedDeltaMutation = (type, mutation, origin, renderer, executor, canonicalApplyDelta, integrateType, createNestedType, renderDeltaPlan) => {
+  const doc = readOwnData(type, 'doc')
   if (doc === null || doc.isDestroyed) {
     throw new DeltaMutationPreparationError('Delta mutation target must be integrated in a live document')
   }
@@ -1601,22 +1749,37 @@ export const createPreparedDeltaMutation = (type, mutation, origin, renderer, ex
   if (!deltaConstructorsHaveSafeAssignments()) {
     throw new DeltaMutationPreparationError('Reserved delta mutation requires canonical constructor dispatch')
   }
+  const runtime = createReservedMutationRuntime(integrateType)
+  assertReservedMutationRuntimeIntegrity(runtime)
   const documentRevision = readDocumentStructuralRevision(doc)
   let rendererLifecycle = null
   let executionRenderer = null
+  /** @type {{doc:Doc,revision:number}[]} */
+  const rendererDependencyRevisions = []
   if (renderer !== null) {
     rendererLifecycle = readRendererLifecycle(renderer)
-    executionRenderer = readRendererExecutionAdapter(renderer)
-    if (rendererLifecycle === null || !rendererLifecycle.active || executionRenderer === null) {
+    const execution = readRendererExecutionAdapter(renderer)
+    if (rendererLifecycle === null || !rendererLifecycle.active || execution === null) {
       throw new DeltaMutationPreparationError('Delta mutation renderer must be a live tracked DiffRenderer')
+    }
+    executionRenderer = execution.adapter
+    for (let index = 0; index < execution.dependencies.length; index++) {
+      const dependency = execution.dependencies[index]
+      appendDense(rendererDependencyRevisions, objectFreeze({ doc: dependency, revision: readDocumentStructuralRevision(dependency) }))
     }
   }
   const assertPreparationFresh = () => {
+    let dependencyChanged = false
+    for (let index = 0; index < rendererDependencyRevisions.length; index++) {
+      const dependency = rendererDependencyRevisions[index]
+      if (readDocumentStructuralRevision(dependency.doc) !== dependency.revision) dependencyChanged = true
+    }
     if (
       doc.isDestroyed ||
       doc._transaction !== null ||
       doc._transactionCleanups.length !== 0 ||
       (renderer !== null && readRendererLifecycle(renderer) !== rendererLifecycle) ||
+      dependencyChanged ||
       readDocumentStructuralRevision(doc) !== documentRevision
     ) {
       throw new DeltaMutationStaleError('Delta mutation state changed during preparation')
@@ -1631,7 +1794,7 @@ export const createPreparedDeltaMutation = (type, mutation, origin, renderer, ex
     if (ownedPlan.children.length === 0 && ownedPlan.attrs.length === 0) {
       throw new DeltaMutationPreparationError('Cannot reserve an empty delta mutation')
     }
-    const reservation = reserveRangeCount(type, ownedPlan, executionRenderer, doc, canonicalApplyDelta, createNestedType, renderDeltaPlan)
+    const reservation = reserveRangeCount(type, ownedPlan, executionRenderer, doc, canonicalApplyDelta, createNestedType, renderDeltaPlan, runtime)
     rangeCountUpperBound = reservation.rangeCountUpperBound
     guardedTypes = reservation.guardedTypes
     executionPlan = reservation.plan
@@ -1643,6 +1806,12 @@ export const createPreparedDeltaMutation = (type, mutation, origin, renderer, ex
     throw cause
   }
   assertPreparationFresh()
+  assertReservedMutationRuntimeIntegrity(runtime)
+  let guardedTypeChanged = false
+  runtime.mapForEach(guardedTypes, (snapshot, guardedType) => {
+    if (!guardedTypeIsFresh(guardedType, snapshot) || !hasCanonicalApplyDelta(guardedType, canonicalApplyDelta)) guardedTypeChanged = true
+  })
+  if (guardedTypeChanged) throw new DeltaMutationStaleError('Delta mutation target changed during preparation')
   const token = objectFreeze({})
   deltaMutationPlans.set(token, executionPlan)
   const reservation = objectFreeze({ rangeCountUpperBound })
@@ -1654,13 +1823,15 @@ export const createPreparedDeltaMutation = (type, mutation, origin, renderer, ex
     renderer,
     executionRenderer,
     rendererLifecycle,
+    rendererDependencyRevisions: objectFreeze(rendererDependencyRevisions),
     documentRevision,
     mutation: token,
     origin,
     rangeCountUpperBound,
     executor,
     canonicalApplyDelta,
-    guardedTypes
+    guardedTypes,
+    runtime
   })
   return capability
 }

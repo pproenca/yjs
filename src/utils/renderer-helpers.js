@@ -33,27 +33,34 @@ const rendererLifecycles = new WeakMap()
  * object. Reserved mutations retain this sealed adapter so later public property changes cannot
  * alter targeting or fail after a write.
  *
- * @type {WeakMap<object, Readonly<AbstractRenderer>>}
+ * @type {WeakMap<object, Readonly<{adapter:Readonly<AbstractRenderer>,dependencies:readonly Doc[]}>>}
  */
 const rendererExecutionAdapters = new WeakMap()
 
 /**
  * @param {object} renderer
  * @param {AbstractRenderer} adapter
+ * @param {readonly Doc[]} dependencies
  */
-export const registerRendererExecutionAdapter = (renderer, adapter) => {
+export const registerRendererExecutionAdapter = (renderer, adapter, dependencies) => {
   error.assert(!rendererExecutionAdapters.has(renderer))
   const sealed = Object.freeze({
     hasItem: adapter.hasItem,
     readContent: adapter.readContent,
     contentLength: adapter.contentLength
   })
-  rendererExecutionAdapters.set(renderer, /** @type {Readonly<AbstractRenderer>} */ (sealed))
+  /** @type {Doc[]} */
+  const ownedDependencies = []
+  for (let index = 0; index < dependencies.length; index++) appendDense(ownedDependencies, dependencies[index])
+  rendererExecutionAdapters.set(renderer, Object.freeze({
+    adapter: /** @type {Readonly<AbstractRenderer>} */ (sealed),
+    dependencies: Object.freeze(ownedDependencies)
+  }))
 }
 
 /**
  * @param {object} renderer
- * @return {Readonly<AbstractRenderer>?}
+ * @return {Readonly<{adapter:Readonly<AbstractRenderer>,dependencies:readonly Doc[]}>?}
  */
 export const readRendererExecutionAdapter = renderer => rendererExecutionAdapters.get(renderer) ?? null
 

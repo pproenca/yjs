@@ -7,7 +7,7 @@ import { callAll } from 'lib0/function'
 import { ContentFormat } from '../structs/Item.js'
 import { getStateVector } from './StructStore.js'
 import { callEventHandlerListeners } from './EventHandler.js'
-import { createIdSet, iterateStructsByIdSet } from './ids.js'
+import { createIdSet, isIdSetEmptyCanonical, iterateStructsByIdSet } from './ids.js'
 import { GC } from '../structs/GC.js'
 import { YEvent } from './YEvent.js'
 import { writeUpdateMessageFromTransaction } from './encoding-helpers.js'
@@ -19,6 +19,8 @@ export const generateNewClientId = random.uint53
 
 /** @type {WeakMap<Doc,{revision:number}>} */
 const documentStructuralRevisions = new WeakMap()
+/** @type {WeakMap<Transaction,object>} */
+const reservedMutationTransactions = new WeakMap()
 
 /**
  * Internal structural revision used by pre-write capabilities. The entry is allocated lazily so
@@ -244,7 +246,7 @@ const cleanupTransactions = (transactionCleanups, i) => {
     let cleanupFailure
     try {
       // insertIntoIdSet(store.ds, ds)
-      if (!transaction.insertSet.isEmpty() || !transaction.deleteSet.isEmpty()) {
+      if (!isIdSetEmptyCanonical(transaction.insertSet) || !isIdSetEmptyCanonical(transaction.deleteSet)) {
         bumpDocumentStructuralRevision(doc)
       }
       try {
@@ -443,13 +445,14 @@ export const cleanupYTextAfterTransaction = transaction => {
  * @template T
  * @param {Doc} doc
  * @param {function(Transaction):T} f
- * @param {any} [origin=true]
- * @param {boolean} [local=true]
+ * @param {any} origin
+ * @param {boolean} local
+ * @param {object|null} reservedRuntime
  * @return {T}
  *
  * @function
  */
-export const transact = (doc, f, origin = null, local = true) => {
+const transactInternal = (doc, f, origin, local, reservedRuntime) => {
   const transactionCleanups = doc._transactionCleanups
   let initialCall = false
   /**
@@ -461,6 +464,7 @@ export const transact = (doc, f, origin = null, local = true) => {
   if (doc._transaction === null) {
     initialCall = true
     doc._transaction = new Transaction(doc, origin, local)
+    if (reservedRuntime !== null) reservedMutationTransactions.set(doc._transaction, reservedRuntime)
     transactionCleanups.push(doc._transaction)
     try {
       if (transactionCleanups.length === 1) {
@@ -484,7 +488,11 @@ export const transact = (doc, f, origin = null, local = true) => {
       // observes throw errors.
       // This file is full of hacky try {} finally {} blocks to ensure that an
       // event can throw errors and also that the cleanup is called.
-      cleanupTransactions(transactionCleanups, 0)
+      try {
+        cleanupTransactions(transactionCleanups, 0)
+      } finally {
+        if (reservedRuntime !== null) reservedMutationTransactions.delete(transactionCleanups[0])
+      }
     }
   }
   if (setupFailed) {
@@ -504,3 +512,35 @@ export const transact = (doc, f, origin = null, local = true) => {
   }
   return result
 }
+
+/**
+ * @template T
+ * @param {Doc} doc
+ * @param {function(Transaction):T} f
+ * @param {any} [origin]
+ * @param {boolean} [local]
+ * @return {T}
+ */
+export const transact = (doc, f, origin = null, local = true) => transactInternal(doc, f, origin, local, null)
+
+/**
+ * Open the one transaction owned by a reserved mutation capability.
+ *
+ * @internal
+ * @template T
+ * @param {Doc} doc
+ * @param {function(Transaction):T} f
+ * @param {any} origin
+ * @param {object} runtime
+ * @return {T}
+ */
+export const transactReservedMutation = (doc, f, origin, runtime) => {
+  if (doc._transaction !== null) throw new Error('Reserved mutation requires a fresh transaction')
+  return transactInternal(doc, f, origin, true, runtime)
+}
+
+/** @internal @param {Transaction} transaction @param {object} runtime */
+export const assertReservedMutationTransaction = (transaction, runtime) => reservedMutationTransactions.get(transaction) === runtime
+
+/** @internal @param {Transaction} transaction */
+export const isReservedMutationTransaction = transaction => reservedMutationTransactions.has(transaction)

@@ -17,12 +17,32 @@ import {
 const isDevMode = env.getVariable('node_env') === 'development'
 const objectCreate = Object.create
 const objectDefineProperty = Object.defineProperty
+const objectFreeze = Object.freeze
 const objectGetPrototypeOf = Object.getPrototypeOf
+const objectKeys = Object.keys
 const reflectApply = Reflect.apply
-/** @type {WeakSet<Item>} */
-const privateIntegrationItems = new WeakSet()
-/** @type {Map<object, (transaction:Transaction, item:Item) => void>} */
-const privateContentIntegrators = new Map()
+const mapForEach = Map.prototype.forEach
+const mapGet = Map.prototype.get
+const mapSet = Map.prototype.set
+const setAdd = Set.prototype.add
+const setDelete = Set.prototype.delete
+const setHas = Set.prototype.has
+/** @type {WeakMap<Transaction,any>} */
+const reservedMutationTransactions = new WeakMap()
+/** @type {Map<object, any>} */
+const canonicalContentKernels = new Map()
+
+/** @param {Transaction} transaction @param {YType} type @param {string|null} parentSub @param {any} runtime */
+const addChangedTypeCanonical = (transaction, type, parentSub, runtime) => {
+  const item = type._item
+  if (item !== null && runtime.idSets.hasId(transaction.insertSet, item.id)) return
+  let subs = reflectApply(mapGet, transaction.changed, [type])
+  if (subs === undefined) {
+    subs = new Set()
+    reflectApply(mapSet, transaction.changed, [type, subs])
+  }
+  reflectApply(setAdd, subs, [parentSub])
+}
 
 /**
  * @todo This should return several items
@@ -174,11 +194,14 @@ export class Item extends AbstractStruct {
    * @param {number} offset
    */
   integrate (transaction, offset) {
+    const reservedRuntime = reservedMutationTransactions.get(transaction)
     if (offset > 0) {
       this.id.clock += offset
       this.left = getItemCleanEnd(transaction, transaction.doc.store, createID(this.id.client, this.id.clock - 1))
       this.origin = this.left.lastId
-      this.content = this.content.splice(offset)
+      this.content = reservedRuntime === undefined
+        ? this.content.splice(offset)
+        : spliceContentCanonical(this.content, offset)
       this.length -= offset
     }
 
@@ -197,7 +220,9 @@ export class Item extends AbstractStruct {
         if (left !== null) {
           o = left.right
         } else if (this.parentSub !== null) {
-          o = /** @type {YType} */ (this.parent)._map.get(this.parentSub) || null
+          o = reservedRuntime === undefined
+            ? /** @type {YType} */ (this.parent)._map.get(this.parentSub) || null
+            : reflectApply(mapGet, /** @type {YType} */ (this.parent)._map, [this.parentSub]) || null
           while (o !== null && o.left !== null) {
             o = o.left
           }
@@ -251,7 +276,9 @@ export class Item extends AbstractStruct {
       } else {
         let r
         if (this.parentSub !== null) {
-          r = /** @type {YType} */ (this.parent)._map.get(this.parentSub) || null
+          r = reservedRuntime === undefined
+            ? /** @type {YType} */ (this.parent)._map.get(this.parentSub) || null
+            : reflectApply(mapGet, /** @type {YType} */ (this.parent)._map, [this.parentSub]) || null
           while (r !== null && r.left !== null) {
             r = r.left
           }
@@ -265,30 +292,30 @@ export class Item extends AbstractStruct {
         this.right.left = this
       } else if (this.parentSub !== null) {
         // set as current parent value if right === null and this is parentSub
-        /** @type {YType} */ (this.parent)._map.set(this.parentSub, this)
+        if (reservedRuntime === undefined) /** @type {YType} */ (this.parent)._map.set(this.parentSub, this)
+        else reflectApply(mapSet, /** @type {YType} */ (this.parent)._map, [this.parentSub, this])
         if (this.left !== null) {
           // this is the current attribute value of parent. delete the previous value
-          this.left.delete(transaction)
+          if (reservedRuntime === undefined) this.left.delete(transaction)
+          else deleteItemCanonical(this.left, transaction)
         }
       }
       // adjust length of parent
       if (this.parentSub === null && this.countable && !this.deleted) {
         /** @type {YType} */ (this.parent)._length += this.length
       }
-      addStructToIdSet(transaction.insertSet, this)
+      if (reservedRuntime === undefined) addStructToIdSet(transaction.insertSet, this)
+      else reservedRuntime.idSets.add(transaction.insertSet, this.id.client, this.id.clock, this.length)
       transaction.doc.store.add(this)
-      if (privateIntegrationItems.has(this)) {
-        const integrate = privateContentIntegrators.get(objectGetPrototypeOf(this.content))
-        if (integrate === undefined) error.unexpectedCase()
-        reflectApply(integrate, this.content, [transaction, this])
-      } else {
-        this.content.integrate(transaction, this)
-      }
+      if (reservedRuntime === undefined) this.content.integrate(transaction, this)
+      else integrateContentCanonical(this.content, transaction, this, reservedRuntime)
       // add parent to transaction.changed
-      addChangedTypeToTransaction(transaction, /** @type {YType} */ (this.parent), this.parentSub)
+      if (reservedRuntime === undefined) addChangedTypeToTransaction(transaction, /** @type {YType} */ (this.parent), this.parentSub)
+      else addChangedTypeCanonical(transaction, /** @type {YType} */ (this.parent), this.parentSub, reservedRuntime)
       if ((/** @type {YType} */ (this.parent)._item !== null && /** @type {YType} */ (this.parent)._item.deleted) || (this.parentSub !== null && this.right !== null)) {
         // delete if parent is deleted or if this is not the current attribute value of parent
-        this.delete(transaction)
+        if (reservedRuntime === undefined) this.delete(transaction)
+        else deleteItemCanonical(this, transaction)
       }
     } else {
       // parent is not defined. Integrate GC struct instead
@@ -379,15 +406,19 @@ export class Item extends AbstractStruct {
    */
   delete (transaction) {
     if (!this.deleted) {
+      const reservedRuntime = reservedMutationTransactions.get(transaction)
       const parent = /** @type {YType} */ (this.parent)
       // adjust the length of parent
       if (this.countable && this.parentSub === null) {
         parent._length -= this.length
       }
       this.markDeleted()
-      transaction.deleteSet.add(this.id.client, this.id.clock, this.length)
-      addChangedTypeToTransaction(transaction, parent, this.parentSub)
-      this.content.delete(transaction)
+      if (reservedRuntime === undefined) transaction.deleteSet.add(this.id.client, this.id.clock, this.length)
+      else reservedRuntime.idSets.add(transaction.deleteSet, this.id.client, this.id.clock, this.length)
+      if (reservedRuntime === undefined) addChangedTypeToTransaction(transaction, parent, this.parentSub)
+      else addChangedTypeCanonical(transaction, parent, this.parentSub, reservedRuntime)
+      if (reservedRuntime === undefined) this.content.delete(transaction)
+      else deleteContentCanonical(this.content, transaction, reservedRuntime)
     }
   }
 
@@ -414,18 +445,16 @@ export class Item extends AbstractStruct {
    * @return {Item}
    */
   split (transaction, diff) {
+    const reservedRuntime = transaction === null ? undefined : reservedMutationTransactions.get(transaction)
+    const rightContent = reservedRuntime === undefined
+      ? this.content.splice(diff)
+      : spliceContentCanonical(this.content, diff)
     // create rightItem
     const { client, clock } = this.id
-    const rightItem = new Item(
-      createID(client, clock + diff),
-      this,
-      createID(client, clock + diff - 1),
-      this.right,
-      this.rightOrigin,
-      this.parent,
-      this.parentSub,
-      this.content.splice(diff)
-    )
+    const itemArgs = [createID(client, clock + diff), this, createID(client, clock + diff - 1), this.right, this.rightOrigin, this.parent, this.parentSub, rightContent]
+    const rightItem = reservedRuntime === undefined
+      ? new Item(.../** @type {[ID,Item|null,ID|null,Item|null,ID|null,YType|ID|string|null,string|null,AbstractContent]} */(itemArgs))
+      : createItemCanonical(.../** @type {[ID,Item|null,ID|null,Item|null,ID|null,YType|ID|string|null,string|null,AbstractContent]} */(itemArgs))
     if (this.deleted) {
       rightItem.markDeleted()
     }
@@ -446,7 +475,8 @@ export class Item extends AbstractStruct {
       transaction._mergeStructs.push(rightItem)
       // update parent._map
       if (rightItem.parentSub !== null && rightItem.right === null) {
-        /** @type {YType} */ (rightItem.parent)._map.set(rightItem.parentSub, rightItem)
+        if (reservedRuntime === undefined) /** @type {YType} */ (rightItem.parent)._map.set(rightItem.parentSub, rightItem)
+        else reflectApply(mapSet, /** @type {YType} */ (rightItem.parent)._map, [rightItem.parentSub, rightItem])
       }
     } else {
       rightItem.left = null
@@ -1531,10 +1561,132 @@ export class ContentType {
 }
 
 for (const Content of [ContentAny, ContentBinary, ContentDeleted, ContentDoc, ContentEmbed, ContentFormat, ContentJSON, ContentString, ContentType]) {
-  privateContentIntegrators.set(Content.prototype, Content.prototype.integrate)
+  canonicalContentKernels.set(Content.prototype, objectFreeze({
+    delete: Content.prototype.delete,
+    getLength: Content.prototype.getLength,
+    integrate: Content.prototype.integrate,
+    isCountable: Content.prototype.isCountable,
+    splice: Content.prototype.splice
+  }))
 }
 
+const privateItemDelete = Item.prototype.delete
 const privateItemIntegrate = Item.prototype.integrate
+
+/** @param {AbstractContent} content */
+const readContentKernel = content => {
+  const kernel = canonicalContentKernels.get(objectGetPrototypeOf(content))
+  if (kernel === undefined) throw new Error('Unsupported reserved mutation content')
+  return kernel
+}
+
+/** @param {AbstractContent} content */
+const getContentLengthCanonical = content => reflectApply(readContentKernel(content).getLength, content, [])
+
+/** @param {AbstractContent} content */
+const isContentCountableCanonical = content => reflectApply(readContentKernel(content).isCountable, content, [])
+
+/** @param {AbstractContent} content @param {number} offset */
+const spliceContentCanonical = (content, offset) => reflectApply(readContentKernel(content).splice, content, [offset])
+
+/**
+ * @param {AbstractContent} content
+ * @param {Transaction} transaction
+ * @param {Item} item
+ * @param {any} runtime
+ */
+const integrateContentCanonical = (content, transaction, item, runtime) => {
+  const prototype = objectGetPrototypeOf(content)
+  if (prototype === ContentType.prototype) {
+    runtime.integrateType(/** @type {ContentType} */ (content).type, transaction.doc, item)
+  } else if (prototype === ContentDeleted.prototype) {
+    runtime.idSets.add(transaction.deleteSet, item.id.client, item.id.clock, /** @type {ContentDeleted} */ (content).len)
+    item.markDeleted()
+  } else {
+    reflectApply(readContentKernel(content).integrate, content, [transaction, item])
+  }
+}
+
+/**
+ * @param {AbstractContent} content
+ * @param {Transaction} transaction
+ * @param {any} runtime
+ */
+const deleteContentCanonical = (content, transaction, runtime) => {
+  const prototype = objectGetPrototypeOf(content)
+  if (prototype === ContentType.prototype) {
+    const type = /** @type {ContentType} */ (content).type
+    let item = type._start
+    while (item !== null) {
+      if (!item.deleted) {
+        deleteItemCanonical(item, transaction)
+      } else if (!runtime.idSets.hasId(transaction.insertSet, item.id)) {
+        transaction._mergeStructs.push(item)
+      }
+      item = item.right
+    }
+    reflectApply(mapForEach, type._map, [(mapItem) => {
+      if (!mapItem.deleted) {
+        deleteItemCanonical(mapItem, transaction)
+      } else if (!runtime.idSets.hasId(transaction.insertSet, mapItem.id)) {
+        transaction._mergeStructs.push(mapItem)
+      }
+    }])
+  } else if (prototype === ContentDoc.prototype) {
+    const doc = /** @type {ContentDoc} */ (content).doc
+    if (doc !== null) {
+      if (reflectApply(setHas, transaction.subdocsAdded, [doc])) reflectApply(setDelete, transaction.subdocsAdded, [doc])
+      else reflectApply(setAdd, transaction.subdocsRemoved, [doc])
+    }
+  } else {
+    reflectApply(readContentKernel(content).delete, content, [transaction])
+  }
+}
+
+/**
+ * Construct an Item without dispatching through caller-mutable content methods or inherited field
+ * setters. The resulting object is a canonical Item and encodes identically.
+ *
+ * @param {ID} id
+ * @param {Item|null} left
+ * @param {ID|null} origin
+ * @param {Item|null} right
+ * @param {ID|null} rightOrigin
+ * @param {YType|ID|string|null} parent
+ * @param {string|null} parentSub
+ * @param {AbstractContent} content
+ */
+const createItemCanonical = (id, left, origin, right, rightOrigin, parent, parentSub, content) => {
+  const item = /** @type {Item} */ (objectCreate(Item.prototype))
+  /** @type {Record<string,any>} */
+  const values = {
+    id,
+    length: getContentLengthCanonical(content),
+    origin,
+    left,
+    right,
+    rightOrigin,
+    parent,
+    parentSub,
+    redone: null,
+    content,
+    info: isContentCountableCanonical(content) ? binary.BIT2 : 0
+  }
+  const keys = objectKeys(values)
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index]
+    objectDefineProperty(item, key, {
+      configurable: true,
+      enumerable: true,
+      value: values[key],
+      writable: true
+    })
+  }
+  return item
+}
+
+/** @param {Item} item @param {Transaction} transaction */
+const deleteItemCanonical = (item, transaction) => reflectApply(privateItemDelete, item, [transaction])
 
 /**
  * Construct the nested content owned by a reserved mutation without invoking inherited field
@@ -1554,18 +1706,23 @@ export const createContentTypeCanonical = type => {
 }
 
 /**
- * Integrate an item through the module-captured Item/content kernels. Ordinary Item#integrate keeps
- * its dynamic dispatch; only the reserved executor receives this capability.
+ * Module-captured Item/content kernels for the reserved mutation runtime.
  *
- * @param {Item} item
- * @param {Transaction} transaction
- * @param {number} offset
+ * @internal
  */
-export const integrateItemCanonical = (item, transaction, offset) => {
-  privateIntegrationItems.add(item)
-  try {
-    reflectApply(privateItemIntegrate, item, [transaction, offset])
-  } finally {
-    privateIntegrationItems.delete(item)
-  }
-}
+export const reservedMutationItemRuntime = objectFreeze({
+  /** @param {Transaction} transaction @param {any} runtime */
+  begin: (transaction, runtime) => {
+    if (reservedMutationTransactions.has(transaction)) throw new Error('Reserved mutation transaction already active')
+    reservedMutationTransactions.set(transaction, runtime)
+  },
+  /** @param {Transaction} transaction */
+  end: transaction => reservedMutationTransactions.delete(transaction),
+  create: createItemCanonical,
+  createContentType: createContentTypeCanonical,
+  delete: deleteItemCanonical,
+  getContentLength: getContentLengthCanonical,
+  /** @param {Item} item @param {Transaction} transaction @param {number} offset */
+  integrate: (item, transaction, offset) => reflectApply(privateItemIntegrate, item, [transaction, offset]),
+  isContentCountable: isContentCountableCanonical
+})
