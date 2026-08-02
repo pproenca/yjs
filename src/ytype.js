@@ -28,7 +28,7 @@ import {
   createContentDocFromDoc
 } from './structs/Item.js'
 import { AttributedContent, rendererContentLength } from './utils/renderer-helpers.js'
-import { createPreparedDeltaMutation } from './utils/delta-mutation.js'
+import { createPreparedDeltaMutation, readDeltaMutationPlan } from './utils/delta-mutation.js'
 import { removeEventHandlerListener, callEventHandlerListeners, addEventHandlerListener, createEventHandler } from './utils/EventHandler.js'
 import { createID } from './utils/ID.js'
 import { createIdSet, iterateStructsByIdSetWithoutSplits } from './utils/ids.js'
@@ -47,6 +47,10 @@ import { $ydoc } from './utils/schemas.js'
 export const warnPrematureAccess = () => { log.warn('Invalid access: Add Yjs type to a document before reading data.') }
 
 const maxSearchMarker = 80
+const objectCreate = Object.create
+const objectDefineProperty = Object.defineProperty
+const objectKeys = Object.keys
+const reflectDeleteProperty = Reflect.deleteProperty
 
 /**
  * @todo SHOULD NOT RETURN AN OBJECT!
@@ -668,21 +672,28 @@ export const callTypeObservers = (type, transaction, event) => {
  * The single delta mutation interpreter used by ordinary and reserved application.
  *
  * @param {YType<any>} type
- * @param {delta.DeltaAny} d
+ * @param {any} d
  * @param {any} origin
  * @param {AbstractRenderer?} renderer
  * @param {Transaction?} activeTransaction
  */
 const applyDeltaCanonical = (type, d, origin, renderer, activeTransaction) => {
-  if (d.isEmpty()) return null
+  const reserved = activeTransaction !== null
+  if (reserved ? d.children.length === 0 && d.attrs.length === 0 : d.isEmpty()) return null
   if (type.doc == null) {
+    if (reserved) {
+      error.unexpectedCase()
+    }
     (type._prelim || (type._prelim = /** @type {any} */ (delta.create()))).apply(d)
     return null
   }
   const titem = type._item
   if (titem !== null && titem.deleted) {
     if (rendererContentLength(renderer, titem) > 0) {
-      const inv = delta.inverse(d, /** @type {any} */ (type.toDeltaDeep({ renderer })))
+      if (reserved) {
+        return d.preparedFix ?? null
+      }
+      const inv = delta.inverse(/** @type {delta.DeltaAny} */ (d), /** @type {any} */ (type.toDeltaDeep({ renderer })))
       return inv.isEmpty() ? null : /** @type {any} */ (inv)
     }
     return null
@@ -698,6 +709,7 @@ const applyDeltaCanonical = (type, d, origin, renderer, activeTransaction) => {
      * @param {{ [k:string]: any }} [invFormat]
      */
     const appendModifyFix = (childFix, invFormat) => {
+      if (reserved) return
       const f = fix ?? (fix = /** @type {any} */ (delta.create()))
       expectedIndex > fixLen && f.retain(expectedIndex - fixLen)
       f.modify(/** @type {any} */ (childFix ?? delta.create().done(false)), invFormat)
@@ -708,40 +720,112 @@ const applyDeltaCanonical = (type, d, origin, renderer, activeTransaction) => {
      * admitted canonical types and stays on this private interpreter in the captured transaction.
      *
      * @param {YType<any>} sub
-     * @param {delta.DeltaAny} mutation
+     * @param {any} mutation
      */
     const applyNestedDelta = (sub, mutation) => activeTransaction === null
       ? sub.applyDelta(mutation, origin, { renderer })
       : applyDeltaCanonical(sub, mutation, origin, renderer, transaction)
     const currPos = new ItemTextListPosition(null, type._start, 0, new Map(), renderer)
-    for (const op of d.children) {
-      if (delta.$textOp.check(op)) {
-        insertContent(transaction, type, currPos, new ContentString(op.insert), op.format || {})
+    /** @param {any} format */
+    const getFormat = format => {
+      if (!reserved) return format || {}
+      const owned = objectCreate(null)
+      if (format != null) {
+        const keys = objectKeys(format)
+        for (let index = 0; index < keys.length; index++) {
+          objectDefineProperty(owned, keys[index], {
+            configurable: true,
+            enumerable: true,
+            value: format[keys[index]],
+            writable: true
+          })
+        }
+      }
+      return owned
+    }
+    /**
+     * @param {readonly any[]} entries
+     * @param {Object<string,any>} formats
+     */
+    const insertReservedContent = (entries, formats) => {
+      /** @type {any[]} */
+      let values = []
+      const flushValues = () => {
+        if (values.length > 0) {
+          insertContent(transaction, type, currPos, new ContentAny(values), formats)
+          values = []
+        }
+      }
+      for (let index = 0; index < entries.length; index++) {
+        const entry = entries[index]
+        if (entry.kind === 'nested') {
+          flushValues()
+          const child = entry.type
+          if (child.doc !== null) error.unexpectedCase()
+          insertContent(transaction, type, currPos, entry.content, formats)
+          reflectDeleteProperty(child, '_integrate')
+          applyDeltaCanonical(child, entry.value, origin, renderer, transaction)
+        } else {
+          values[values.length] = entry.value
+        }
+      }
+      flushValues()
+    }
+    /** @param {any} op */
+    const applyChild = op => {
+      const kind = reserved
+        ? op.kind
+        : (delta.$textOp.check(op)
+            ? 'text'
+            : (delta.$insertOp.check(op)
+                ? 'insert'
+                : (delta.$retainOp.check(op)
+                    ? 'retain'
+                    : (delta.$deleteOp.check(op) ? 'delete' : (delta.$modifyOp.check(op) ? 'modify' : null)))))
+      if (kind === 'text') {
+        insertContent(transaction, type, currPos, new ContentString(op.insert), getFormat(op.format))
+        expectedIndex += reserved ? op.length : op.length
+      } else if (kind === 'insert') {
+        if (reserved) insertReservedContent(op.insert, getFormat(op.format))
+        else insertContentHelper(transaction, type, currPos, op.insert, op.format || {})
         expectedIndex += op.length
-      } else if (delta.$insertOp.check(op)) {
-        insertContentHelper(transaction, type, currPos, op.insert, op.format || {})
+      } else if (kind === 'retain') {
+        currPos.formatText(transaction, type, op.retain, getFormat(op.format))
         expectedIndex += op.length
-      } else if (delta.$retainOp.check(op)) {
-        currPos.formatText(transaction, type, op.retain, op.format || {})
-        expectedIndex += op.length
-      } else if (delta.$deleteOp.check(op)) {
-        deleteText(transaction, currPos, op.delete)
-      } else if (delta.$modifyOp.check(op)) {
+      } else if (kind === 'delete') {
+        deleteText(transaction, currPos, reserved ? op.length : op.delete)
+      } else if (kind === 'modify') {
         let item = currPos.right
         while (item !== null && rendererContentLength(renderer, item) === 0) { item = item.right }
         if (item == null || item.content.constructor !== ContentType) { error.unexpectedCase() }
         if (item.deleted) {
-          currPos.formatText(transaction, type, 1, {})
-          /** @type {{ [k:string]: any }|undefined} */
-          let invFormat
-          for (const k in op.format) {
-            (invFormat ?? (invFormat = {}))[k] = currPos.currentFormats.get(k) ?? null
+          currPos.formatText(transaction, type, 1, getFormat(null))
+          if (reserved) {
+            if (op.inverseFormat !== undefined) {
+              const keys = objectKeys(op.inverseFormat)
+              for (let index = 0; index < keys.length; index++) {
+                const key = keys[index]
+                objectDefineProperty(op.inverseFormat, key, {
+                  configurable: true,
+                  enumerable: true,
+                  value: currPos.currentFormats.get(key) ?? null,
+                  writable: true
+                })
+              }
+            }
+            applyNestedDelta(/** @type {ContentType} */ (item.content).type, op.value)
+          } else {
+            /** @type {{ [k:string]: any }|undefined} */
+            let invFormat
+            for (const k in op.format) {
+              (invFormat ?? (invFormat = {}))[k] = currPos.currentFormats.get(k) ?? null
+            }
+            const childFix = applyNestedDelta(/** @type {ContentType} */ (item.content).type, op.value)
+            if (childFix !== null || invFormat !== undefined) appendModifyFix(childFix, invFormat)
           }
-          const childFix = applyNestedDelta(/** @type {ContentType} */ (item.content).type, op.value)
-          if (childFix !== null || invFormat !== undefined) appendModifyFix(childFix, invFormat)
         } else {
           const childFix = applyNestedDelta(/** @type {ContentType} */ (item.content).type, op.value)
-          currPos.formatText(transaction, type, 1, op.format || {})
+          currPos.formatText(transaction, type, 1, getFormat(op.format))
           if (childFix !== null) appendModifyFix(childFix)
         }
         expectedIndex += 1
@@ -749,13 +833,22 @@ const applyDeltaCanonical = (type, d, origin, renderer, activeTransaction) => {
         error.unexpectedCase()
       }
     }
-    for (const op of d.attrs) {
-      if (delta.$setAttrOp.check(op)) {
-        typeMapSet(transaction, type, /** @type {any} */ (op.key), op.value)
-      } else if (delta.$deleteAttrOp.check(op)) {
-        typeMapDelete(transaction, type, /** @type {any} */ (op.key))
+    if (reserved) {
+      for (let index = 0; index < d.children.length; index++) applyChild(d.children[index])
+    } else {
+      for (const op of d.children) applyChild(op)
+    }
+    /** @param {any} op */
+    const applyAttr = op => {
+      const kind = reserved
+        ? op.kind
+        : (delta.$setAttrOp.check(op) ? 'set' : (delta.$deleteAttrOp.check(op) ? 'delete' : 'modify'))
+      if (kind === 'set') {
+        typeMapSet(transaction, type, op.key, op.value)
+      } else if (kind === 'delete') {
+        typeMapDelete(transaction, type, op.key)
       } else {
-        const mapItem = type._map.get(/** @type {any} */ (op.key))
+        const mapItem = type._map.get(op.key)
         const sub = mapItem === undefined
           ? undefined
           : (mapItem.deleted
@@ -766,12 +859,19 @@ const applyDeltaCanonical = (type, d, origin, renderer, activeTransaction) => {
         if (!(sub instanceof YType)) error.unexpectedCase()
         const subFix = applyNestedDelta(sub, op.value)
         if (subFix !== null) {
-          const f = fix ?? (fix = /** @type {any} */ (delta.create()))
-          f.modifyAttr(/** @type {any} */ (op.key), /** @type {any} */ (subFix))
+          if (!reserved) {
+            const f = fix ?? (fix = /** @type {any} */ (delta.create()))
+            f.modifyAttr(op.key, /** @type {any} */ (subFix))
+          }
         }
       }
     }
-    return fix !== null && !(/** @type {delta.DeltaBuilder<any>} */ (fix).done(false).isEmpty()) ? fix : null
+    if (reserved) {
+      for (let index = 0; index < d.attrs.length; index++) applyAttr(d.attrs[index])
+    } else {
+      for (const op of d.attrs) applyAttr(op)
+    }
+    return reserved ? (d.preparedFix ?? null) : (fix !== null && !(/** @type {delta.DeltaBuilder<any>} */ (fix).done(false).isEmpty()) ? fix : null)
   }
   return activeTransaction === null ? transact(type.doc, execute, origin) : execute(activeTransaction)
 }
@@ -1691,8 +1791,19 @@ export class YType extends ObservableV2 {
       d,
       origin,
       renderer,
-      (transaction, mutation) => applyDeltaCanonical(this, mutation, origin, renderer, transaction),
-      YType.prototype.applyDelta
+      (transaction, mutation) => {
+        return applyDeltaCanonical(this, readDeltaMutationPlan(mutation), origin, renderer, transaction)
+      },
+      YType.prototype.applyDelta,
+      name => {
+        const type = new YType(name)
+        objectDefineProperty(type, '_integrate', {
+          configurable: true,
+          value: YType.prototype._integrate,
+          writable: true
+        })
+        return type
+      }
     )
   }
 

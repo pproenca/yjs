@@ -441,32 +441,50 @@ export const transact = (doc, f, origin = null, local = true) => {
    * @type {any}
    */
   let result = null
+  let setupFailed = false
+  let setupError
   if (doc._transaction === null) {
     initialCall = true
     doc._transaction = new Transaction(doc, origin, local)
     transactionCleanups.push(doc._transaction)
-    if (transactionCleanups.length === 1) {
-      doc.emit('beforeAllTransactions', [doc])
+    try {
+      if (transactionCleanups.length === 1) {
+        doc.emit('beforeAllTransactions', [doc])
+      }
+      doc.emit('beforeTransaction', [doc._transaction, doc])
+    } catch (error) {
+      setupFailed = true
+      setupError = error
     }
-    doc.emit('beforeTransaction', [doc._transaction, doc])
+  }
+  const finishInitialCall = () => {
+    const finishCleanup = doc._transaction === transactionCleanups[0]
+    doc._transaction = null
+    if (finishCleanup) {
+      // The first transaction ended, now process observer calls.
+      // Observer call may create new transactions for which we need to call the observers and do cleanup.
+      // We don't want to nest these calls, so we execute these calls one after
+      // another.
+      // Also we need to ensure that all cleanups are called, even if the
+      // observes throw errors.
+      // This file is full of hacky try {} finally {} blocks to ensure that an
+      // event can throw errors and also that the cleanup is called.
+      cleanupTransactions(transactionCleanups, 0)
+    }
+  }
+  if (setupFailed) {
+    try {
+      finishInitialCall()
+    } catch (_) {
+      // A setup hook's original failure is authoritative; cleanup still ran to completion.
+    }
+    throw setupError
   }
   try {
     result = f(doc._transaction)
   } finally {
     if (initialCall) {
-      const finishCleanup = doc._transaction === transactionCleanups[0]
-      doc._transaction = null
-      if (finishCleanup) {
-        // The first transaction ended, now process observer calls.
-        // Observer call may create new transactions for which we need to call the observers and do cleanup.
-        // We don't want to nest these calls, so we execute these calls one after
-        // another.
-        // Also we need to ensure that all cleanups are called, even if the
-        // observes throw errors.
-        // This file is full of hacky try {} finally {} blocks to ensure that an
-        // event can throw errors and also that the cleanup is called.
-        cleanupTransactions(transactionCleanups, 0)
-      }
+      finishInitialCall()
     }
   }
   return result
