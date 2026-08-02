@@ -93,7 +93,7 @@ export const emptySnapshot = createSnapshot(createIdSet(), new Map())
 
 /** @param {StructStore} store */
 const assertDenseSnapshotStore = store => {
-  if (!store.skips.isEmpty() || !store.causalHoles.isEmpty() || !store.terminalCausalHoles.isEmpty()) {
+  if (!store.skips.isEmpty() || !store.causalHoles.isEmpty()) {
     throw new Error('Snapshots are unavailable for sparse documents')
   }
 }

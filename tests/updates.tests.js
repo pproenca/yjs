@@ -93,7 +93,7 @@ const encoders = [encV1, encV2, encDoc]
 /**
  * @typedef {Enc & {
  *   convert: function(Uint8Array<ArrayBuffer>):Uint8Array<ArrayBuffer>,
- *   decodeUpdate: function(Uint8Array<ArrayBuffer>):{structs:Array<Y.GC|Y.Item|Y.Skip|CausalHole|import('../src/structs/TerminalCausalHole.js').TerminalCausalHole|import('../src/structs/ProvenanceGC.js').ProvenanceGC>},
+ *   decodeUpdate: function(Uint8Array<ArrayBuffer>):{structs:Array<Y.GC|Y.Item|Y.Skip|CausalHole>},
  *   intersectUpdate: function(Uint8Array<ArrayBuffer>,Y.ContentIds):Uint8Array<ArrayBuffer>
  * }} SparseEnc
  */
@@ -380,10 +380,11 @@ export const testSparseCausalHoleCodecMatrix = () => {
     const fullIds = enc.readUpdateToContentIds(full)
     t.assert(!fullIds.inserts.has(2, 0) && fullIds.inserts.has(2, 1), `${enc.description} full content ids exclude holes`)
 
-    const merged = enc.mergeUpdates([baseline, sparse])
+    t.fails(() => enc.mergeUpdates([baseline, sparse]))
+    const merged = enc.encodeStateAsUpdate(incremental)
     const mergedReload = new Y.Doc({ gc: false, sparseExactResolution: true })
     enc.applyUpdate(mergedReload, merged)
-    assertSparse(mergedReload, 'merged reload')
+    assertSparse(mergedReload, 'context-compacted reload')
 
     const baselineDoc = new Y.Doc({ gc: false, sparseExactResolution: true })
     enc.applyUpdate(baselineDoc, baseline)
@@ -448,9 +449,12 @@ export const testSparseCausalHoleSplitArrivalMatrix = () => {
       t.assert(Y.decodeStateVector(enc.encodeStateVector(target)).get(2) === 4)
     })
 
+    t.fails(() => enc.mergeUpdates([sparse, source]))
+    t.fails(() => enc.mergeUpdates([source, sparse]))
     const realPreferred = new Y.Doc({ gc: false, sparseExactResolution: true })
-    enc.applyUpdate(realPreferred, enc.mergeUpdates([sparse, source]))
-    t.assert(realPreferred.get('text').toString() === 'aXYZW', `${enc.description} merge prefers real content`)
+    enc.applyUpdate(realPreferred, sparse)
+    enc.applyUpdate(realPreferred, source)
+    t.assert(realPreferred.get('text').toString() === 'aXYZW', `${enc.description} context-aware apply prefers real content`)
     t.assert(realPreferred.store.causalHoles.isEmpty())
   })
 }

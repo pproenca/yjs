@@ -7,15 +7,13 @@ import { Skip } from '../structs/Skip.js'
 import { Item } from '../structs/Item.js'
 import { GC } from '../structs/GC.js'
 import { CausalHole, CausalHoleIndex, createCausalHoleFromItem, sameCausalHoleMetadata } from '../structs/CausalHole.js'
-import { TerminalCausalHole, sameTerminalCausalHoleMetadata } from '../structs/TerminalCausalHole.js'
-import { ProvenanceGC } from '../structs/ProvenanceGC.js'
 import { createID } from './ID.js'
 import { createIdSet, intersectSets, mergeIdSets, writeIdSet } from './ids.js'
-import { forEachLiveCausalHole, forEachTerminalCausalHole } from './sparse-transport.js'
+import { forEachLiveCausalHole } from './sparse-transport.js'
 
 /**
  * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
- * @param {Array<GC|Item|Skip|CausalHole|TerminalCausalHole|ProvenanceGC>} structs All structs by `client`
+ * @param {Array<GC|Item|Skip|CausalHole>} structs All structs by `client`
  * @param {number} client
  * @param {Array<IdRange>} idranges
  *
@@ -243,13 +241,12 @@ const assertAcyclicCausalHoles = holes => {
  * @param {StructStore} sourceStore
  * @param {IdSet} selected
  * @param {CausalHoleIndex} holes
- * @param {Array<TerminalCausalHole>} [terminalHoles]
  */
-const writeSparseSelection = (encoder, sourceStore, selected, holes, terminalHoles = []) => {
-  /** @type {Map<number,Array<{struct:Item|CausalHole|TerminalCausalHole|ProvenanceGC|GC,start:number,end:number}>>} */
+const writeSparseSelection = (encoder, sourceStore, selected, holes) => {
+  /** @type {Map<number,Array<{struct:Item|CausalHole|GC,start:number,end:number}>>} */
   const blocks = new Map()
   /**
-   * @param {Item|CausalHole|TerminalCausalHole|ProvenanceGC|GC} struct
+   * @param {Item|CausalHole|GC} struct
    * @param {number} start
    * @param {number} end
    */
@@ -268,14 +265,13 @@ const writeSparseSelection = (encoder, sourceStore, selected, holes, terminalHol
     let clock = range.clock
     while (clock < end) {
       const struct = structs[index++]
-      if (struct === undefined || (struct.constructor !== Item && struct.constructor !== GC && struct.constructor !== ProvenanceGC) || struct.id.clock > clock) throw new Error('Selected content is not materialized')
+      if (struct === undefined || (struct.constructor !== Item && struct.constructor !== GC) || struct.id.clock > clock) throw new Error('Selected content is not materialized')
       const sliceEnd = Math.min(end, struct.id.clock + struct.length)
-      add(/** @type {Item|GC|ProvenanceGC} */ (struct), clock, sliceEnd)
+      add(/** @type {Item|GC} */ (struct), clock, sliceEnd)
       clock = sliceEnd
     }
   })
   holes.forEach(hole => add(hole, hole.id.clock, hole.id.clock + hole.length))
-  terminalHoles.forEach(terminal => add(terminal, terminal.id.clock, terminal.id.clock + terminal.length))
   encoding.writeVarUint(encoder.restEncoder, blocks.size)
   array.from(blocks.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, unsortedBlocks]) => {
     const clientBlocks = unsortedBlocks.sort((a, b) => a.start - b.start).reduce((result, block) => {
@@ -286,17 +282,11 @@ const writeSparseSelection = (encoder, sourceStore, selected, holes, terminalHol
         /** @type {CausalHole} */ (previous.struct).mergeWith(/** @type {CausalHole} */ (block.struct))
       ) {
         previous.end = block.end
-      } else if (
-        previous !== undefined && previous.end === block.start &&
-        previous.struct.constructor === TerminalCausalHole && block.struct.constructor === TerminalCausalHole &&
-        /** @type {TerminalCausalHole} */ (previous.struct).mergeWith(/** @type {TerminalCausalHole} */ (block.struct))
-      ) {
-        previous.end = block.end
       } else {
         result.push(block)
       }
       return result
-    }, /** @type {Array<{struct:Item|CausalHole|TerminalCausalHole|ProvenanceGC|GC,start:number,end:number}>} */ ([]))
+    }, /** @type {Array<{struct:Item|CausalHole|GC,start:number,end:number}>} */ ([]))
     let count = clientBlocks.length
     let clock = clientBlocks[0].start
     for (let i = 1; i < clientBlocks.length; i++) {
@@ -337,19 +327,7 @@ const addTransactionCausalHoles = (store, transaction, holes) => {
 const collectTransactionSparseTransport = (store, transaction) => {
   const holes = new CausalHoleIndex()
   addTransactionCausalHoles(store, transaction, holes)
-  /** @type {Array<TerminalCausalHole>} */
-  const terminalHoles = []
-  forEachTerminalCausalHole(transaction, recorded => {
-    for (const current of store.getTerminalCausalHoleOverlaps(recorded.id.client, recorded.id.clock, recorded.length)) {
-      const clock = Math.max(recorded.id.clock, current.id.clock)
-      const end = Math.min(recorded.id.clock + recorded.length, current.id.clock + current.length)
-      if (clock >= end) continue
-      const actual = current.slice(clock, end - clock)
-      const expected = recorded.slice(clock, end - clock)
-      if (sameTerminalCausalHoleMetadata(expected, actual)) terminalHoles.push(actual)
-    }
-  })
-  return { holes, terminalHoles }
+  return holes
 }
 
 /**
@@ -364,12 +342,11 @@ export const writeStructsFromTransaction = (encoder, transaction) => {
   const holes = store.causalHoles.clients.size === 0
     ? new CausalHoleIndex()
     : collectCausalHoles(store, transaction.insertSet, [], false)
-  const transport = collectTransactionSparseTransport(store, transaction)
-  transport.holes.forEach(hole => holes.add(hole))
-  if (holes.size === 0 && transport.terminalHoles.length === 0) {
+  collectTransactionSparseTransport(store, transaction).forEach(hole => holes.add(hole))
+  if (holes.size === 0) {
     writeStructsFromIdSet(encoder, store, transaction.insertSet)
   } else {
-    writeSparseSelection(encoder, store, transaction.insertSet, holes, transport.terminalHoles)
+    writeSparseSelection(encoder, store, transaction.insertSet, holes)
   }
 }
 
@@ -383,8 +360,7 @@ export const writeUpdateMessageFromTransaction = (encoder, transaction) => {
   if (
     transaction.deleteSet.clients.size === 0 &&
     transaction.insertSet.clients.size === 0 &&
-    transport.holes.size === 0 &&
-    transport.terminalHoles.length === 0
+    transport.size === 0
   ) {
     return false
   }

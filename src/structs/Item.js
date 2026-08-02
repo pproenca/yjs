@@ -7,7 +7,6 @@ import { AbstractStruct, addStructToIdSet } from '../structs/AbstractStruct.js'
 
 import { ID, createID, compareIDs, findRootTypeKey } from '../utils/ID.js'
 import { GC } from '../structs/GC.js'
-import { createProvenanceGCFromItem } from '../structs/ProvenanceGC.js'
 
 import {
   replaceStruct,
@@ -380,16 +379,9 @@ export class Item extends AbstractStruct {
     if (!this.deleted) {
       throw error.unexpectedCase()
     }
-    const contentWasType = this.content instanceof ContentType
     this.content.gc(tr)
-    if (contentWasType) tr.doc.store.retireCausalHolesForParent(tr, this.id)
     if (parentGCd) {
-      const replacement = tr.doc.sparseExactResolution ? createProvenanceGCFromItem(this) : new GC(this.id, this.length)
-      replaceStruct(tr, this, /** @type {GC} */ (/** @type {unknown} */ (replacement)))
-      if (tr.doc.sparseExactResolution) {
-        tr.doc.store.provenanceGCs.add(this.id.client, this.id.clock, this.length)
-        addStructToIdSet(tr.insertSet, /** @type {import('./AbstractStruct.js').AbstractStruct} */ (/** @type {unknown} */ (replacement)))
-      }
+      replaceStruct(tr, this, new GC(this.id, this.length))
     } else {
       this.content = new ContentDeleted(this.length)
     }
