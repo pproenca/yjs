@@ -20,7 +20,7 @@ import * as map from 'lib0/map'
 import * as math from 'lib0/math'
 import * as array from 'lib0/array'
 
-import { getStateVector, StructStore } from './StructStore.js'
+import { commitPendingDs, commitPendingStructs, getStateVector, StructStore } from './StructStore.js'
 import { findIndexSS, getItemCleanStart, getItemCleanEnd } from './transaction-helpers.js'
 import { createIdSet, IdRange, readAndApplyDeleteSet, readIdSet, mergeIdSets, writeIdSet } from './ids.js'
 import { compareIDs, createID, ID } from './ID.js'
@@ -315,16 +315,20 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
       }
       if (restStructs) {
         // merge restStructs into store.pending
+        const missing = new Map(pending.missing)
         for (const [client, clock] of restStructs.missing) {
-          const mclock = pending.missing.get(client)
+          const mclock = missing.get(client)
           if (mclock == null || mclock > clock) {
-            pending.missing.set(client, clock)
+            missing.set(client, clock)
           }
         }
-        pending.update = mergeUpdatesV2([pending.update, restStructs.update])
+        commitPendingStructs(store, {
+          missing,
+          update: mergeUpdatesV2([pending.update, restStructs.update])
+        })
       }
     } else {
-      store.pendingStructs = restStructs
+      commitPendingStructs(store, restStructs)
     }
     // console.log('time to integrate: ', performance.now() - start) // @todo remove
     // start = performance.now()
@@ -338,16 +342,16 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
       const dsRest2 = readAndApplyDeleteSet(pendingDSUpdate, transaction, store)
       if (dsRest && dsRest2) {
         // case 1: ds1 != null && ds2 != null
-        store.pendingDs = mergeUpdatesV2([dsRest, dsRest2])
+        commitPendingDs(store, mergeUpdatesV2([dsRest, dsRest2]))
       } else {
         // case 2: ds1 != null
         // case 3: ds2 != null
         // case 4: ds1 == null && ds2 == null
-        store.pendingDs = dsRest || dsRest2
+        commitPendingDs(store, dsRest || dsRest2)
       }
     } else {
       // Either dsRest == null && pendingDs == null OR dsRest != null
-      store.pendingDs = dsRest
+      commitPendingDs(store, dsRest)
     }
     // console.log('time to cleanup: ', performance.now() - start) // @todo remove
     // start = performance.now()
@@ -356,7 +360,7 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     // start = performance.now()
     if (retry) {
       const update = /** @type {{update: Uint8Array}} */ (store.pendingStructs).update
-      store.pendingStructs = null
+      commitPendingStructs(store, null)
       applyUpdateV2(transaction.doc, update)
     }
   }, transactionOrigin, false)
@@ -1292,6 +1296,9 @@ export const applyUpdate = (ydoc, update, transactionOrigin) => applyUpdateV2(yd
  * @function
  */
 export const writeStateAsUpdate = (encoder, doc, targetStateVector = new Map()) => {
+  if (doc.sparseExactResolution && getDocTransactionGeneration(doc).destroyed) {
+    throw new Error('Cannot encode a destroyed sparse exact-resolution document')
+  }
   writeClientsStructs(encoder, doc.store, targetStateVector)
   writeIdSet(encoder, doc.store.ds)
 }
@@ -1407,24 +1414,24 @@ const sparsePendingProofRuns = new WeakMap()
 export const _testOnlyGetSparsePendingProofRuns = doc => sparsePendingProofRuns.get(doc) ?? 0
 
 /** @param {Doc} doc @return {SparsePendingSnapshot} */
-const captureSparsePendingSnapshot = doc => ({
-  update: doc.store.pendingStructs?.update.slice() ?? null,
-  missing: doc.store.pendingStructs === null
-    ? null
-    : array.from(doc.store.pendingStructs.missing.entries()).sort((left, right) => left[0] - right[0] || left[1] - right[1]),
-  deletes: doc.store.pendingDs?.slice() ?? null
-})
+const captureSparsePendingSnapshot = doc => {
+  const pending = doc.store.pendingStructs
+  return {
+    update: pending?.update.slice() ?? null,
+    missing: pending === null
+      ? null
+      : array.from(pending.missing.entries()).sort((left, right) => left[0] - right[0] || left[1] - right[1]),
+    deletes: doc.store.pendingDs?.slice() ?? null
+  }
+}
 
-/** @param {SparsePendingSnapshot} left @param {SparsePendingSnapshot} right */
-const equalSparsePendingSnapshots = (left, right) => {
-  if (left.update === null ? right.update !== null : right.update === null || !equalBytes(left.update, right.update)) return false
-  if (left.deletes === null ? right.deletes !== null : right.deletes === null || !equalBytes(left.deletes, right.deletes)) return false
-  if (left.missing === null || right.missing === null) return left.missing === right.missing
-  const rightMissing = right.missing
-  return left.missing.length === rightMissing.length && left.missing.every(([client, clock], index) => {
-    const candidate = rightMissing[index]
-    return candidate[0] === client && candidate[1] === clock
-  })
+/** @param {Doc} doc @param {SparsePendingSnapshot} snapshot */
+const matchesLiveSparsePendingSnapshot = (doc, snapshot) => {
+  const pending = doc.store.pendingStructs
+  if (snapshot.update === null ? pending !== null : pending === null || !equalBytes(snapshot.update, pending.update)) return false
+  if (snapshot.deletes === null ? doc.store.pendingDs !== null : doc.store.pendingDs === null || !equalBytes(snapshot.deletes, doc.store.pendingDs)) return false
+  if (snapshot.missing === null || pending === null) return snapshot.missing === null && pending === null
+  return snapshot.missing.length === pending.missing.size && snapshot.missing.every(([client, clock]) => pending.missing.get(client) === clock)
 }
 
 /** @param {Doc} doc */
@@ -1442,10 +1449,9 @@ const encodeAuthoritativeSparseState = doc => {
  */
 const validateSparsePendingState = doc => {
   const transaction = getDocTransactionGeneration(doc)
-  const snapshot = captureSparsePendingSnapshot(doc)
   const proof = sparsePendingProofs.get(doc)
   if (transaction.settled && proof?.generation === transaction.generation) {
-    if (!equalSparsePendingSnapshots(proof.snapshot, snapshot)) {
+    if (!matchesLiveSparsePendingSnapshot(doc, proof.snapshot)) {
       throw new Error('Sparse pending state changed outside a completed transaction')
     }
     return
@@ -1489,7 +1495,7 @@ const validateSparsePendingState = doc => {
     }
     sparsePendingProofRuns.set(doc, (sparsePendingProofRuns.get(doc) ?? 0) + 1)
     if (transaction.settled) {
-      sparsePendingProofs.set(doc, { generation: transaction.generation, snapshot })
+      sparsePendingProofs.set(doc, { generation: transaction.generation, snapshot: captureSparsePendingSnapshot(doc) })
     }
   } finally {
     scratch.destroy()

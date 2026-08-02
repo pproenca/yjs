@@ -17,7 +17,8 @@ import {
 import * as Y from '../src/index.js'
 import { CausalHole, sameCausalHoleMetadata } from '../src/structs/CausalHole.js'
 import { normalizeDocOptions } from '../src/utils/Doc.js'
-import { _testOnlyGetSparsePendingProofRuns } from '../src/utils/encoding.js'
+import { getPendingRevision } from '../src/utils/StructStore.js'
+import { _testOnlyGetSparsePendingProofRuns, writeStateAsUpdate } from '../src/utils/encoding.js'
 import { writeStructsFromIdSetWithCausalHoles } from '../src/utils/encoding-helpers.js'
 
 /**
@@ -491,6 +492,14 @@ export const testSparsePendingProofCacheTracksTransactionsAndDefensiveSnapshots 
   Y.encodeStateAsUpdateV2(doc)
   t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 1)
 
+  doc.transact(() => {})
+  Y.applyUpdate(doc, new Uint8Array([0, 0]))
+  Y.applyUpdate(doc, sourceUpdates[1])
+  Y.applyUpdateV2(doc, Y.convertUpdateFormatV1ToV2(sourceUpdates[1]))
+  Y.encodeStateAsUpdate(doc, currentState)
+  Y.encodeStateAsUpdateV2(doc, currentState)
+  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 1)
+
   const pending = /** @type {NonNullable<typeof doc.store.pendingStructs>} */ (doc.store.pendingStructs)
   const originalByte = pending.update[pending.update.byteLength - 1]
   pending.update[pending.update.byteLength - 1] ^= 1
@@ -499,6 +508,14 @@ export const testSparsePendingProofCacheTracksTransactionsAndDefensiveSnapshots 
   pending.missing.set(999, 0)
   t.fails(() => Y.encodeStateAsUpdateV2(doc, currentState))
   pending.missing.delete(999)
+  const replacedMissing = new Map(pending.missing)
+  replacedMissing.set(999, 0)
+  doc.store.pendingStructs = {
+    missing: replacedMissing,
+    update: pending.update.slice()
+  }
+  t.fails(() => Y.encodeStateAsUpdate(doc, currentState))
+  doc.store.pendingStructs = pending
   t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 1)
 
   const deletes = Y.createIdSet()
@@ -523,13 +540,90 @@ export const testSparsePendingProofCacheTracksTransactionsAndDefensiveSnapshots 
   })
   t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 5)
   Y.encodeStateAsUpdate(doc, currentState)
-  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 6)
+  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 5)
 
   doc.clientID = 22
   Y.applyUpdate(doc, sourceUpdates[0])
   t.assert(doc.store.pendingStructs === null && doc.get('pending').toString() === 'ab')
   Y.encodeStateAsUpdateV2(doc, currentState)
-  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 7)
+  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 6)
+}
+
+export const testLargePendingTransportIgnoresEmptyTransactions = () => {
+  const source = new Y.Doc({ gc: false })
+  source.clientID = 24
+  /** @type {Array<Uint8Array<ArrayBuffer>>} */
+  const updates = []
+  source.on('update', update => updates.push(update))
+  source.get('pending').insert(0, 'a')
+  source.get('pending').insert(1, 'x'.repeat(2_000_000))
+
+  const doc = new Y.Doc({ gc: false, sparseExactResolution: true })
+  Y.applyUpdate(doc, updates[1])
+  t.assert(doc.store.pendingStructs !== null && doc.store.pendingStructs.update.byteLength > 2_000_000)
+
+  const targetState = Y.encodeStateVector(source)
+  const first = Y.encodeStateAsUpdate(doc, targetState)
+  t.assert(first.byteLength < 256 && _testOnlyGetSparsePendingProofRuns(doc) === 1)
+  const pendingRevision = getPendingRevision(doc.store)
+
+  for (let index = 0; index < 50; index++) {
+    Y.applyUpdate(doc, new Uint8Array([0, 0]))
+  }
+
+  t.assert(getPendingRevision(doc.store) === pendingRevision)
+  t.assert(Y.encodeStateAsUpdate(doc, targetState).byteLength < 256)
+  t.assert(Y.encodeStateAsUpdateV2(doc, targetState).byteLength < 256)
+  t.assert(_testOnlyGetSparsePendingProofRuns(doc) === 1)
+}
+
+export const testDestroyedSparseDocumentsCannotReusePendingProofs = () => {
+  const createPending = () => {
+    const source = new Y.Doc({ gc: false })
+    source.clientID = 31
+    /** @type {Array<Uint8Array<ArrayBuffer>>} */
+    const updates = []
+    source.on('update', update => updates.push(update))
+    source.get('pending').insert(0, 'a')
+    source.get('pending').insert(1, 'b')
+    const doc = new Y.Doc({ gc: false, sparseExactResolution: true })
+    Y.applyUpdate(doc, updates[1])
+    return doc
+  }
+
+  const cached = createPending()
+  Y.encodeStateAsUpdate(cached)
+  t.assert(_testOnlyGetSparsePendingProofRuns(cached) === 1)
+  cached.destroy()
+  cached.isDestroyed = false
+  cached.clientID = 31
+  cached.get('pending').insert(0, 'a')
+  t.fails(() => Y.encodeStateAsUpdate(cached))
+  t.fails(() => Y.encodeStateAsUpdateV2(cached))
+  t.fails(() => writeStateAsUpdate(new Y.UpdateEncoderV1(), cached))
+  t.fails(() => writeStateAsUpdate(new Y.UpdateEncoderV2(), cached))
+  t.assert(_testOnlyGetSparsePendingProofRuns(cached) === 1)
+
+  const uncached = createPending()
+  uncached.destroy()
+  uncached.isDestroyed = false
+  uncached.clientID = 31
+  uncached.get('pending').insert(0, 'a')
+  t.fails(() => Y.encodeStateAsUpdate(uncached))
+  t.fails(() => Y.encodeStateAsUpdateV2(uncached))
+  t.fails(() => writeStateAsUpdate(new Y.UpdateEncoderV1(), uncached))
+  t.fails(() => writeStateAsUpdate(new Y.UpdateEncoderV2(), uncached))
+  t.assert(_testOnlyGetSparsePendingProofRuns(uncached) === 0)
+
+  const ordinary = new Y.Doc({ gc: false })
+  ordinary.get('text').insert(0, 'ordinary')
+  const before = Y.encodeStateAsUpdate(ordinary)
+  ordinary.destroy()
+  t.compareArrays(Array.from(Y.encodeStateAsUpdate(ordinary)), Array.from(before))
+  const ordinaryV2 = Y.encodeStateAsUpdateV2(ordinary)
+  const reload = new Y.Doc({ gc: false })
+  Y.applyUpdateV2(reload, ordinaryV2)
+  t.assert(reload.get('text').toString() === 'ordinary')
 }
 
 export const testSparseSubdocWirePreservesCapability = () => {

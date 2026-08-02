@@ -5,6 +5,64 @@ import { createID } from './ID.js'
 import { createDeleteSetFromStructStore, createIdSet } from './ids.js'
 import { findIndexSS } from './transaction-helpers.js'
 
+/** @type {WeakMap<StructStore,number>} */
+const pendingRevisions = new WeakMap()
+
+/** @param {Uint8Array} left @param {Uint8Array} right */
+const equalPendingBytes = (left, right) => {
+  if (left === right) return true
+  if (left.byteLength !== right.byteLength) return false
+  for (let index = 0; index < left.byteLength; index++) {
+    if (left[index] !== right[index]) return false
+  }
+  return true
+}
+
+/**
+ * @param {{ missing: Map<number, number>, update: Uint8Array<ArrayBuffer> }} left
+ * @param {{ missing: Map<number, number>, update: Uint8Array<ArrayBuffer> }} right
+ */
+const equalPendingStructs = (left, right) => {
+  if (left === right) return true
+  if (left.missing.size !== right.missing.size || !equalPendingBytes(left.update, right.update)) return false
+  for (const [client, clock] of left.missing) {
+    if (right.missing.get(client) !== clock) return false
+  }
+  return true
+}
+
+/** @param {StructStore} store */
+export const getPendingRevision = store => pendingRevisions.get(store) ?? 0
+
+/**
+ * Commit pending structs produced by the update decoder. Direct field writes intentionally bypass
+ * the revision so proof-cache snapshots can reject unsupported mutation.
+ *
+ * @param {StructStore} store
+ * @param {null | { missing: Map<number, number>, update: Uint8Array<ArrayBuffer> }} pending
+ */
+export const commitPendingStructs = (store, pending) => {
+  const current = store.pendingStructs
+  const changed = current === null || pending === null
+    ? current !== pending
+    : !equalPendingStructs(current, pending)
+  store.pendingStructs = pending
+  if (changed) pendingRevisions.set(store, getPendingRevision(store) + 1)
+}
+
+/**
+ * @param {StructStore} store
+ * @param {null | Uint8Array<ArrayBuffer>} pending
+ */
+export const commitPendingDs = (store, pending) => {
+  const current = store.pendingDs
+  const changed = current === null || pending === null
+    ? current !== pending
+    : !equalPendingBytes(current, pending)
+  store.pendingDs = pending
+  if (changed) pendingRevisions.set(store, getPendingRevision(store) + 1)
+}
+
 /** @param {ID|string} parent @param {string|null} parentSub */
 const causalHoleParentGroupKey = (parent, parentSub) => typeof parent === 'string'
   ? `root:${JSON.stringify(parent)}:${JSON.stringify(parentSub)}`
@@ -24,6 +82,7 @@ const sameSparseMetadataAt = (left, right, clock, end) => {
 
 export class StructStore {
   constructor () {
+    pendingRevisions.set(this, 0)
     /**
      * Causal holes are an internal sparse extension hidden from the ordinary StructStore contract.
      * @type {Map<number,Array<GC|Item|Skip>>}

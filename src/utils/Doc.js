@@ -8,20 +8,21 @@ import * as map from 'lib0/map'
 import * as array from 'lib0/array'
 import * as promise from 'lib0/promise'
 
-import { StructStore } from './StructStore.js'
+import { getPendingRevision, StructStore } from './StructStore.js'
 import { transact, generateNewClientId } from './Transaction.js'
+import { hasSparseTransport } from './sparse-transport.js'
 import { YType } from '../ytype.js'
 import { $ydoc } from './schemas.js'
 
-/** @type {WeakMap<Doc,{generation:number,pendingTransactions:number}>} */
+/** @type {WeakMap<Doc,{generation:number,pendingTransactions:number,destroyed:boolean,pendingBefore:WeakMap<object,number>}>} */
 const transactionGenerations = new WeakMap()
 
 /** @param {Doc} doc */
 export const getDocTransactionGeneration = doc => {
   const state = transactionGenerations.get(doc)
   return state === undefined
-    ? { generation: 0, settled: doc._transaction === null }
-    : { generation: state.generation, settled: state.pendingTransactions === 0 && doc._transaction === null }
+    ? { generation: 0, settled: doc._transaction === null, destroyed: false }
+    : { generation: state.generation, settled: state.pendingTransactions === 0 && doc._transaction === null, destroyed: state.destroyed }
 }
 
 /**
@@ -144,11 +145,28 @@ export class Doc extends ObservableV2 {
     this.autoLoad = autoLoad
     this.meta = meta
     if (sparseExactResolution) {
-      const transactionGeneration = { generation: 0, pendingTransactions: 0 }
+      const transactionGeneration = { generation: 0, pendingTransactions: 0, destroyed: false, pendingBefore: new WeakMap() }
       transactionGenerations.set(this, transactionGeneration)
-      this.on('beforeTransaction', () => { transactionGeneration.pendingTransactions++ })
-      this.on('beforeObserverCalls', () => { transactionGeneration.generation++ })
-      this.on('afterTransactionCleanup', () => { transactionGeneration.pendingTransactions-- })
+      this.on('beforeTransaction', transaction => {
+        transactionGeneration.pendingTransactions++
+        transactionGeneration.pendingBefore.set(transaction, getPendingRevision(this.store))
+      })
+      this.on('beforeObserverCalls', transaction => {
+        const pendingBefore = transactionGeneration.pendingBefore.get(transaction)
+        if (
+          transaction.insertSet.clients.size > 0 ||
+          transaction.deleteSet.clients.size > 0 ||
+          hasSparseTransport(transaction) ||
+          pendingBefore === undefined ||
+          pendingBefore !== getPendingRevision(this.store)
+        ) {
+          transactionGeneration.generation++
+        }
+      })
+      this.on('afterTransactionCleanup', transaction => {
+        transactionGeneration.pendingTransactions--
+        transactionGeneration.pendingBefore.delete(transaction)
+      })
     }
     /**
      * This is set to true when the persistence provider loaded the document from the database or when the `sync` event fires.
@@ -290,6 +308,8 @@ export class Doc extends ObservableV2 {
    * Emit `destroy` event and unregister all event handlers.
    */
   destroy () {
+    const transactionGeneration = transactionGenerations.get(this)
+    if (transactionGeneration !== undefined) transactionGeneration.destroyed = true
     this.isDestroyed = true
     // Tear down the top-level shared types as RDTs (emits their `'destroy'` event so any bindings
     // unsubscribe). Only top-level types are destroyed here; nested child types are not recursed.
