@@ -1491,7 +1491,9 @@ export const testCausalHoleTerminalForgeryAndArrivalOrdering = () => {
     const sourceFirst = createDeadParent()
     apply(sourceFirst, source)
     t.assert(sourceFirst.store.getStruct(Y.createID(2, 0))?.constructor === Y.GC)
-    apply(sourceFirst, terminal)
+    const sourceFirstBefore = encode(sourceFirst)
+    t.fails(() => apply(sourceFirst, terminal))
+    t.compareArrays(Array.from(encode(sourceFirst)), Array.from(sourceFirstBefore))
 
     const terminalFirst = createDeadParent()
     apply(terminalFirst, terminal)
@@ -1505,8 +1507,7 @@ export const testCausalHoleTerminalForgeryAndArrivalOrdering = () => {
       t.assert(merged.store.getStruct(Y.createID(2, 0))?.constructor === TerminalCausalHole)
       t.compareArrays(Array.from(encode(merged)), Array.from(encode(terminalFirst)))
     })
-    t.assert(sourceFirst.store.getStruct(Y.createID(2, 0))?.constructor === TerminalCausalHole)
-    t.compareArrays(Array.from(encode(sourceFirst)), Array.from(encode(terminalFirst)))
+    t.assert(sourceFirst.store.getStruct(Y.createID(2, 0))?.constructor === Y.GC)
   })
 }
 
@@ -1616,46 +1617,112 @@ export const testCausalHoleRetainedParentArrivalPermutations = () => {
   })
 }
 
-export const testCausalHolePartialTerminalReplaysOverReloadedGc = () => {
+export const testCausalHoleTerminalCannotReplaceReloadedGc = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, contentIds: Y.createContentIdsFromUpdate, event: 'update' },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, contentIds: Y.createContentIdsFromUpdateV2, event: 'updateV2' }
+  ].forEach(({ Encoder, apply, encode, contentIds, event }) => {
+    const doc = new Y.Doc({ gc: true })
+    apply(doc, encodeStructGroups([
+      [new Y.Item(Y.createID(1, 0), null, null, null, null, 'root', null, new Y.ContentType(new Y.Type()))],
+      [new Y.Item(Y.createID(2, 0), null, null, null, null, Y.createID(1, 0), null, new Y.ContentString('abc'))],
+      [new Y.Item(Y.createID(3, 0), null, null, null, null, 'unrelated', null, new Y.ContentType(new Y.Type()))]
+    ], Encoder))
+    const deletionIds = Y.createIdSet()
+    deletionIds.add(1, 0, 1)
+    deletionIds.add(3, 0, 1)
+    apply(doc, encodeDeleteSet(deletionIds, Encoder))
+    t.assert(doc.store.getStruct(Y.createID(2, 0))?.constructor === Y.GC)
+
+    const full = encode(doc)
+    const reloaded = new Y.Doc({ gc: true })
+    apply(reloaded, full)
+    t.assert(reloaded.store.getStruct(Y.createID(2, 0))?.constructor === Y.GC)
+    const before = encode(reloaded)
+    const beforeState = Y.encodeStateVector(reloaded)
+    const beforeIds = contentIds(before)
+    for (let clock = 0; clock < 3; clock++) {
+      t.assert(beforeIds.inserts.has(2, clock) && beforeIds.deletes.has(2, clock), `${Encoder.name} GC is semantic before forged terminal`)
+    }
+    /** @type {Array<Uint8Array<ArrayBuffer>>} */
+    const events = []
+    reloaded.on(/** @type {'update'|'updateV2'} */ (event), update => events.push(update))
+    ;[
+      new TerminalCausalHole(Y.createID(2, 0), 3, null, null, Y.createID(3, 0), null),
+      new TerminalCausalHole(Y.createID(2, 1), 1, Y.createID(2, 0), null, Y.createID(3, 0), null),
+      new CausalHole(Y.createID(2, 1), 1, Y.createID(2, 0), null, Y.createID(3, 0), null)
+    ].forEach(sparse => {
+      t.fails(() => apply(reloaded, encodeStructs([sparse], Encoder)))
+      const after = encode(reloaded)
+      t.compareArrays(Array.from(after), Array.from(before))
+      t.compareArrays(Array.from(Y.encodeStateVector(reloaded)), Array.from(beforeState))
+      const afterIds = contentIds(after)
+      for (let clock = 0; clock < 3; clock++) {
+        t.assert(afterIds.inserts.has(2, clock) && afterIds.deletes.has(2, clock), `${Encoder.name} rejected terminal preserves semantic GC`)
+      }
+      t.assert(events.length === 0 && reloaded.store.getStruct(Y.createID(2, 0))?.constructor === Y.GC)
+    })
+  })
+}
+
+export const testCausalHoleTerminalMayUseDisjointGcEndpoint = () => {
   ;[
     { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, decode: Y.decodeUpdate },
     { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, decode: Y.decodeUpdateV2 }
   ].forEach(({ Encoder, apply, encode, decode }) => {
     const doc = new Y.Doc({ gc: true })
     apply(doc, encodeStructGroups([
-      [new Y.Item(Y.createID(1, 0), null, null, null, null, 'root', null, new Y.ContentType(new Y.Type()))],
-      [new Y.Item(Y.createID(2, 0), null, null, null, null, Y.createID(1, 0), null, new Y.ContentString('abc'))]
+      [new Y.GC(Y.createID(1, 0), 1)],
+      [new Y.GC(Y.createID(2, 0), 1)]
     ], Encoder))
-    const deletionIds = Y.createIdSet()
-    deletionIds.add(1, 0, 1)
-    apply(doc, encodeDeleteSet(deletionIds, Encoder))
-    t.assert(doc.store.getStruct(Y.createID(2, 0))?.constructor === Y.GC)
+    apply(doc, encodeStructs([
+      new TerminalCausalHole(Y.createID(2, 1), 1, Y.createID(2, 0), null, Y.createID(1, 0), null)
+    ], Encoder))
+    t.compare(
+      (doc.store.clients.get(2) ?? []).map(struct => [struct.constructor.name, struct.id.clock, struct.length]),
+      [['GC', 0, 1], ['TerminalCausalHole', 1, 1]]
+    )
 
     const full = encode(doc)
-    t.assert(decode(full).structs.some(struct => struct.constructor === Y.GC && struct.id.client === 2))
-    t.assert(!decode(full).structs.some(struct => struct.constructor === TerminalCausalHole && struct.id.client === 2))
+    const structs = decode(full).structs.filter(struct => struct.id.client === 2)
+    t.assert(structs.some(struct => struct.constructor === Y.GC && struct.id.clock === 0))
+    t.assert(structs.some(struct => struct.constructor === TerminalCausalHole && struct.id.clock === 1))
     const reloaded = new Y.Doc({ gc: true })
     apply(reloaded, full)
-    t.assert(reloaded.store.getStruct(Y.createID(2, 0))?.constructor === Y.GC)
-
-    apply(reloaded, encodeStructs([
-      new TerminalCausalHole(Y.createID(2, 1), 2, Y.createID(2, 0), null, Y.createID(1, 0), null)
-    ], Encoder))
     t.compare(
       (reloaded.store.clients.get(2) ?? []).map(struct => [struct.constructor.name, struct.id.clock, struct.length]),
-      [['GC', 0, 1], ['TerminalCausalHole', 1, 2]]
+      [['GC', 0, 1], ['TerminalCausalHole', 1, 1]]
     )
     t.assert(reloaded.store.pendingStructs === null && reloaded.store.pendingDs === null)
+  })
+}
 
-    const persisted = encode(reloaded)
-    t.assert(decode(persisted).structs.some(struct => struct.constructor === TerminalCausalHole && struct.id.client === 2 && struct.id.clock === 1 && struct.length === 2))
-    const replay = new Y.Doc({ gc: true })
-    apply(replay, persisted)
-    t.compare(
-      (replay.store.clients.get(2) ?? []).map(struct => [struct.constructor.name, struct.id.clock, struct.length]),
-      [['GC', 0, 1], ['TerminalCausalHole', 1, 2]]
-    )
-    t.assert(replay.store.pendingStructs === null && replay.store.pendingDs === null)
+export const testCausalHoleStoredGcCannotShadowIncomingTerminalCycle = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, decode: Y.decodeUpdate, event: 'update' },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, decode: Y.decodeUpdateV2, event: 'updateV2' }
+  ].forEach(({ Encoder, apply, encode, decode, event }) => {
+    const doc = new Y.Doc({ gc: true })
+    apply(doc, encodeStructGroups([
+      [new Y.GC(Y.createID(1, 0), 1)],
+      [new Y.GC(Y.createID(2, 0), 1)]
+    ], Encoder))
+    const before = encode(doc)
+    const beforeState = Y.encodeStateVector(doc)
+    /** @type {Array<Uint8Array<ArrayBuffer>>} */
+    const events = []
+    doc.on(/** @type {'update'|'updateV2'} */ (event), update => events.push(update))
+    t.fails(() => apply(doc, encodeStructs([
+      new TerminalCausalHole(Y.createID(2, 0), 1, Y.createID(2, 0), null, Y.createID(1, 0), null)
+    ], Encoder)))
+    t.compareArrays(Array.from(encode(doc)), Array.from(before))
+    t.compareArrays(Array.from(Y.encodeStateVector(doc)), Array.from(beforeState))
+    t.assert(events.length === 0 && doc.store.getStruct(Y.createID(2, 0))?.constructor === Y.GC)
+    t.assert(!decode(encode(doc)).structs.some(struct => struct.constructor === TerminalCausalHole))
+    const reloaded = new Y.Doc({ gc: true })
+    apply(reloaded, encode(doc))
+    t.assert(reloaded.store.getStruct(Y.createID(2, 0))?.constructor === Y.GC)
+    t.assert(reloaded.store.pendingStructs === null && reloaded.store.pendingDs === null)
   })
 }
 

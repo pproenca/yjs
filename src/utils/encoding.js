@@ -472,6 +472,38 @@ const validateCausalHoleEnvelope = (blockSet, store, deleteSet) => {
     }
     return null
   }
+  const assertIncomingSparseAnchorsAcyclic = () => {
+    /** @type {Map<CausalHole|TerminalCausalHole,0|1|2>} */
+    const colors = new Map()
+    const sparseStructs = /** @type {Array<CausalHole|TerminalCausalHole>} */ ([...incomingHoles, ...incomingTerminals])
+    for (const root of sparseStructs) {
+      if (colors.get(root) === 2) continue
+      /** @type {Array<{sparse:CausalHole|TerminalCausalHole,next:number}>} */
+      const stack = [{ sparse: root, next: 0 }]
+      colors.set(root, 1)
+      while (stack.length > 0) {
+        const frame = stack[stack.length - 1]
+        const anchors = [frame.sparse.origin, frame.sparse.rightOrigin]
+        if (frame.next >= anchors.length) {
+          colors.set(frame.sparse, 2)
+          stack.pop()
+          continue
+        }
+        const anchor = anchors[frame.next++]
+        if (anchor === null) continue
+        const dependency = incomingAt(anchor)
+        if (dependency?.constructor !== CausalHole && dependency?.constructor !== TerminalCausalHole) continue
+        const sparse = /** @type {CausalHole|TerminalCausalHole} */ (dependency)
+        const color = colors.get(sparse) ?? 0
+        if (color === 1) throw new Error('Cyclic causal hole metadata')
+        if (color === 0) {
+          colors.set(sparse, 1)
+          stack.push({ sparse, next: 0 })
+        }
+      }
+    }
+  }
+  assertIncomingSparseAnchorsAcyclic()
   /**
    * @param {ID} id
    */
@@ -530,6 +562,21 @@ const validateCausalHoleEnvelope = (blockSet, store, deleteSet) => {
       }
       clock = overlapEnd
       if (clock === end) return true
+    }
+    return false
+  }
+  /** @param {CausalHole|TerminalCausalHole} sparse */
+  const overlapsStoredGc = sparse => {
+    const rawStructs = store.clients.get(sparse.id.client)
+    if (rawStructs === undefined || rawStructs.length === 0) return false
+    const structs = /** @type {Array<GC|Item|Skip|CausalHole|TerminalCausalHole>} */ (/** @type {unknown} */ (rawStructs))
+    const end = sparse.id.clock + sparse.length
+    const firstClock = structs[0].id.clock
+    const last = structs[structs.length - 1]
+    if (end <= firstClock || sparse.id.clock >= last.id.clock + last.length) return false
+    let index = findIndexSS(/** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ (structs)), Math.max(sparse.id.clock, firstClock))
+    for (let struct = structs[index]; struct !== undefined && struct.id.clock < end; struct = structs[++index]) {
+      if (struct.constructor === GC && struct.id.clock + struct.length > sparse.id.clock) return true
     }
     return false
   }
@@ -631,6 +678,9 @@ const validateCausalHoleEnvelope = (blockSet, store, deleteSet) => {
   for (const terminal of incomingTerminals) {
     const disposition = /** @type {SparseParentDisposition} */ (terminalMemo.get(terminal))
     if (disposition === 'live') throw new Error('Terminal causal hole parent is not dead')
+    if (disposition === 'dead' && overlapsStoredGc(terminal)) {
+      throw new Error('Terminal causal hole cannot replace GC coverage')
+    }
     if (disposition === 'staged') {
       stagedTerminals.set(terminal, new CausalHole(
         createID(terminal.id.client, terminal.id.clock),
@@ -640,6 +690,11 @@ const validateCausalHoleEnvelope = (blockSet, store, deleteSet) => {
         terminal.parent,
         terminal.parentSub
       ))
+    }
+  }
+  for (const hole of incomingHoles) {
+    if (terminalMemo.get(hole) === 'dead' && overlapsStoredGc(hole)) {
+      throw new Error('Terminal causal hole cannot replace GC coverage')
     }
   }
   if (stagedTerminals.size > 0) {
