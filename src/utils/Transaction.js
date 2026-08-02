@@ -11,17 +11,83 @@ import { createIdSet, isIdSetEmptyCanonical, iterateStructsByIdSet } from './ids
 import { GC } from '../structs/GC.js'
 import { YEvent } from './YEvent.js'
 import { writeUpdateMessageFromTransaction } from './encoding-helpers.js'
-import { UpdateEncoderV1, UpdateEncoderV2 } from './UpdateEncoder.js'
+import { IdSetEncoderV1, IdSetEncoderV2, UpdateEncoderV1, UpdateEncoderV2 } from './UpdateEncoder.js'
 import { findIndexSS, updateCurrentFormats, cleanupFormattingGap, tryGcDeleteSet, tryMerge, tryToMergeWithLefts, cleanupContextlessFormattingGap } from './transaction-helpers.js'
+import { activateReservedMutationTransaction, assertReservedMutationTransactionRuntime, beginReservedMutationCleanup, deactivateReservedMutationTransaction, isReservedMutationTransactionActive, readReservedMutationAccounting, readReservedMutationTransactionRuntime, writeReservedMutationUpdate } from './reserved-mutation-runtime.js'
 import * as random from 'lib0/random'
 
 export const generateNewClientId = random.uint53
 
+const objectFreeze = Object.freeze
+const reflectApply = Reflect.apply
+const NativeMap = Map
+const NativeSet = Set
+const reservedEncoderV1Kernel = objectFreeze({
+  toUint8Array: IdSetEncoderV1.prototype.toUint8Array,
+  resetIdSetCurVal: IdSetEncoderV1.prototype.resetIdSetCurVal,
+  writeIdSetClock: IdSetEncoderV1.prototype.writeIdSetClock,
+  writeIdSetLen: IdSetEncoderV1.prototype.writeIdSetLen,
+  writeLeftID: UpdateEncoderV1.prototype.writeLeftID,
+  writeRightID: UpdateEncoderV1.prototype.writeRightID,
+  writeClient: UpdateEncoderV1.prototype.writeClient,
+  writeInfo: UpdateEncoderV1.prototype.writeInfo,
+  writeString: UpdateEncoderV1.prototype.writeString,
+  writeParentInfo: UpdateEncoderV1.prototype.writeParentInfo,
+  writeTypeRef: UpdateEncoderV1.prototype.writeTypeRef,
+  writeLen: UpdateEncoderV1.prototype.writeLen,
+  writeAny: UpdateEncoderV1.prototype.writeAny,
+  writeBuf: UpdateEncoderV1.prototype.writeBuf,
+  writeJSON: UpdateEncoderV1.prototype.writeJSON,
+  writeKey: UpdateEncoderV1.prototype.writeKey
+})
+const reservedEncoderV2Kernel = objectFreeze({
+  toUint8Array: UpdateEncoderV2.prototype.toUint8Array,
+  resetIdSetCurVal: IdSetEncoderV2.prototype.resetIdSetCurVal,
+  writeIdSetClock: IdSetEncoderV2.prototype.writeIdSetClock,
+  writeIdSetLen: IdSetEncoderV2.prototype.writeIdSetLen,
+  writeLeftID: UpdateEncoderV2.prototype.writeLeftID,
+  writeRightID: UpdateEncoderV2.prototype.writeRightID,
+  writeClient: UpdateEncoderV2.prototype.writeClient,
+  writeInfo: UpdateEncoderV2.prototype.writeInfo,
+  writeString: UpdateEncoderV2.prototype.writeString,
+  writeParentInfo: UpdateEncoderV2.prototype.writeParentInfo,
+  writeTypeRef: UpdateEncoderV2.prototype.writeTypeRef,
+  writeLen: UpdateEncoderV2.prototype.writeLen,
+  writeAny: UpdateEncoderV2.prototype.writeAny,
+  writeBuf: UpdateEncoderV2.prototype.writeBuf,
+  writeJSON: UpdateEncoderV2.prototype.writeJSON,
+  writeKey: UpdateEncoderV2.prototype.writeKey
+})
+
+/** @param {UpdateEncoderV1|UpdateEncoderV2} encoder @param {typeof reservedEncoderV1Kernel} kernel */
+const createReservedEncoder = (encoder, kernel) => {
+  /** @param {Function} method */
+  const call = method => /** @param {any} value */ value => reflectApply(method, encoder, [value])
+  /** @param {Function} method */
+  const callWithoutArguments = method => () => reflectApply(method, encoder, [])
+  return objectFreeze({
+    restEncoder: encoder.restEncoder,
+    toUint8Array: callWithoutArguments(kernel.toUint8Array),
+    resetIdSetCurVal: callWithoutArguments(kernel.resetIdSetCurVal),
+    writeIdSetClock: call(kernel.writeIdSetClock),
+    writeIdSetLen: call(kernel.writeIdSetLen),
+    writeLeftID: call(kernel.writeLeftID),
+    writeRightID: call(kernel.writeRightID),
+    writeClient: call(kernel.writeClient),
+    writeInfo: call(kernel.writeInfo),
+    writeString: call(kernel.writeString),
+    writeParentInfo: call(kernel.writeParentInfo),
+    writeTypeRef: call(kernel.writeTypeRef),
+    writeLen: call(kernel.writeLen),
+    writeAny: call(kernel.writeAny),
+    writeBuf: call(kernel.writeBuf),
+    writeJSON: call(kernel.writeJSON),
+    writeKey: call(kernel.writeKey)
+  })
+}
+
 /** @type {WeakMap<Doc,{revision:number}>} */
 const documentStructuralRevisions = new WeakMap()
-/** @type {WeakMap<Transaction,object>} */
-const reservedMutationTransactions = new WeakMap()
-
 /**
  * Internal structural revision used by pre-write capabilities. The entry is allocated lazily so
  * documents without a revision consumer only pay one WeakMap lookup for nonempty cleanup.
@@ -109,13 +175,13 @@ export class Transaction {
      * Maps from type to parentSubs (`item.parentSub = null` for YArray)
      * @type {Map<YType,Set<String|null>>}
      */
-    this.changed = new Map()
+    this.changed = new NativeMap()
     /**
      * Stores the events for the types that observe also child elements.
      * It is mainly used by `observeDeep`.
      * @type {Map<YType,Array<YEvent<any>>>}
      */
-    this.changedParentTypes = new Map()
+    this.changedParentTypes = new NativeMap()
     /**
      * @type {Array<AbstractStruct>}
      */
@@ -128,7 +194,7 @@ export class Transaction {
      * Stores meta information on the transaction
      * @type {Map<any,any>}
      */
-    this.meta = new Map()
+    this.meta = new NativeMap()
     /**
      * Whether this change originates from this doc.
      * @type {boolean}
@@ -137,15 +203,15 @@ export class Transaction {
     /**
      * @type {Set<Doc>}
      */
-    this.subdocsAdded = new Set()
+    this.subdocsAdded = new NativeSet()
     /**
      * @type {Set<Doc>}
      */
-    this.subdocsRemoved = new Set()
+    this.subdocsRemoved = new NativeSet()
     /**
      * @type {Set<Doc>}
      */
-    this.subdocsLoaded = new Set()
+    this.subdocsLoaded = new NativeSet()
     /**
      * @type {boolean}
      */
@@ -242,6 +308,7 @@ const cleanupTransactions = (transactionCleanups, i) => {
     const store = doc.store
     const ds = transaction.deleteSet
     const mergeStructs = transaction._mergeStructs
+    const reservedRuntime = /** @type {any} */ (readReservedMutationTransactionRuntime(transaction))
     let cleanupFailed = false
     let cleanupFailure
     try {
@@ -302,42 +369,60 @@ const cleanupTransactions = (transactionCleanups, i) => {
         })
         fs.push(() => doc.emit('afterTransaction', [transaction, doc]))
         callAll(fs, [])
-        if (transaction._needFormattingCleanup && doc.cleanupFormatting) {
+        if (reservedRuntime === undefined && transaction._needFormattingCleanup && doc.cleanupFormatting) {
           cleanupYTextAfterTransaction(transaction)
         }
       } finally {
-        // Replace deleted items with ItemDeleted / GC.
-        // This is where content is actually remove from the Yjs Doc.
-        if (doc.gc) {
-          tryGcDeleteSet(transaction, ds, doc.gcFilter)
-        }
-        tryMerge(ds, store)
-
-        // on all affected store.clients props, try to merge
-        transaction.insertSet.clients.forEach((ids, client) => {
-          const firstClock = ids.getIds()[0].clock
-          const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
-          // we iterate from right to left so we can safely remove entries
-          const firstChangePos = math.max(findIndexSS(structs, firstClock), 1)
-          for (let i = structs.length - 1; i >= firstChangePos;) {
-            i -= 1 + tryToMergeWithLefts(structs, i)
+        if (reservedRuntime === undefined) {
+          // Replace deleted items with ItemDeleted / GC.
+          // This is where content is actually remove from the Yjs Doc.
+          if (doc.gc) {
+            tryGcDeleteSet(transaction, ds, doc.gcFilter)
           }
-        })
-        // try to merge mergeStructs
-        // @todo: it makes more sense to transform mergeStructs to a DS, sort it, and merge from right to left
-        //        but at the moment DS does not handle duplicates
-        for (let i = mergeStructs.length - 1; i >= 0; i--) {
-          const { client, clock } = mergeStructs[i].id
-          const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
-          const replacedStructPos = findIndexSS(structs, clock)
-          if (replacedStructPos + 1 < structs.length) {
-            if (tryToMergeWithLefts(structs, replacedStructPos + 1) > 1) {
-              continue // no need to perform next check, both are already merged
+          tryMerge(ds, store)
+
+          // on all affected store.clients props, try to merge
+          transaction.insertSet.clients.forEach((ids, client) => {
+            const firstClock = ids.getIds()[0].clock
+            const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
+            // we iterate from right to left so we can safely remove entries
+            const firstChangePos = math.max(findIndexSS(structs, firstClock), 1)
+            for (let i = structs.length - 1; i >= firstChangePos;) {
+              i -= 1 + tryToMergeWithLefts(structs, i)
+            }
+          })
+          // try to merge mergeStructs
+          // @todo: it makes more sense to transform mergeStructs to a DS, sort it, and merge from right to left
+          //        but at the moment DS does not handle duplicates
+          for (let i = mergeStructs.length - 1; i >= 0; i--) {
+            const { client, clock } = mergeStructs[i].id
+            const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
+            const replacedStructPos = findIndexSS(structs, clock)
+            if (replacedStructPos + 1 < structs.length) {
+              if (tryToMergeWithLefts(structs, replacedStructPos + 1) > 1) {
+                continue // no need to perform next check, both are already merged
+              }
+            }
+            if (replacedStructPos > 0) {
+              tryToMergeWithLefts(structs, replacedStructPos)
             }
           }
-          if (replacedStructPos > 0) {
-            tryToMergeWithLefts(structs, replacedStructPos)
+        } else {
+          const accounting = readReservedMutationAccounting(transaction, reservedRuntime)
+          const inserts = reservedRuntime.idSets.union([
+            accounting.preInserts,
+            accounting.executorInserts,
+            accounting.callbackInserts
+          ])
+          const deletes = reservedRuntime.idSets.union([
+            accounting.preDeletes,
+            accounting.executorDeletes,
+            accounting.callbackDeletes
+          ])
+          if (doc.gc && !reservedRuntime.idSets.isEmpty(deletes)) {
+            reservedRuntime.items.gcDeleteSet(transaction, deletes, reservedRuntime.gcFilter, reservedRuntime.idSets)
           }
+          reservedRuntime.items.mergeCleanup(transaction, inserts, deletes, reservedRuntime.idSets)
         }
         if (!transaction.local && transaction.insertSet.clients.has(doc.clientID)) {
           logging.print(logging.ORANGE, logging.BOLD, '[yjs] ', logging.UNBOLD, logging.RED, 'Changed the client-id because another client seems to be using it.')
@@ -347,16 +432,26 @@ const cleanupTransactions = (transactionCleanups, i) => {
         doc.emit('afterTransactionCleanup', [transaction, doc])
         if (doc._observers.has('update')) {
           const encoder = new UpdateEncoderV1()
-          const hasContent = writeUpdateMessageFromTransaction(encoder, transaction)
+          const reservedEncoder = createReservedEncoder(encoder, reservedEncoderV1Kernel)
+          const reservedContent = writeReservedMutationUpdate(/** @type {any} */ (reservedEncoder), transaction)
+          const hasContent = reservedContent === null
+            ? writeUpdateMessageFromTransaction(encoder, transaction)
+            : reservedContent
           if (hasContent) {
-            doc.emit('update', [encoder.toUint8Array(), transaction.origin, doc, transaction])
+            const update = reservedContent === null ? encoder.toUint8Array() : reservedEncoder.toUint8Array()
+            doc.emit('update', [update, transaction.origin, doc, transaction])
           }
         }
         if (doc._observers.has('updateV2')) {
           const encoder = new UpdateEncoderV2()
-          const hasContent = writeUpdateMessageFromTransaction(encoder, transaction)
+          const reservedEncoder = createReservedEncoder(encoder, reservedEncoderV2Kernel)
+          const reservedContent = writeReservedMutationUpdate(/** @type {any} */ (reservedEncoder), transaction)
+          const hasContent = reservedContent === null
+            ? writeUpdateMessageFromTransaction(encoder, transaction)
+            : reservedContent
           if (hasContent) {
-            doc.emit('updateV2', [encoder.toUint8Array(), transaction.origin, doc, transaction])
+            const update = reservedContent === null ? encoder.toUint8Array() : reservedEncoder.toUint8Array()
+            doc.emit('updateV2', [update, transaction.origin, doc, transaction])
           }
         }
         const { subdocsAdded, subdocsLoaded, subdocsRemoved } = transaction
@@ -464,7 +559,7 @@ const transactInternal = (doc, f, origin, local, reservedRuntime) => {
   if (doc._transaction === null) {
     initialCall = true
     doc._transaction = new Transaction(doc, origin, local)
-    if (reservedRuntime !== null) reservedMutationTransactions.set(doc._transaction, reservedRuntime)
+    if (reservedRuntime !== null) activateReservedMutationTransaction(doc._transaction, reservedRuntime)
     transactionCleanups.push(doc._transaction)
     try {
       if (transactionCleanups.length === 1) {
@@ -478,6 +573,7 @@ const transactInternal = (doc, f, origin, local, reservedRuntime) => {
   }
   const finishInitialCall = () => {
     const finishCleanup = doc._transaction === transactionCleanups[0]
+    if (finishCleanup && reservedRuntime !== null) beginReservedMutationCleanup(transactionCleanups[0])
     doc._transaction = null
     if (finishCleanup) {
       // The first transaction ended, now process observer calls.
@@ -491,7 +587,7 @@ const transactInternal = (doc, f, origin, local, reservedRuntime) => {
       try {
         cleanupTransactions(transactionCleanups, 0)
       } finally {
-        if (reservedRuntime !== null) reservedMutationTransactions.delete(transactionCleanups[0])
+        if (reservedRuntime !== null) deactivateReservedMutationTransaction(transactionCleanups[0])
       }
     }
   }
@@ -540,7 +636,7 @@ export const transactReservedMutation = (doc, f, origin, runtime) => {
 }
 
 /** @internal @param {Transaction} transaction @param {object} runtime */
-export const assertReservedMutationTransaction = (transaction, runtime) => reservedMutationTransactions.get(transaction) === runtime
+export const assertReservedMutationTransaction = (transaction, runtime) => assertReservedMutationTransactionRuntime(transaction, runtime)
 
 /** @internal @param {Transaction} transaction */
-export const isReservedMutationTransaction = transaction => reservedMutationTransactions.has(transaction)
+export const isReservedMutationTransaction = transaction => isReservedMutationTransactionActive(transaction)

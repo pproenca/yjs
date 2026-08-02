@@ -61,10 +61,7 @@ const policyAllowsOrigin = (origins, origin) => {
 const captureSuggestionOrigins = origins => {
   if (origins === null) return null
   if (!Array.isArray(origins)) throw new TypeError('suggestionOrigins must be an array or null')
-  /** @type {any[]} */
-  const captured = []
-  for (let index = 0; index < origins.length; index++) appendDense(captured, origins[index])
-  return Object.freeze(captured)
+  return origins
 }
 
 const objectDefineProperty = Object.defineProperty
@@ -436,7 +433,7 @@ export class DiffRenderer extends ObservableV2 {
         readDiffRendererContent(this, contents, client, clock, deleted, content, shouldRender)
       },
       contentLength: (/** @type {Item} */ item) => diffRendererContentLength(this, item)
-    }), [prevDoc, nextDoc])
+    }), [prevDoc, nextDoc], () => getDiffRendererPolicy(this))
     // update before observer calls fired
     this._nextBOH = nextDoc.on('beforeObserverCalls', tr => {
       const diffInserts = diffIdSet(tr.insertSet, _prevDocInserts)

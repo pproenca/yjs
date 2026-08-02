@@ -23,6 +23,17 @@ const mapGet = Map.prototype.get
 const mapSet = Map.prototype.set
 const mapSize = /** @type {() => number} */ (/** @type {PropertyDescriptor} */ (objectGetOwnPropertyDescriptor(Map.prototype, 'size')).get)
 const arraySort = Array.prototype.sort
+const arraySlice = Array.prototype.slice
+const NativeArray = Array
+const NativeArrayPrototype = Array.prototype
+const NativeMap = Map
+const NativeMapPrototype = Map.prototype
+const NativeUint32Array = Uint32Array
+const numberIsSafeInteger = Number.isSafeInteger
+const nativeMathFloor = Math.floor
+const nativeMathMax = Math.max
+const nativeMathMin = Math.min
+const radixSize = 2048
 
 /** @param {object} value @param {PropertyKey} key */
 const hasOwn = (value, key) => reflectApply(objectHasOwnProperty, value, [key])
@@ -713,7 +724,7 @@ export const createIdSet = () => new IdSet()
 const readCanonicalClients = idSet => {
   if (objectGetPrototypeOf(idSet) !== IdSet.prototype) throw new Error('Invalid canonical IdSet')
   const clients = readCanonicalOwnData(idSet, 'clients')
-  if (objectGetPrototypeOf(clients) !== Map.prototype) throw new Error('Invalid canonical IdSet clients')
+  if (objectGetPrototypeOf(clients) !== NativeMapPrototype) throw new Error('Invalid canonical IdSet clients')
   return /** @type {Map<number,IdRanges>} */ (clients)
 }
 
@@ -723,7 +734,7 @@ const readCanonicalRanges = ranges => {
   const ids = readCanonicalOwnData(ranges, '_ids')
   const sorted = readCanonicalOwnData(ranges, 'sorted')
   const lastIsUsed = readCanonicalOwnData(ranges, '_lastIsUsed')
-  if (objectGetPrototypeOf(ids) !== Array.prototype || typeof sorted !== 'boolean' || typeof lastIsUsed !== 'boolean') {
+  if (objectGetPrototypeOf(ids) !== NativeArrayPrototype || typeof sorted !== 'boolean' || typeof lastIsUsed !== 'boolean') {
     throw new Error('Invalid canonical IdRanges state')
   }
   return /** @type {{ids:Array<IdRange>,sorted:boolean,lastIsUsed:boolean}} */ ({ ids, sorted, lastIsUsed })
@@ -734,7 +745,7 @@ const readCanonicalRange = range => {
   if (objectGetPrototypeOf(range) !== IdRange.prototype) throw new Error('Invalid canonical IdRange')
   const clock = readCanonicalOwnData(range, 'clock')
   const len = readCanonicalOwnData(range, 'len')
-  if (!Number.isSafeInteger(clock) || clock < 0 || !Number.isSafeInteger(len) || len < 0) {
+  if (!numberIsSafeInteger(clock) || clock < 0 || !numberIsSafeInteger(len) || len < 0) {
     throw new Error('Invalid canonical IdRange bounds')
   }
   return { clock, len }
@@ -762,7 +773,7 @@ const createCanonicalIdSet = () => {
   objectDefineProperty(idSet, 'clients', {
     configurable: true,
     enumerable: true,
-    value: new Map(),
+    value: new NativeMap(),
     writable: true
   })
   return idSet
@@ -786,7 +797,7 @@ const normalizeCanonicalRanges = ranges => {
       const previousRange = ids[write - 1]
       const previous = readCanonicalRange(previousRange)
       if (previous.clock + previous.len >= current.clock) {
-        const end = Math.max(previous.clock + previous.len, current.clock + current.len)
+        const end = nativeMathMax(previous.clock + previous.len, current.clock + current.len)
         if (end !== previous.clock + previous.len) {
           objectDefineProperty(ids, write - 1, {
             configurable: true,
@@ -808,9 +819,74 @@ const normalizeCanonicalRanges = ranges => {
   return ids
 }
 
+/**
+ * Detach, sort, and merge ranges in linear time. Six stable base-2048 passes cover every safe
+ * integer clock, so snapshots only sort the much smaller client component.
+ *
+ * @param {IdRanges} ranges
+ */
+const snapshotCanonicalIdRanges = ranges => {
+  const state = readCanonicalRanges(ranges)
+  /** @type {IdRange[]} */
+  let source = reflectApply(arraySlice, state.ids, [])
+  let maxClock = 0
+  for (let index = 0; index < source.length; index++) {
+    const range = readCanonicalRange(source[index])
+    maxClock = nativeMathMax(maxClock, range.clock)
+  }
+  if (!state.sorted && source.length > 1) {
+    for (let divisor = 1; divisor <= maxClock; divisor *= radixSize) {
+      const offsets = new NativeUint32Array(radixSize)
+      for (let index = 0; index < source.length; index++) {
+        offsets[nativeMathFloor(readCanonicalRange(source[index]).clock / divisor) % radixSize]++
+      }
+      let offset = 0
+      for (let digit = 0; digit < offsets.length; digit++) {
+        const count = offsets[digit]
+        offsets[digit] = offset
+        offset += count
+      }
+      /** @type {IdRange[]} */
+      const target = new NativeArray(source.length)
+      for (let index = 0; index < source.length; index++) {
+        const range = source[index]
+        const digit = nativeMathFloor(readCanonicalRange(range).clock / divisor) % radixSize
+        objectDefineProperty(target, offsets[digit]++, {
+          configurable: true,
+          enumerable: true,
+          value: range,
+          writable: true
+        })
+      }
+      source = target
+    }
+  }
+  /** @type {IdRange[]} */
+  const merged = []
+  for (let index = 0; index < source.length; index++) {
+    const current = readCanonicalRange(source[index])
+    if (current.len === 0) continue
+    const previous = merged.length === 0 ? null : readCanonicalRange(merged[merged.length - 1])
+    if (previous !== null && previous.clock + previous.len >= current.clock) {
+      const end = nativeMathMax(previous.clock + previous.len, current.clock + current.len)
+      if (end > previous.clock + previous.len) {
+        objectDefineProperty(merged, merged.length - 1, {
+          configurable: true,
+          enumerable: true,
+          value: createCanonicalRange(previous.clock, end - previous.clock),
+          writable: true
+        })
+      }
+    } else {
+      appendDense(merged, source[index])
+    }
+  }
+  return merged
+}
+
 /** @param {IdSet} idSet @param {number} client @param {number} clock @param {number} len */
 const addCanonicalRange = (idSet, client, clock, len) => {
-  if (!Number.isSafeInteger(client) || client < 0 || !Number.isSafeInteger(clock) || clock < 0 || !Number.isSafeInteger(len) || len < 0) {
+  if (!numberIsSafeInteger(client) || client < 0 || !numberIsSafeInteger(clock) || clock < 0 || !numberIsSafeInteger(len) || len < 0) {
     throw new Error('Invalid canonical ID range')
   }
   if (len === 0) return
@@ -851,7 +927,7 @@ const addCanonicalRange = (idSet, client, clock, len) => {
 const forEachCanonicalClient = (idSet, callback) => {
   const clients = readCanonicalClients(idSet)
   reflectApply(mapForEach, clients, [(ranges, client) => {
-    if (!Number.isSafeInteger(client) || client < 0) throw new Error('Invalid canonical client ID')
+    if (!numberIsSafeInteger(client) || client < 0) throw new Error('Invalid canonical client ID')
     readCanonicalRanges(ranges)
     callback(ranges, client)
   }])
@@ -863,11 +939,11 @@ const hasCanonicalId = (idSet, id) => {
   const clock = readCanonicalOwnData(id, 'clock')
   const ranges = /** @type {IdRanges|undefined} */ (reflectApply(mapGet, readCanonicalClients(idSet), [client]))
   if (ranges === undefined) return false
-  const ids = normalizeCanonicalRanges(ranges)
+  const ids = snapshotCanonicalIdRanges(ranges)
   let left = 0
   let right = ids.length - 1
   while (left <= right) {
-    const middle = Math.floor((left + right) / 2)
+    const middle = nativeMathFloor((left + right) / 2)
     const range = readCanonicalRange(ids[middle])
     if (clock < range.clock) right = middle - 1
     else if (clock >= range.clock + range.len) left = middle + 1
@@ -883,7 +959,7 @@ const isCanonicalIdSetEmpty = idSet => reflectApply(mapSize, readCanonicalClient
 const cloneCanonicalIdSet = idSet => {
   const clone = createCanonicalIdSet()
   forEachCanonicalClient(idSet, (ranges, client) => {
-    const ids = normalizeCanonicalRanges(ranges)
+    const ids = snapshotCanonicalIdRanges(ranges)
     for (let index = 0; index < ids.length; index++) {
       const range = readCanonicalRange(ids[index])
       addCanonicalRange(clone, client, range.clock, range.len)
@@ -897,7 +973,7 @@ const differenceCanonicalIdSet = (idSet, excluded) => {
   const result = createCanonicalIdSet()
   const excludedClients = readCanonicalClients(excluded)
   forEachCanonicalClient(idSet, (ranges, client) => {
-    const source = normalizeCanonicalRanges(ranges)
+    const source = snapshotCanonicalIdRanges(ranges)
     const excludedRanges = /** @type {IdRanges|undefined} */ (reflectApply(mapGet, excludedClients, [client]))
     if (excludedRanges === undefined) {
       for (let index = 0; index < source.length; index++) {
@@ -906,7 +982,7 @@ const differenceCanonicalIdSet = (idSet, excluded) => {
       }
       return
     }
-    const exclude = normalizeCanonicalRanges(excludedRanges)
+    const exclude = snapshotCanonicalIdRanges(excludedRanges)
     let excludeIndex = 0
     for (let sourceIndex = 0; sourceIndex < source.length; sourceIndex++) {
       const sourceRange = readCanonicalRange(source[sourceIndex])
@@ -917,8 +993,8 @@ const differenceCanonicalIdSet = (idSet, excluded) => {
       while (currentExclude < exclude.length) {
         const excludedRange = readCanonicalRange(exclude[currentExclude])
         if (excludedRange.clock >= end) break
-        if (clock < excludedRange.clock) addCanonicalRange(result, client, clock, Math.min(end, excludedRange.clock) - clock)
-        clock = Math.max(clock, excludedRange.clock + excludedRange.len)
+        if (clock < excludedRange.clock) addCanonicalRange(result, client, clock, nativeMathMin(end, excludedRange.clock) - clock)
+        clock = nativeMathMax(clock, excludedRange.clock + excludedRange.len)
         if (clock >= end) break
         currentExclude++
       }
@@ -936,8 +1012,8 @@ const canonicalSetsIntersect = (left, right) => {
     if (intersects) return
     const rightRanges = /** @type {IdRanges|undefined} */ (reflectApply(mapGet, rightClients, [client]))
     if (rightRanges === undefined) return
-    const leftIds = normalizeCanonicalRanges(leftRanges)
-    const rightIds = normalizeCanonicalRanges(rightRanges)
+    const leftIds = snapshotCanonicalIdRanges(leftRanges)
+    const rightIds = snapshotCanonicalIdRanges(rightRanges)
     let leftIndex = 0
     let rightIndex = 0
     while (leftIndex < leftIds.length && rightIndex < rightIds.length) {
@@ -957,7 +1033,7 @@ const canonicalSetsIntersect = (left, right) => {
 /** @param {IdSet} idSet */
 const countCanonicalRanges = idSet => {
   let count = 0
-  forEachCanonicalClient(idSet, ranges => { count += normalizeCanonicalRanges(ranges).length })
+  forEachCanonicalClient(idSet, ranges => { count += snapshotCanonicalIdRanges(ranges).length })
   return count
 }
 
@@ -965,7 +1041,7 @@ const countCanonicalRanges = idSet => {
 const snapshotCanonicalRanges = idSet => {
   /** @type {Array<{client:number,ranges:IdRange[]}>} */
   const buckets = []
-  forEachCanonicalClient(idSet, (ranges, client) => appendDense(buckets, { client, ranges: normalizeCanonicalRanges(ranges) }))
+  forEachCanonicalClient(idSet, (ranges, client) => appendDense(buckets, { client, ranges: snapshotCanonicalIdRanges(ranges) }))
   reflectApply(arraySort, buckets, [(left, right) => left.client - right.client])
   /** @type {Array<{readonly client:number,readonly clock:number,readonly length:number}>} */
   const snapshot = []
@@ -977,6 +1053,47 @@ const snapshotCanonicalRanges = idSet => {
     }
   }
   return objectFreeze(snapshot)
+}
+
+/** @param {readonly IdSet[]} sets */
+const unionCanonicalIdSets = sets => {
+  const result = createCanonicalIdSet()
+  for (let setIndex = 0; setIndex < sets.length; setIndex++) {
+    forEachCanonicalClient(sets[setIndex], (ranges, client) => {
+      const ids = snapshotCanonicalIdRanges(ranges)
+      for (let index = 0; index < ids.length; index++) {
+        const range = readCanonicalRange(ids[index])
+        addCanonicalRange(result, client, range.clock, range.len)
+      }
+    })
+  }
+  return result
+}
+
+/** @param {IdSet} idSet */
+const snapshotCanonicalBuckets = idSet => {
+  /** @type {Array<{client:number,ranges:IdRange[]}>} */
+  const buckets = []
+  forEachCanonicalClient(idSet, (ranges, client) => appendDense(buckets, { client, ranges: snapshotCanonicalIdRanges(ranges) }))
+  reflectApply(arraySort, buckets, [(left, right) => right.client - left.client])
+  return buckets
+}
+
+/** @param {IdSetEncoderV1|IdSetEncoderV2} encoder @param {IdSet} idSet */
+const writeCanonicalIdSet = (encoder, idSet) => {
+  const buckets = snapshotCanonicalBuckets(idSet)
+  encoding.writeVarUint(encoder.restEncoder, buckets.length)
+  for (let bucketIndex = 0; bucketIndex < buckets.length; bucketIndex++) {
+    const bucket = buckets[bucketIndex]
+    encoder.resetIdSetCurVal()
+    encoding.writeVarUint(encoder.restEncoder, bucket.client)
+    encoding.writeVarUint(encoder.restEncoder, bucket.ranges.length)
+    for (let rangeIndex = 0; rangeIndex < bucket.ranges.length; rangeIndex++) {
+      const range = readCanonicalRange(bucket.ranges[rangeIndex])
+      encoder.writeIdSetClock(range.clock)
+      encoder.writeIdSetLen(range.len)
+    }
+  }
 }
 
 /**
@@ -994,7 +1111,10 @@ export const reservedMutationIdSetRuntime = objectFreeze({
   difference: differenceCanonicalIdSet,
   hasIntersection: canonicalSetsIntersect,
   countRanges: countCanonicalRanges,
-  snapshotRanges: snapshotCanonicalRanges
+  snapshotRanges: snapshotCanonicalRanges,
+  snapshotBuckets: snapshotCanonicalBuckets,
+  union: unionCanonicalIdSets,
+  write: writeCanonicalIdSet
 })
 
 /** @internal @param {IdSet} idSet @param {number} client @param {number} clock @param {number} len */

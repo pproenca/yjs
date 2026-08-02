@@ -33,7 +33,7 @@ const rendererLifecycles = new WeakMap()
  * object. Reserved mutations retain this sealed adapter so later public property changes cannot
  * alter targeting or fail after a write.
  *
- * @type {WeakMap<object, Readonly<{adapter:Readonly<AbstractRenderer>,dependencies:readonly Doc[]}>>}
+ * @type {WeakMap<object, Readonly<{adapter:Readonly<AbstractRenderer>,dependencies:readonly Doc[],readPolicy:(()=>any)|null}>>}
  */
 const rendererExecutionAdapters = new WeakMap()
 
@@ -41,8 +41,9 @@ const rendererExecutionAdapters = new WeakMap()
  * @param {object} renderer
  * @param {AbstractRenderer} adapter
  * @param {readonly Doc[]} dependencies
+ * @param {()=>any} [readPolicy]
  */
-export const registerRendererExecutionAdapter = (renderer, adapter, dependencies) => {
+export const registerRendererExecutionAdapter = (renderer, adapter, dependencies, readPolicy) => {
   error.assert(!rendererExecutionAdapters.has(renderer))
   const sealed = Object.freeze({
     hasItem: adapter.hasItem,
@@ -54,7 +55,8 @@ export const registerRendererExecutionAdapter = (renderer, adapter, dependencies
   for (let index = 0; index < dependencies.length; index++) appendDense(ownedDependencies, dependencies[index])
   rendererExecutionAdapters.set(renderer, Object.freeze({
     adapter: /** @type {Readonly<AbstractRenderer>} */ (sealed),
-    dependencies: Object.freeze(ownedDependencies)
+    dependencies: Object.freeze(ownedDependencies),
+    readPolicy: readPolicy ?? null
   }))
 }
 
@@ -63,6 +65,46 @@ export const registerRendererExecutionAdapter = (renderer, adapter, dependencies
  * @return {Readonly<{adapter:Readonly<AbstractRenderer>,dependencies:readonly Doc[]}>?}
  */
 export const readRendererExecutionAdapter = renderer => rendererExecutionAdapters.get(renderer) ?? null
+
+/** @param {object} renderer */
+export const readRendererPolicySnapshot = renderer => {
+  const execution = rendererExecutionAdapters.get(renderer)
+  if (execution === undefined || execution.readPolicy === null) return null
+  const policy = execution.readPolicy()
+  const origins = policy.suggestionOrigins
+  let capturedOrigins = null
+  if (origins !== null) {
+    if (!Array.isArray(origins)) throw new TypeError('suggestionOrigins must be an array or null')
+    const length = origins.length
+    capturedOrigins = new Array(length)
+    for (let index = 0; index < length; index++) {
+      const descriptor = Object.getOwnPropertyDescriptor(origins, String(index))
+      if (descriptor === undefined || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+        throw new TypeError('suggestionOrigins must contain own data entries')
+      }
+      objectDefineProperty(capturedOrigins, index, {
+        configurable: true,
+        enumerable: true,
+        value: descriptor.value,
+        writable: true
+      })
+    }
+    Object.freeze(capturedOrigins)
+  }
+  return Object.freeze({ suggestionMode: policy.suggestionMode, suggestionOrigins: capturedOrigins })
+}
+
+/** @param {object} renderer @param {any} snapshot */
+export const rendererPolicySnapshotIsFresh = (renderer, snapshot) => {
+  const current = readRendererPolicySnapshot(renderer)
+  if (current === null || snapshot === null || current.suggestionMode !== snapshot.suggestionMode) return current === snapshot
+  if (current.suggestionOrigins === null || snapshot.suggestionOrigins === null) return current.suggestionOrigins === snapshot.suggestionOrigins
+  if (current.suggestionOrigins.length !== snapshot.suggestionOrigins.length) return false
+  for (let index = 0; index < current.suggestionOrigins.length; index++) {
+    if (current.suggestionOrigins[index] !== snapshot.suggestionOrigins[index]) return false
+  }
+  return true
+}
 
 /**
  * @param {object} renderer
