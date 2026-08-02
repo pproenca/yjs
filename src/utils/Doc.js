@@ -14,6 +14,30 @@ import { YType } from '../ytype.js'
 import { $ydoc } from './schemas.js'
 
 /**
+ * Validate fork-owned document options without changing the supplied record. Sparse capability is
+ * enabled only by own data properties so decoded or inherited values cannot opt a document in.
+ *
+ * @param {DocOpts} opts
+ */
+export const normalizeDocOptions = opts => {
+  if (opts === null || typeof opts !== 'object' || Array.isArray(opts)) {
+    throw new TypeError('Document options must be a non-null record')
+  }
+  const sparse = Object.getOwnPropertyDescriptor(opts, 'sparseExactResolution')
+  if (sparse === undefined) return { opts, sparseExactResolution: false }
+  if (!Object.prototype.hasOwnProperty.call(sparse, 'value') || typeof sparse.value !== 'boolean') {
+    throw new TypeError('sparseExactResolution must be an own boolean')
+  }
+  if (sparse.value) {
+    const gc = Object.getOwnPropertyDescriptor(opts, 'gc')
+    if (gc === undefined || !Object.prototype.hasOwnProperty.call(gc, 'value') || gc.value !== false) {
+      throw new Error('Sparse exact resolution requires own gc:false')
+    }
+  }
+  return { opts, sparseExactResolution: sparse.value }
+}
+
+/**
  * @typedef {Object} DocOpts
  * @property {boolean} [DocOpts.gc=true] Disable garbage collection (default: gc=true)
  * @property {function(Item):boolean} [DocOpts.gcFilter] Will be called before an Item is garbage collected. Return false to keep the Item.
@@ -53,19 +77,9 @@ export class Doc extends ObservableV2 {
    * @param {DocOpts} opts configuration
    */
   constructor (opts = {}) {
-    if (
-      Object.prototype.hasOwnProperty.call(opts, 'sparseExactResolution') &&
-      typeof opts.sparseExactResolution !== 'boolean'
-    ) {
-      throw new TypeError('sparseExactResolution must be a boolean')
-    }
-    const { guid = random.uuidv4(), collectionid = null, gc = true, gcFilter = () => true, meta = null, autoLoad = false, shouldLoad = true, isSuggestionDoc = false, sparseExactResolution = false } = opts
-    if (typeof sparseExactResolution !== 'boolean') {
-      throw new TypeError('sparseExactResolution must be a boolean')
-    }
-    if (sparseExactResolution && gc !== false) {
-      throw new Error('Sparse exact resolution requires gc:false')
-    }
+    const normalized = normalizeDocOptions(opts)
+    const { guid = random.uuidv4(), collectionid = null, gc = true, gcFilter = () => true, meta = null, autoLoad = false, shouldLoad = true, isSuggestionDoc = false } = normalized.opts
+    const sparseExactResolution = normalized.sparseExactResolution
     super()
     this.gc = gc
     if (sparseExactResolution) {

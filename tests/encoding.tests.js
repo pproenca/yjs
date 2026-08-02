@@ -16,6 +16,7 @@ import {
 
 import * as Y from '../src/index.js'
 import { CausalHole, sameCausalHoleMetadata } from '../src/structs/CausalHole.js'
+import { normalizeDocOptions } from '../src/utils/Doc.js'
 import { writeStructsFromIdSetWithCausalHoles } from '../src/utils/encoding-helpers.js'
 
 /**
@@ -123,6 +124,9 @@ export const testStructReferences = _tc => {
 }
 
 export const testSparseExactResolutionRequiresGcFalseAtConstructionAndClone = () => {
+  ;[null, [], () => {}].forEach(value => {
+    t.fails(() => new Y.Doc(/** @type {any} */ (value)))
+  })
   t.fails(() => new Y.Doc({ sparseExactResolution: true }))
   t.fails(() => new Y.Doc({ gc: true, sparseExactResolution: true }))
   ;[0, 1, null, undefined, 'true', {}].forEach(value => {
@@ -130,7 +134,28 @@ export const testSparseExactResolutionRequiresGcFalseAtConstructionAndClone = ()
   })
   const inheritedInvalid = Object.create({ sparseExactResolution: 'true' })
   inheritedInvalid.gc = false
-  t.fails(() => new Y.Doc(inheritedInvalid))
+  const inherited = new Y.Doc(inheritedInvalid)
+  t.assert(inherited.sparseExactResolution === false && inherited.gc === false)
+  const inheritedPair = new Y.Doc(Object.create({ sparseExactResolution: true, gc: false }))
+  t.assert(inheritedPair.sparseExactResolution === false && inheritedPair.gc === false)
+  const inheritedGc = Object.create({ gc: false })
+  inheritedGc.sparseExactResolution = true
+  t.fails(() => new Y.Doc(inheritedGc))
+
+  let sparseReads = 0
+  const accessorSparse = { gc: false }
+  Object.defineProperty(accessorSparse, 'sparseExactResolution', { get: () => { sparseReads++; return true } })
+  t.fails(() => new Y.Doc(/** @type {any} */ (accessorSparse)))
+  t.assert(sparseReads === 0)
+  let gcReads = 0
+  const accessorGc = { sparseExactResolution: true }
+  Object.defineProperty(accessorGc, 'gc', { get: () => { gcReads++; return false } })
+  t.fails(() => new Y.Doc(/** @type {any} */ (accessorGc)))
+  t.assert(gcReads === 0)
+
+  const future = { guid: 'preserved', meta: { ok: true }, futureOption: 42 }
+  const normalized = normalizeDocOptions(future)
+  t.assert(normalized.opts === future && /** @type {any} */ (normalized.opts).futureOption === 42 && !normalized.sparseExactResolution)
 
   const ordinary = new Y.Doc()
   ordinary.gc = false
@@ -172,8 +197,78 @@ export const testSparseExactResolutionRequiresGcFalseAtConstructionAndClone = ()
   t.fails(() => Y.cloneDoc(source))
   t.fails(() => Y.cloneDoc(source, { gc: true, sparseExactResolution: true }))
   t.fails(() => Y.cloneDoc(source, { gc: false }))
+  t.fails(() => Y.cloneDoc(source, Object.create({ gc: false, sparseExactResolution: true })))
   const clone = Y.cloneDoc(source, { gc: false, sparseExactResolution: true })
   t.assert(clone.get('text').toString() === 'x' && clone.gc === false && clone.sparseExactResolution)
+}
+
+export const testSubdocSparseOptionsRejectBeforeMutation = () => {
+  ;[
+    {
+      Encoder: Y.UpdateEncoderV1,
+      apply: Y.applyUpdate,
+      encode: Y.encodeStateAsUpdate,
+      event: 'update'
+    },
+    {
+      Encoder: Y.UpdateEncoderV2,
+      apply: Y.applyUpdateV2,
+      encode: Y.encodeStateAsUpdateV2,
+      event: 'updateV2'
+    }
+  ].forEach(({ Encoder, apply, encode, event }) => {
+    ;[
+      null,
+      { sparseExactResolution: true },
+      { gc: true, sparseExactResolution: true },
+      { gc: false, sparseExactResolution: 1 }
+    ].forEach((opts, caseIndex) => {
+      ;[false, true].forEach(sparseTarget => {
+        const target = new Y.Doc(sparseTarget ? { gc: false, sparseExactResolution: true } : { gc: false })
+        const invalid = encodeStructs([
+          new Y.Item(
+            Y.createID(41, 0),
+            null,
+            null,
+            null,
+            null,
+            'docs',
+            null,
+            new Y.ContentDoc(`invalid-${caseIndex}`, /** @type {any} */ (opts))
+          )
+        ], Encoder)
+        const corrected = encodeStructs([
+          new Y.Item(
+            Y.createID(41, 0),
+            null,
+            null,
+            null,
+            null,
+            'docs',
+            null,
+            new Y.ContentDoc(`valid-${caseIndex}`, { gc: false, sparseExactResolution: true })
+          )
+        ], Encoder)
+        const before = encode(target)
+        const state = Y.encodeStateVector(target)
+        let updates = 0
+        let transactions = 0
+        let subdocEvents = 0
+        target.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+        target.on('afterTransaction', () => { transactions++ })
+        target.on('subdocs', () => { subdocEvents++ })
+        t.fails(() => apply(target, invalid))
+        t.compareArrays(Array.from(encode(target)), Array.from(before))
+        t.compareArrays(Array.from(Y.encodeStateVector(target)), Array.from(state))
+        t.assert(target.share.size === 0 && target.store.clients.size === 0 && target.subdocs.size === 0)
+        t.assert(updates === 0 && transactions === 0 && subdocEvents === 0)
+
+        apply(target, corrected)
+        const restored = /** @type {Y.Doc} */ (target.get('docs').get(0))
+        t.assert(restored.sparseExactResolution && restored.gc === false)
+      })
+    })
+  })
 }
 
 export const testSparsePendingStateSerializesWithDocumentContext = () => {
@@ -272,6 +367,99 @@ export const testSparsePendingStateRejectsInvalidInternalTransport = () => {
       ], Y.UpdateEncoderV2)
     }
     t.fails(() => encode(withConflict))
+  })
+}
+
+export const testSparsePendingStateRejectsForgedMissingPairsBeforeFiltering = () => {
+  const targetState = new Y.Doc({ gc: false })
+  targetState.clientID = 2
+  targetState.get('text').insert(0, 'known')
+  const dishonestStateVector = Y.encodeStateVector(targetState)
+  const pendingItem = encodeStructs([
+    new Y.Item(
+      Y.createID(2, 0),
+      null,
+      Y.createID(1, 0),
+      null,
+      null,
+      'text',
+      null,
+      new Y.ContentString('X')
+    )
+  ], Y.UpdateEncoderV2)
+  const pendingDeleteIds = Y.createIdSet()
+  pendingDeleteIds.add(77, 0, 1)
+  const pendingDelete = encodeDeleteSet(pendingDeleteIds, Y.UpdateEncoderV2)
+
+  ;[Y.encodeStateAsUpdate, Y.encodeStateAsUpdateV2].forEach(encode => {
+    ;[false, true].forEach(withPendingDelete => {
+      ;[new Uint8Array([0]), dishonestStateVector].forEach(stateVector => {
+        const doc = createCausalHoleBase()
+        Y.applyUpdateV2(doc, encodeCausalHoles([
+          new CausalHole(Y.createID(2, 0), 1, Y.createID(1, 0), null, 'text', null)
+        ], Y.UpdateEncoderV2))
+        doc.store.pendingStructs = {
+          missing: new Map([[99, 0]]),
+          update: pendingItem
+        }
+        if (withPendingDelete) doc.store.pendingDs = pendingDelete
+        const hole = doc.store.getCausalHole(Y.createID(2, 0))
+        const pendingStructs = doc.store.pendingStructs
+        const pendingDs = doc.store.pendingDs
+        t.fails(() => encode(doc, stateVector))
+        t.assert(doc.store.getCausalHole(Y.createID(2, 0)) === hole)
+        t.assert(doc.store.pendingStructs === pendingStructs && doc.store.pendingDs === pendingDs)
+        t.assert(doc.get('text').toString() === 'a')
+      })
+    })
+  })
+}
+
+export const testSparseCombinedPendingStateRoundtrips = () => {
+  ;[
+    {
+      apply: Y.applyUpdate,
+      encode: Y.encodeStateAsUpdate,
+      convert: (/** @type {Uint8Array<ArrayBuffer>} */ update) => update
+    },
+    {
+      apply: Y.applyUpdateV2,
+      encode: Y.encodeStateAsUpdateV2,
+      convert: Y.convertUpdateFormatV1ToV2
+    }
+  ].forEach(({ apply, encode, convert }) => {
+    const inserts = new Y.Doc({ gc: false })
+    inserts.clientID = 12
+    /** @type {Array<Uint8Array<ArrayBuffer>>} */
+    const insertUpdates = []
+    inserts.on('update', update => insertUpdates.push(update))
+    inserts.get('later').insert(0, 'a')
+    inserts.get('later').insert(1, 'b')
+
+    const deletes = new Y.Doc({ gc: false })
+    deletes.clientID = 13
+    /** @type {Array<Uint8Array<ArrayBuffer>>} */
+    const deleteUpdates = []
+    deletes.on('update', update => deleteUpdates.push(update))
+    deletes.get('deleted').insert(0, 'x')
+    deletes.get('deleted').delete(0, 1)
+
+    const doc = new Y.Doc({ gc: false, sparseExactResolution: true })
+    apply(doc, convert(encodeCausalHoles([
+      new CausalHole(Y.createID(14, 0), 1, null, null, 'unrelated', null)
+    ], Y.UpdateEncoderV1)))
+    apply(doc, convert(insertUpdates[1]))
+    apply(doc, convert(deleteUpdates[1]))
+    t.assert(!doc.store.causalHoles.isEmpty() && doc.store.pendingStructs !== null && doc.store.pendingDs !== null)
+    const snapshot = encode(doc)
+
+    const reload = new Y.Doc({ gc: false, sparseExactResolution: true })
+    apply(reload, snapshot)
+    t.assert(!reload.store.causalHoles.isEmpty() && reload.store.pendingStructs !== null && reload.store.pendingDs !== null)
+    apply(reload, convert(insertUpdates[0]))
+    apply(reload, convert(deleteUpdates[0]))
+    t.assert(reload.store.pendingStructs === null && reload.store.pendingDs === null)
+    t.assert(reload.get('later').toString() === 'ab' && reload.get('deleted').toString() === '')
   })
 }
 

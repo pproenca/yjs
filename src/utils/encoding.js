@@ -29,10 +29,10 @@ import { UpdateEncoderV1, UpdateEncoderV2, IdSetEncoderV1, IdSetEncoderV2 } from
 import { convertUpdateFormatV2ToV1, LazyStructReader, LazyStructWriter, writeStructToLazyStructWriter, finishLazyStructWriting } from './updates.js'
 import { readBlockSet, writeBlockSet } from './BlockSet.js'
 import { Skip } from '../structs/Skip.js'
-import { ContentType, Item, findItemInsertionLeft } from '../structs/Item.js'
+import { ContentDoc, ContentType, Item, findItemInsertionLeft } from '../structs/Item.js'
 import { GC } from '../structs/GC.js'
 import { CausalHole, CausalHoleIndex, createCausalHoleFromItem, normalizeCausalHoleParent, sameCausalHoleMetadata, sameCausalHoleParent } from '../structs/CausalHole.js'
-import { Doc } from './Doc.js'
+import { Doc, normalizeDocOptions } from './Doc.js'
 import { writeStructs } from './encoding-helpers.js'
 
 /**
@@ -248,6 +248,11 @@ const integrateStructs = (transaction, store, clientsStructRefs, sparsePlan) => 
 export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = new UpdateDecoderV2(decoder)) => {
   const ss = readBlockSet(structDecoder)
   const ranges = array.from(ss.clients.values())
+  ranges.forEach(range => range.refs.forEach(struct => {
+    if (struct.constructor === Item && /** @type {Item} */ (struct).content instanceof ContentDoc) {
+      normalizeDocOptions(/** @type {ContentDoc} */ (/** @type {Item} */ (struct).content).opts)
+    }
+  }))
   const hasIncomingHoles = ranges.some(range => range.refs.some(struct => struct.constructor === CausalHole))
   const hasIncomingGc = ranges.some(range => range.refs.some(struct => struct.constructor === GC))
   if (hasIncomingHoles && !ydoc.sparseExactResolution) {
@@ -1340,6 +1345,7 @@ export const encodeStateAsUpdateV2 = (doc, encodedTargetStateVector = new Uint8A
  * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
  */
 const encodeSparseStateWithPending = (doc, stateUpdate, encodedTargetStateVector, encoder) => {
+  validateSparsePendingState(doc)
   const isV1 = encoder.constructor === UpdateEncoderV1
   const Decoder = isV1 ? UpdateDecoderV1 : UpdateDecoderV2
   const stateDecoder = new Decoder(decoding.createDecoder(stateUpdate))
@@ -1375,6 +1381,68 @@ const encodeSparseStateWithPending = (doc, stateUpdate, encodedTargetStateVector
   writeBlockSet(result, blocks)
   writeIdSet(result, mergeIdSets(deleteSets))
   return result.toUint8Array()
+}
+
+/** @param {Uint8Array} left @param {Uint8Array} right */
+const equalBytes = (left, right) => left.byteLength === right.byteLength && left.every((value, index) => value === right[index])
+
+/** @param {Map<number,number>} left @param {Map<number,number>} right */
+const equalMissing = (left, right) => left.size === right.size && array.from(left.entries()).every(([client, clock]) => right.get(client) === clock)
+
+/** @param {Doc} doc */
+const encodeAuthoritativeSparseState = doc => {
+  const encoder = new UpdateEncoderV2()
+  writeStateAsUpdate(encoder, doc)
+  return encoder.toUint8Array()
+}
+
+/**
+ * Prove that stored pending transport is still unresolved against a copy of the authoritative
+ * sparse state. A forged missing map cannot therefore hide a materializable Item or delete.
+ *
+ * @param {Doc} doc
+ */
+const validateSparsePendingState = doc => {
+  const authoritative = encodeAuthoritativeSparseState(doc)
+  const scratch = new Doc({ guid: doc.guid, gc: false, sparseExactResolution: true })
+  const occupied = new Set(doc.store.clients.keys())
+  if (doc.store.pendingStructs) {
+    const decoder = new UpdateDecoderV2(decoding.createDecoder(doc.store.pendingStructs.update))
+    readBlockSet(decoder).clients.forEach((_, client) => occupied.add(client))
+  }
+  let scratchClientID = Number.MAX_SAFE_INTEGER
+  while (occupied.has(scratchClientID)) scratchClientID--
+  try {
+    scratch.clientID = scratchClientID
+    applyUpdateV2(scratch, authoritative)
+    const share = array.from(scratch.share.keys())
+    const subdocs = array.from(scratch.subdocs, subdoc => subdoc.guid).sort()
+    const stateVector = encodeStateVector(scratch)
+
+    if (doc.store.pendingStructs) applyUpdateV2(scratch, doc.store.pendingStructs.update)
+    if (doc.store.pendingDs) applyUpdateV2(scratch, doc.store.pendingDs)
+
+    const pendingStructsMatch = doc.store.pendingStructs === null
+      ? scratch.store.pendingStructs === null
+      : scratch.store.pendingStructs !== null &&
+        equalMissing(doc.store.pendingStructs.missing, scratch.store.pendingStructs.missing) &&
+        equalBytes(doc.store.pendingStructs.update, scratch.store.pendingStructs.update)
+    const pendingDeletesMatch = doc.store.pendingDs === null
+      ? scratch.store.pendingDs === null
+      : scratch.store.pendingDs !== null && equalBytes(doc.store.pendingDs, scratch.store.pendingDs)
+    if (
+      !equalBytes(authoritative, encodeAuthoritativeSparseState(scratch)) ||
+      !equalBytes(stateVector, encodeStateVector(scratch)) ||
+      share.length !== scratch.share.size || share.some((key, index) => key !== array.from(scratch.share.keys())[index]) ||
+      subdocs.join('\u0000') !== array.from(scratch.subdocs, subdoc => subdoc.guid).sort().join('\u0000') ||
+      !pendingStructsMatch ||
+      !pendingDeletesMatch
+    ) {
+      throw new Error('Sparse pending state is not authentic unresolved transport')
+    }
+  } finally {
+    scratch.destroy()
+  }
 }
 
 /**
@@ -1710,10 +1778,11 @@ export const createDocFromUpdateV2 = (update, opts = {}) => {
  * @param {import('./Doc.js').DocOpts} [opts]
  */
 export const cloneDoc = (ydoc, opts) => {
-  if (ydoc.sparseExactResolution && (opts?.sparseExactResolution !== true || opts.gc !== false)) {
+  const normalized = normalizeDocOptions(opts === undefined ? {} : opts)
+  if (ydoc.sparseExactResolution && !normalized.sparseExactResolution) {
     throw new Error('Cloning a sparse exact-resolution document requires gc:false and sparseExactResolution:true')
   }
-  const clone = new Doc(opts)
+  const clone = new Doc(normalized.opts)
   applyUpdate(clone, encodeStateAsUpdate(ydoc))
   return clone
 }
