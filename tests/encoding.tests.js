@@ -802,6 +802,139 @@ export const testSparseFailedResolverRecomputesWithinOpenTransaction = () => {
   })
 }
 
+export const testOrdinaryBeforeTransactionSameUpdateIntegratesOnce = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, event: 'updateV2' }
+  ].forEach(({ Encoder, apply, encode, event }) => {
+    const update = encodeStructs([
+      new Y.Item(Y.createID(11, 0), null, null, null, null, 'text', null, new Y.ContentString('x'))
+    ], Encoder)
+    const target = new Y.Doc({ gc: false })
+    let inject = true
+    let transactions = 0
+    let updates = 0
+    target.on('beforeTransaction', () => {
+      if (!inject) return
+      inject = false
+      apply(target, update)
+    })
+    target.on('afterTransaction', () => { transactions++ })
+    target.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+
+    apply(target, update)
+    const stored = target.store.getStruct(Y.createID(11, 0))
+    t.assert(target.get('text').toString() === 'x', `${Encoder.name} reentrant duplicate inserts once`)
+    t.assert(stored?.constructor === Y.Item && stored.id.clock === 0 && stored.length === 1)
+    t.assert(target.store.clients.get(11)?.length === 1 && Y.decodeStateVector(Y.encodeStateVector(target)).get(11) === 1)
+    t.assert(transactions === 1 && updates === 1, `${Encoder.name} reentrant duplicate stays in one transaction/event`)
+
+    const snapshot = encode(target)
+    const reload = new Y.Doc({ gc: false })
+    apply(reload, snapshot)
+    t.compareArrays(Array.from(encode(reload)), Array.from(snapshot))
+    t.compareArrays(Array.from(Y.encodeStateVector(reload)), Array.from(Y.encodeStateVector(target)))
+    t.assert(reload.get('text').toString() === 'x' && Y.decodeStateVector(Y.encodeStateVector(reload)).get(11) === 1)
+  })
+}
+
+export const testSparsePreparedRootMutationRejectsBeforeAdmission = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2 }
+  ].forEach(({ Encoder, apply, encode }) => {
+    ;['delete', 'replace'].forEach(mode => {
+      const target = new Y.Doc({ gc: false, sparseExactResolution: true })
+      const preparedRoot = target.get('text')
+      const update = encodeStructs([
+        new CausalHole(Y.createID(21, 0), 1, null, null, 'text', null),
+        new Y.Item(Y.createID(21, 1), null, Y.createID(21, 0), null, null, null, null, new Y.ContentString('x'))
+      ], Encoder)
+      const before = Array.from(encode(target))
+      const beforeState = Array.from(Y.encodeStateVector(target))
+      const pendingStructs = target.store.pendingStructs
+      const pendingDs = target.store.pendingDs
+      let inject = true
+      let updates = 0
+      target.on('beforeTransaction', () => {
+        if (!inject) return
+        inject = false
+        if (mode === 'delete') target.share.delete('text')
+        else target.share.set('text', new Y.Type())
+      })
+      target.on('update', () => { updates++ })
+      target.on('updateV2', () => { updates++ })
+
+      t.fails(() => apply(target, update))
+      t.compareArrays(Array.from(encode(target)), before, `${Encoder.name} ${mode} root mutation preserves bytes`)
+      t.compareArrays(Array.from(Y.encodeStateVector(target)), beforeState)
+      t.assert(target.store.clients.size === 0 && target.store.causalHoles.isEmpty())
+      t.assert(target.store.pendingStructs === pendingStructs && target.store.pendingDs === pendingDs)
+      t.assert(preparedRoot.toString() === '' && updates === 0, `${Encoder.name} ${mode} root receives no invisible insertion`)
+
+      target.share.set('text', preparedRoot)
+      apply(target, update)
+      t.assert(target.get('text') === preparedRoot && preparedRoot.toString() === 'x')
+      t.assert(target.store.getStruct(Y.createID(21, 0))?.constructor === CausalHole)
+      t.assert(target.store.getStruct(Y.createID(21, 1))?.constructor === Y.Item)
+      t.assert(target.store.pendingStructs === null && target.store.pendingDs === null)
+    })
+  })
+}
+
+export const testSparseAbsentRootInstallationIsAtomicUnderHostileMap = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, apply }) => {
+    const target = new Y.Doc({ gc: false, sparseExactResolution: true })
+    const update = encodeStructGroups([
+      [
+        new CausalHole(Y.createID(30, 0), 1, null, null, 'root-a', null),
+        new Y.Item(Y.createID(30, 1), null, Y.createID(30, 0), null, null, null, null, new Y.ContentString('a'))
+      ],
+      [
+        new CausalHole(Y.createID(20, 0), 1, null, null, 'root-b', null),
+        new Y.Item(Y.createID(20, 1), null, Y.createID(20, 0), null, null, null, null, new Y.ContentString('b'))
+      ]
+    ], Encoder)
+    const share = target.share
+    const originalSet = share.set
+    let calls = 0
+    let failed = false
+    share.set = function (key, value) {
+      calls++
+      if (calls === 2) throw new Error('hostile second root')
+      return Reflect.apply(originalSet, this, [key, value])
+    }
+    try {
+      try {
+        apply(target, update)
+      } catch (_) {
+        failed = true
+      }
+      const roots = Number(share.has('root-a')) + Number(share.has('root-b'))
+      t.assert(roots !== 1, `${Encoder.name} staged roots are never partially installed`)
+      if (failed) {
+        t.assert(roots === 0 && target.store.clients.size === 0 && target.store.causalHoles.isEmpty())
+        t.assert(target.store.pendingStructs === null && target.store.pendingDs === null)
+      } else {
+        t.assert(roots === 2 && share.get('root-a')?.toString() === 'a' && share.get('root-b')?.toString() === 'b')
+        t.assert(target.store.getStruct(Y.createID(30, 1))?.constructor === Y.Item)
+        t.assert(target.store.getStruct(Y.createID(20, 1))?.constructor === Y.Item)
+      }
+    } finally {
+      share.set = originalSet
+    }
+
+    apply(target, update)
+    t.assert(target.get('root-a').toString() === 'a' && target.get('root-b').toString() === 'b')
+    t.assert(target.store.getStruct(Y.createID(30, 1))?.constructor === Y.Item)
+    t.assert(target.store.getStruct(Y.createID(20, 1))?.constructor === Y.Item)
+    t.assert(target.store.pendingStructs === null && target.store.pendingDs === null)
+  })
+}
+
 export const testSparsePendingStateSerializesWithDocumentContext = () => {
   ;[
     {

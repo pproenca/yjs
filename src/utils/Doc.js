@@ -33,10 +33,34 @@ export const stageDocRootType = doc => {
   return type
 }
 
-/** @param {Doc} doc @param {string} key @param {YType} type */
-export const installStagedDocRootType = (doc, key, type) => {
-  doc.share.set(key, type)
-  markStructuralChange(doc.store)
+const docRootMapBrandKey = Symbol('doc-root-map-brand')
+
+/**
+ * @param {Doc} doc
+ * @param {Map<string,YType>} existingRoots
+ * @param {Map<string,YType>} stagedRoots
+ */
+export const installStagedDocRootTypes = (doc, existingRoots, stagedRoots) => {
+  const share = doc.share
+  Map.prototype.has.call(share, docRootMapBrandKey)
+  Map.prototype.forEach.call(existingRoots, (type, key) => {
+    if (!Map.prototype.has.call(share, key) || Map.prototype.get.call(share, key) !== type) {
+      throw new Error(`Prepared sparse root changed before commit: ${key}`)
+    }
+  })
+  /** @type {Array<[string,YType]>} */
+  const installs = []
+  Map.prototype.forEach.call(stagedRoots, (type, key) => {
+    if (Map.prototype.has.call(share, key)) {
+      throw new Error(`Staged sparse root was installed before commit: ${key}`)
+    }
+    installs.push([key, type])
+  })
+  for (let index = 0; index < installs.length; index++) {
+    const [key, type] = installs[index]
+    Map.prototype.set.call(share, key, type)
+  }
+  if (installs.length > 0) markStructuralChange(doc.store)
 }
 
 /**
