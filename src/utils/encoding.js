@@ -16,26 +16,24 @@
 
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
-import * as map from 'lib0/map'
 import * as math from 'lib0/math'
 import * as array from 'lib0/array'
 
 import { commitPendingDs, commitPendingStructs, getPendingRevision, getStateVector, hasOrdinaryPendingResolution, readIndexedPendingDs, readIndexedPendingStructs, readPendingDs, readPendingStructs, resyncOrdinaryPendingState, StructStore } from './StructStore.js'
+import { getStructuralRevision } from './structural-revision.js'
 import { findIndexSS, getItemCleanStart, getItemCleanEnd } from './transaction-helpers.js'
 import { createIdSet, IdRange, readAndApplyDeleteSet, readIdSet, mergeIdSets, writeIdSet } from './ids.js'
 import { compareIDs, createID, ID } from './ID.js'
 import { UpdateDecoderV1, UpdateDecoderV2, IdSetDecoderV1 } from './UpdateDecoder.js'
 import { UpdateEncoderV1, UpdateEncoderV2, IdSetEncoderV1, IdSetEncoderV2 } from './UpdateEncoder.js'
 import { convertUpdateFormatV2ToV1, LazyStructReader, LazyStructWriter, writeStructToLazyStructWriter, finishLazyStructWriting } from './updates.js'
-import { readBlockSet, writeBlockSet } from './BlockSet.js'
+import { BlockSet, readBlockSet, writeBlockSet } from './BlockSet.js'
 import { Skip } from '../structs/Skip.js'
 import { ContentDoc, ContentType, Item, findItemInsertionLeft } from '../structs/Item.js'
 import { GC } from '../structs/GC.js'
 import { CausalHole, CausalHoleIndex, createCausalHoleFromItem, normalizeCausalHoleParent, sameCausalHoleMetadata, sameCausalHoleParent } from '../structs/CausalHole.js'
 import { Doc, getDocTransactionGeneration, normalizeDocOptions } from './Doc.js'
 import { writeStructs } from './encoding-helpers.js'
-
-/** @typedef {import('./BlockSet.js').BlockSet} BlockSet */
 
 /**
  * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
@@ -89,50 +87,41 @@ export const writeClientsStructs = (encoder, store, _sm) => {
  * This method is implemented in a way so that we can resume computation if this update
  * causally depends on another update.
  *
- * @param {Transaction} transaction
  * @param {StructStore} store
  * @param {BlockSet} clientsStructRefs
  * @param {ReturnType<typeof createSparseIntegrationPlan>} sparsePlan
- * @return { null | { update: Uint8Array<ArrayBuffer>, missing: Map<number,number> } }
+ * @return {{ordered:Array<{struct:GC|Item|CausalHole,clock:number,gap:number}>,rest:null|{update:Uint8Array<ArrayBuffer>,missing:Map<number,number>}}}
  *
  * @private
  * @function
  */
-const integrateStructs = (transaction, store, clientsStructRefs, sparsePlan) => {
-  /**
-   * @type {Array<Item | GC | Skip | CausalHole>}
-   */
+const scheduleStructs = (store, clientsStructRefs, sparsePlan) => {
+  /** @type {Array<Item | GC | CausalHole>} */
   const stack = []
-  // sort them so that we take the higher id first, in case of conflicts the lower id will probably not conflict with the id from the higher user.
-  let clientsStructRefsIds = array.from(clientsStructRefs.clients.keys()).sort((a, b) => a - b)
-  if (clientsStructRefsIds.length === 0) {
-    return null
-  }
+  const activeClients = new Set(clientsStructRefs.clients.keys())
+  const indices = new Map(array.from(clientsStructRefs.clients.entries()).map(([client, range]) => [client, range.i]))
+  let clientsStructRefsIds = array.from(activeClients).sort((a, b) => a - b)
   const getNextStructTarget = () => {
-    if (clientsStructRefsIds.length === 0) {
-      return null
-    }
-    let nextStructsTarget = /** @type {{i:number,refs:Array<GC|Item>}} */ (clientsStructRefs.clients.get(clientsStructRefsIds[clientsStructRefsIds.length - 1]))
-    while (nextStructsTarget.refs.length === nextStructsTarget.i) {
+    while (clientsStructRefsIds.length > 0) {
+      const client = clientsStructRefsIds[clientsStructRefsIds.length - 1]
+      const range = /** @type {{i:number,refs:Array<GC|Item|Skip|CausalHole>}} */ (clientsStructRefs.clients.get(client))
+      if (activeClients.has(client) && /** @type {number} */ (indices.get(client)) < range.refs.length) return { client, range }
       clientsStructRefsIds.pop()
-      if (clientsStructRefsIds.length > 0) {
-        nextStructsTarget = /** @type {{i:number,refs:Array<GC|Item>}} */ (clientsStructRefs.clients.get(clientsStructRefsIds[clientsStructRefsIds.length - 1]))
-      } else {
-        return null
-      }
     }
-    return nextStructsTarget
+    return null
   }
   let curStructsTarget = getNextStructTarget()
-  if (curStructsTarget === null) {
-    return null
-  }
+  if (curStructsTarget === null) return { ordered: [], rest: null }
 
-  /**
-   * @type {StructStore}
-   */
-  const restStructs = new StructStore()
+  /** @type {Map<number,Array<GC|Item|Skip|CausalHole>>} */
+  const restClients = new Map()
   const missingSV = new Map()
+  /** @type {Array<{struct:GC|Item|CausalHole,clock:number,gap:number}>} */
+  const ordered = []
+  const scheduled = new Set()
+  const virtualState = new Map()
+  const virtualSkips = createIdSet()
+  const virtualMaterial = createIdSet()
   /**
    * @param {number} client
    * @param {number} clock
@@ -143,36 +132,47 @@ const integrateStructs = (transaction, store, clientsStructRefs, sparsePlan) => 
       missingSV.set(client, clock)
     }
   }
-  /**
-   * @type {GC|Item|Skip|CausalHole}
-   */
-  let stackHead = /** @type {any} */ (curStructsTarget).refs[/** @type {any} */ (curStructsTarget).i++]
-  // caching the state because it is used very often
-  const state = new Map()
+  /** @param {{client:number,range:{i:number,refs:Array<GC|Item|Skip|CausalHole>}}} target @return {GC|Item|Skip|CausalHole} */
+  const take = target => {
+    const index = /** @type {number} */ (indices.get(target.client))
+    indices.set(target.client, index + 1)
+    return target.range.refs[index]
+  }
+  /** @type {GC|Item|Skip|CausalHole} */
+  let stackHead = take(curStructsTarget)
 
-  // // caching the state because it is used very often
-  // const currentInsertSet = createIdSet()
-  // clientsStructRefsIds.forEach(clientId => {
-  //   currentInsertSet.clients.set(clientid, new IdRanges(_createInsertSliceFromStructs(store.clients.get(clientId) ?? [], false)))
-  // })
+  /** @param {ID} id */
+  const hasSkip = id => virtualSkips.hasId(id) || (store.skips.hasId(id) && !virtualMaterial.hasId(id))
+  /** @param {Item|CausalHole} struct */
+  const getPureMissing = struct => {
+    const structuralParent = sparsePlan?.getStructuralParentDependency(struct) ?? null
+    if (structuralParent !== null) {
+      const installed = store.getStruct(structuralParent.id)
+      if (
+        !scheduled.has(structuralParent) &&
+        (installed?.constructor !== Item || !(/** @type {Item} */ (installed).content instanceof ContentType))
+      ) return structuralParent.id.client
+    }
+    for (const id of [struct.origin, struct.rightOrigin, struct.parent]) {
+      if (!(id instanceof ID)) continue
+      const clock = virtualState.get(id.client) ?? store.getClock(id.client)
+      if (id.clock >= clock || hasSkip(id)) return id.client
+    }
+    return null
+  }
 
   const addStackToRestSS = () => {
     for (const item of stack) {
       const client = item.id.client
-      const inapplicableItems = clientsStructRefs.clients.get(client)
-      if (inapplicableItems) {
-        // decrement because we weren't able to apply previous operation
-        inapplicableItems.i--
-        restStructs.clients.set(client, /** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ (inapplicableItems.refs.slice(inapplicableItems.i))))
-        clientsStructRefs.clients.delete(client)
-        inapplicableItems.i = 0
-        inapplicableItems.refs = []
-      } else {
-        // item was the last item on clientsStructRefs and the field was already cleared. Add item to restStructs and continue
-        restStructs.clients.set(client, /** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ ([item])))
+      const range = clientsStructRefs.clients.get(client)
+      if (range !== undefined && activeClients.has(client)) {
+        const index = Math.max(0, /** @type {number} */ (indices.get(client)) - 1)
+        restClients.set(client, range.refs.slice(index))
+      } else if (!restClients.has(client)) {
+        restClients.set(client, [item])
       }
-      // remove client from clientsStructRefsIds to prevent users from applying the same update again
-      clientsStructRefsIds = clientsStructRefsIds.filter(c => c !== client)
+      activeClients.delete(client)
+      clientsStructRefsIds = clientsStructRefsIds.filter(current => current !== client)
     }
     stack.length = 0
   }
@@ -180,59 +180,58 @@ const integrateStructs = (transaction, store, clientsStructRefs, sparsePlan) => 
   // iterate over all struct readers until we are done
   while (true) {
     if (stackHead.constructor !== Skip) {
-      const localClock = map.setIfUndefined(state, stackHead.id.client, () => store.getClock(stackHead.id.client))
-      const offset = localClock - stackHead.id.clock
-      const missing = getMissing(/** @type {any} */ (stackHead), transaction, store, sparsePlan)
+      const material = /** @type {GC|Item|CausalHole} */ (stackHead)
+      const localClock = virtualState.get(stackHead.id.client) ?? store.getClock(stackHead.id.client)
+      const gap = Math.max(0, stackHead.id.clock - localClock)
+      const missing = material.constructor === Item || material.constructor === CausalHole
+        ? getPureMissing(/** @type {Item|CausalHole} */ (material))
+        : null
       if (missing !== null) {
-        stack.push(stackHead)
-        // get the struct reader that has the missing struct
-        /**
-         * @type {{ refs: Array<GC|Item|Skip|CausalHole>, i: number }}
-         */
-        const structRefs = clientsStructRefs.clients.get(/** @type {number} */ (missing)) || { refs: [], i: 0 }
-        if (structRefs.refs.length === structRefs.i || missing === stackHead.id.client || stack.some(s => s.id.client === missing)) { // @todo this could be optimized!
-          // This update message causally depends on another update message that doesn't exist yet
+        stack.push(material)
+        const range = clientsStructRefs.clients.get(missing)
+        const index = indices.get(missing) ?? 0
+        if (range === undefined || !activeClients.has(missing) || range.refs.length === index || missing === stackHead.id.client || stack.some(s => s.id.client === missing)) {
           updateMissingSv(/** @type {number} */ (missing), store.getClock(missing))
           addStackToRestSS()
         } else {
-          stackHead = structRefs.refs[structRefs.i++]
+          stackHead = take({ client: missing, range })
           continue
         }
       } else {
-        // all fine, apply the stackhead
-        // but first add a skip to structs if necessary
-        if (offset < 0) {
-          const skip = new Skip(createID(stackHead.id.client, localClock), -offset)
-          skip.integrate(transaction, 0)
-        }
-        stackHead.integrate(transaction, 0)
-        state.set(stackHead.id.client, math.max(stackHead.id.clock + stackHead.length, localClock))
+        if (gap > 0) virtualSkips.add(stackHead.id.client, localClock, gap)
+        ordered.push({ struct: material, clock: localClock, gap })
+        scheduled.add(material)
+        virtualSkips.delete(material.id.client, material.id.clock, material.length)
+        virtualMaterial.add(material.id.client, material.id.clock, material.length)
+        virtualState.set(stackHead.id.client, Math.max(stackHead.id.clock + stackHead.length, localClock))
       }
     }
     // iterate to next stackHead
     if (stack.length > 0) {
       stackHead = /** @type {GC|Item|CausalHole} */ (stack.pop())
-    } else if (curStructsTarget !== null && curStructsTarget.i < curStructsTarget.refs.length) {
-      stackHead = /** @type {GC|Item|CausalHole} */ (curStructsTarget.refs[curStructsTarget.i++])
+    } else if (curStructsTarget !== null && activeClients.has(curStructsTarget.client) && /** @type {number} */ (indices.get(curStructsTarget.client)) < curStructsTarget.range.refs.length) {
+      stackHead = take(curStructsTarget)
     } else {
       curStructsTarget = getNextStructTarget()
       if (curStructsTarget === null) {
         // we are done!
         break
       } else {
-        stackHead = /** @type {GC|Item|CausalHole} */ (curStructsTarget.refs[curStructsTarget.i++])
+        stackHead = take(curStructsTarget)
       }
     }
   }
-  if (restStructs.clients.size > 0) {
+  if (restClients.size > 0) {
+    const restStructs = new StructStore()
+    restClients.forEach((refs, client) => restStructs.clients.set(client, /** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ (refs))))
     const encoder = new UpdateEncoderV2()
     writeClientsStructs(encoder, restStructs, new Map())
     // write empty deleteset
     // writeDeleteSet(encoder, new DeleteSet())
     encoding.writeVarUint(encoder.restEncoder, 0) // => no need for an extra function call, just write 0 deletes
-    return { missing: missingSV, update: encoder.toUint8Array() }
+    return { ordered, rest: { missing: missingSV, update: encoder.toUint8Array() } }
   }
-  return null
+  return { ordered, rest: null }
 }
 
 /**
@@ -300,7 +299,7 @@ const collectMissingDependencyCoverage = (missing, incoming, sparse) => {
  * revision, and structural envelope. Content payload is deliberately absent because sparse planning
  * observes only ranges, causal metadata, and whether content materializes a nested type.
  *
- * @typedef {{generation:number,pendingRevision:number,canonical:string,error:Error}} SparseFailedPlan
+ * @typedef {{structuralRevision:number,pendingRevision:number,canonical:string,error:Error}} SparseFailedPlan
  * @typedef {{entries:Array<SparseFailedPlan>}} SparseFailedPlanState
  */
 
@@ -344,7 +343,7 @@ const encodeSemanticEnvelope = blocks => JSON.stringify(
 
 /** @param {Doc} doc */
 const getSparseFailureCoordinates = doc => ({
-  generation: getDocTransactionGeneration(doc).generation,
+  structuralRevision: getStructuralRevision(doc.store),
   pendingRevision: getPendingRevision(doc.store)
 })
 
@@ -359,7 +358,7 @@ const getCachedSparsePlanFailure = (doc, canonical) => {
   const semantic = canonical.length > maxCachedSparseEnvelopeCharacters
     ? undefined
     : state.entries.find(entry =>
-      entry.generation === coordinates.generation &&
+      entry.structuralRevision === coordinates.structuralRevision &&
       entry.pendingRevision === coordinates.pendingRevision &&
       entry.canonical === canonical
     )
@@ -390,44 +389,42 @@ const cacheSparsePlanFailure = (doc, canonical, failure) => {
 }
 
 /**
- * Construct every decoded subdocument before target mutation. ContentDoc.integrate reuses `doc`.
+ * Construct only subdocuments in the frozen integration schedule. ContentDoc.integrate reuses `doc`.
  *
- * @param {BlockSet} blocks
+ * @param {Array<{struct:GC|Item|CausalHole,clock:number,gap:number}>} ordered
  * @param {Doc} target
- * @param {boolean} materialize
+ * @param {Array<ContentDoc>} prepared
+ * @param {()=>boolean} isStable
  */
-const prepareContentDocs = (blocks, target, materialize) => {
-  /** @type {Array<ContentDoc>} */
-  const contents = []
-  blocks.clients.forEach(range => range.refs.forEach(struct => {
-    if (struct.constructor !== Item || !(/** @type {Item} */ (struct).content instanceof ContentDoc)) return
-    const content = /** @type {ContentDoc} */ (/** @type {Item} */ (struct).content)
-    normalizeDocOptions(content.opts)
-    if (materialize && content.doc === null) contents.push(content)
-  }))
-  /** @type {Array<ContentDoc>} */
-  const created = []
+const prepareContentDocs = (ordered, target, prepared, isStable) => {
+  const scheduled = new Set(ordered
+    .map(entry => entry.struct)
+    .filter(struct => struct.constructor === Item && /** @type {Item} */ (struct).content instanceof ContentDoc)
+    .map(struct => /** @type {ContentDoc} */ (/** @type {Item} */ (struct).content)))
+  const stale = prepared.filter(content => !scheduled.has(content))
+  disposeUnintegratedContentDocs(stale)
+  for (let index = prepared.length - 1; index >= 0; index--) {
+    if (!scheduled.has(prepared[index])) prepared.splice(index, 1)
+  }
   try {
-    for (const content of contents) {
+    for (const content of scheduled) {
+      normalizeDocOptions(content.opts)
+      if (content.doc !== null) continue
       const opts = content.opts
       content.doc = /** @type {Doc} */ (new /** @type {any} */ (target.constructor)({
         guid: content.guid,
         ...opts,
         shouldLoad: opts.shouldLoad || opts.autoLoad || false
       }))
-      created.push(content)
+      prepared.push(content)
+      if (!isStable()) return false
     }
   } catch (failure) {
-    const docs = created.map(content => content.doc)
-    created.forEach(content => { content.doc = null })
-    docs.forEach(doc => {
-      try {
-        doc?.destroy()
-      } catch (_) {}
-    })
+    disposeUnintegratedContentDocs(prepared)
+    prepared.length = 0
     throw failure
   }
-  return created
+  return true
 }
 
 /** @param {Array<ContentDoc>} contents */
@@ -440,6 +437,25 @@ const disposeUnintegratedContentDocs = contents => {
       doc?.destroy()
     } catch (_) {}
   })
+}
+
+/** @param {BlockSet} blocks @param {StructStore} store */
+const excludeKnownStructs = (blocks, store) => {
+  const filtered = new BlockSet()
+  blocks.clients.forEach((range, client) => {
+    filtered.clients.set(client, { i: range.i, refs: range.refs.slice(), startClock: range.startClock })
+  })
+  const known = createIdSet()
+  filtered.clients.forEach((_, client) => {
+    const structs = store.clients.get(client)
+    if (structs === undefined) return
+    const last = structs[structs.length - 1]
+    known.add(client, 0, last.id.clock + last.length)
+    store.skips.clients.get(client)?.getIds().forEach(range => known.delete(client, range.clock, range.len))
+    store.causalHoles.clients.get(client)?.getIds().forEach(range => known.delete(client, range.clock, range.len))
+  })
+  filtered.exclude(known)
+  return filtered
 }
 
 /** @param {Transaction} transaction @param {StructStore} store @param {IdSet} deletes */
@@ -503,10 +519,11 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     : collectMissingDependencyCoverage(pendingBefore.missing, ss, ydoc.sparseExactResolution)
   let selectedDeleteSet = sparseDeleteSet
   let consumeSparsePending = false
+  let failureCanonical = null
   let sparsePlan = null
   if (ydoc.sparseExactResolution && sparseDeleteSet !== null && pendingBefore !== null && missingDependencyCoverage.length > 0) {
-    const canonical = encodeSemanticEnvelope(ss)
-    const cachedFailure = getCachedSparsePlanFailure(ydoc, canonical)
+    failureCanonical = encodeSemanticEnvelope(ss)
+    const cachedFailure = getCachedSparsePlanFailure(ydoc, failureCanonical)
     if (cachedFailure !== null) throw cachedFailure
     sparseFailedPlanRuns.set(ydoc, (sparseFailedPlanRuns.get(ydoc) ?? 0) + 1)
     try {
@@ -521,49 +538,70 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
       if (array.from(ss.clients.values()).some(range => range.refs.some(struct => struct.constructor === CausalHole))) {
         normalizeIncomingCausalHoles(ss, store)
       }
-      const validation = validateCausalHoleEnvelope(ss, store)
-      sparsePlan = validation === null ? null : createSparseIntegrationPlan(ss, store, ydoc, validation)
     } catch (failure) {
-      throw cacheSparsePlanFailure(ydoc, canonical, failure)
+      throw cacheSparsePlanFailure(ydoc, failureCanonical, failure)
     }
   } else {
     if (hasIncomingHoles) normalizeIncomingCausalHoles(ss, store)
-    const validation = validateCausalHoleEnvelope(ss, store)
-    sparsePlan = validation === null ? null : createSparseIntegrationPlan(ss, store, ydoc, validation)
   }
-  const preparedContentDocs = prepareContentDocs(ss, ydoc, consumeSparsePending)
+  /** @type {Array<ContentDoc>} */
+  const preparedContentDocs = []
+  /** @type {ReturnType<typeof scheduleStructs>} */
+  let schedule = { ordered: [], rest: null }
+  let stable = false
+  let scheduledStructuralRevision = getStructuralRevision(store)
+  let scheduledPendingRevision = ydoc.sparseExactResolution ? getPendingRevision(store) : 0
+  for (let attempt = 0; attempt < 32 && !stable; attempt++) {
+    const structuralRevision = getStructuralRevision(store)
+    const pendingRevision = ydoc.sparseExactResolution ? getPendingRevision(store) : 0
+    try {
+      const validation = validateCausalHoleEnvelope(ss, store)
+      sparsePlan = validation === null ? null : createSparseIntegrationPlan(ss, store, ydoc, validation)
+      sparsePlan?.applySplits()
+      schedule = scheduleStructs(store, excludeKnownStructs(ss, store), sparsePlan)
+    } catch (failure) {
+      if (failureCanonical !== null) throw cacheSparsePlanFailure(ydoc, failureCanonical, failure)
+      throw failure
+    }
+    const revisionsStable = () => structuralRevision === getStructuralRevision(store) &&
+      pendingRevision === (ydoc.sparseExactResolution ? getPendingRevision(store) : 0)
+    stable = prepareContentDocs(schedule.ordered, ydoc, preparedContentDocs, revisionsStable) && revisionsStable()
+    if (stable) {
+      scheduledStructuralRevision = structuralRevision
+      scheduledPendingRevision = pendingRevision
+    }
+  }
+  if (!stable) {
+    disposeUnintegratedContentDocs(preparedContentDocs)
+    throw new Error('Subdocument preparation did not reach a stable document revision')
+  }
 
   const apply = () => ydoc.transact(transaction => {
     // force that transaction.local is set to non-local
     transaction.local = false
+    if (
+      scheduledStructuralRevision !== getStructuralRevision(store) ||
+      scheduledPendingRevision !== (ydoc.sparseExactResolution ? getPendingRevision(store) : 0)
+    ) {
+      throw new Error('Integration schedule invalidated before commit')
+    }
     if (consumeSparsePending) {
       commitPendingStructs(store, null)
       commitPendingDs(store, null)
     }
-    // let start = performance.now()
-    sparsePlan?.applySplits(transaction)
-    const knownState = createIdSet()
-    ss.clients.forEach((_, client) => {
-      const storeStructs = store.clients.get(client)
-      if (storeStructs) {
-        const last = storeStructs[storeStructs.length - 1]
-        knownState.add(client, 0, last.id.clock + last.length)
-        // remove known items from ss
-        store.skips.clients.get(client)?.getIds().forEach(idrange => {
-          knownState.delete(client, idrange.clock, idrange.len)
-        })
-        store.causalHoles.clients.get(client)?.getIds().forEach(idrange => {
-          knownState.delete(client, idrange.clock, idrange.len)
-        })
+    for (const entry of schedule.ordered) {
+      const clock = store.getClock(entry.struct.id.client)
+      if (clock !== entry.clock) throw new Error('Integration schedule invalidated before commit')
+      if (entry.gap > 0) new Skip(createID(entry.struct.id.client, clock), entry.gap).integrate(transaction, 0)
+      if (
+        (entry.struct.constructor === Item || entry.struct.constructor === CausalHole) &&
+        getMissing(/** @type {Item|CausalHole} */ (entry.struct), transaction, store, sparsePlan) !== null
+      ) {
+        throw new Error('Integration schedule has an unresolved dependency')
       }
-    })
-    // remove known items from ss
-    ss.exclude(knownState)
-    // console.log('time to read structs: ', performance.now() - start) // @todo remove
-    // start = performance.now()
-    // console.log('time to merge: ', performance.now() - start) // @todo remove
-    // start = performance.now()
-    const restStructs = integrateStructs(transaction, store, ss, sparsePlan)
+      entry.struct.integrate(transaction, 0)
+    }
+    const restStructs = schedule.rest
     const pending = readPendingStructs(store)
     if (pending) {
       if (restStructs) {
@@ -1475,7 +1513,7 @@ const createSparseIntegrationPlan = (blockSet, store, doc, validation) => {
 
   return {
     getStructuralParentDependency: (/** @type {Item|CausalHole} */ struct) => validation.structuralParentDependencies.get(struct) ?? null,
-    applySplits: (/** @type {Transaction} */ transaction) => {
+    applySplits: () => {
       blockSet.clients.forEach(range => {
         for (let index = 0; index < range.refs.length; index++) {
           const struct = range.refs[index]

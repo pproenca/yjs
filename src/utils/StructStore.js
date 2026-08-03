@@ -4,6 +4,7 @@ import { GC } from '../structs/GC.js'
 import { createID, ID } from './ID.js'
 import { createDeleteSetFromStructStore, createIdSet } from './ids.js'
 import { findIndexSS } from './transaction-helpers.js'
+import { initializeStructuralRevision, markStructuralChange } from './structural-revision.js'
 
 /** @typedef {import('./BlockSet.js').BlockSet} BlockSet */
 /** @typedef {import('./ids.js').IdSet} IdSet */
@@ -33,8 +34,11 @@ const isOrdinaryPendingMaterial = struct => struct.constructor === GC || struct.
  */
 export const resyncOrdinaryPendingState = store => {
   if (pendingStates.has(store)) return
-  const pending = /** @type {PendingStructs|null} */ (store.pendingStructs)
-  if (pending === null) {
+  const pending = /** @type {PendingStructs|null|undefined} */ (store.pendingStructs)
+  if (pending == null) {
+    if (pending !== null || !Object.prototype.hasOwnProperty.call(store, 'pendingStructs')) {
+      store.pendingStructs = null
+    }
     ordinaryPendingStates.delete(store)
     return
   }
@@ -270,6 +274,7 @@ export class StructStore {
       /** @type {PendingState} */
       const state = { structs: null, deletes: null, revision: 0, batchDepth: 0, batchBase: null }
       pendingStates.set(this, state)
+      initializeStructuralRevision(this)
       Object.defineProperties(this, {
         pendingStructs: {
           get: () => state.structs === null
@@ -312,13 +317,15 @@ export class StructStore {
     } else {
       const lastStruct = structs[structs.length - 1]
       if (lastStruct.id.clock + lastStruct.length !== struct.id.clock) {
-        this._replaceSparseRange(structs, struct)
+        const replaced = this._replaceSparseRange(structs, struct)
+        if (replaced) markStructuralChange(this)
         markOrdinaryPendingResolution(this, struct)
         return
       }
     }
     structs.push(struct)
     if (struct.constructor === CausalHole) this._indexCausalHole(/** @type {CausalHole} */ (struct))
+    markStructuralChange(this)
     markOrdinaryPendingResolution(this, struct)
   }
 
@@ -373,8 +380,8 @@ export class StructStore {
       throw new Error('Sparse replacement has missing coverage')
     }
     if (struct.constructor === CausalHole) {
-      if (replaced.length === 1 && replaced[0].constructor === CausalHole && sameCausalHoleMetadata(/** @type {CausalHole} */ (replaced[0]), /** @type {CausalHole} */ (struct))) return
-      if (replaced.some(current => current.constructor !== Skip && current.constructor !== CausalHole)) return
+      if (replaced.length === 1 && replaced[0].constructor === CausalHole && sameCausalHoleMetadata(/** @type {CausalHole} */ (replaced[0]), /** @type {CausalHole} */ (struct))) return false
+      if (replaced.some(current => current.constructor !== Skip && current.constructor !== CausalHole)) return false
       if (replaced.some(current => current.constructor === CausalHole && !sameSparseMetadataAt(current, struct, Math.max(start, current.id.clock), Math.min(end, current.id.clock + current.length)))) {
         throw new Error('Conflicting causal hole metadata')
       }
@@ -410,6 +417,7 @@ export class StructStore {
     })
     this.skips.delete(struct.id.client, start, struct.length)
     this.causalHoles.delete(struct.id.client, start, struct.length)
+    return true
   }
 
   /**

@@ -20,6 +20,8 @@ import { CausalHole, sameCausalHoleMetadata } from '../src/structs/CausalHole.js
 import { normalizeDocOptions } from '../src/utils/Doc.js'
 import { readBlockSet, writeBlockSet } from '../src/utils/BlockSet.js'
 import { commitPendingDs, commitPendingStructs, getPendingRevision, readIndexedPendingStructs, readPendingStructs } from '../src/utils/StructStore.js'
+import { getStructuralRevision } from '../src/utils/structural-revision.js'
+import { getItemCleanStart } from '../src/utils/transaction-helpers.js'
 import { _testOnlyGetSparseFailedPlanRuns, _testOnlyGetSparsePendingProofRuns, writeStateAsUpdate } from '../src/utils/encoding.js'
 import { writeStructsFromIdSetWithCausalHoles } from '../src/utils/encoding-helpers.js'
 import { UpdateDecoderV1, UpdateDecoderV2 } from '../src/utils/UpdateDecoder.js'
@@ -401,6 +403,87 @@ export const testSparseCompositeSubdocsMaterializeBeforeTargetMutation = () => {
     apply(successful, resolving)
     t.assert(constructions === 1 && successful.store.pendingStructs === null)
     t.assert(/** @type {Y.Doc} */ (successful.get('docs').get(0)).guid === 'composite-subdoc')
+  })
+}
+
+export const testSubdocPreparationUsesOnlyTheStableIntegrationSchedule = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, apply }) => {
+    let host = /** @type {Y.Doc|null} */ (null)
+    let scheduledConstructions = 0
+    let excludedConstructions = 0
+    let excludedDestructions = 0
+    const materializedExcluded = encodeStructs([
+      new Y.Item(Y.createID(59, 0), null, null, null, null, 'materialized', null, new Y.ContentString('x'))
+    ], Encoder)
+    class TargetDoc extends Y.Doc {
+      /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+      constructor (opts) {
+        super(opts)
+        if (opts?.guid === 'scheduled-once') {
+          scheduledConstructions++
+          if (host !== null && host.store.getStruct(Y.createID(59, 0)) === null) apply(host, materializedExcluded)
+        }
+        if (opts?.guid === 'excluded-before-construction') excludedConstructions++
+      }
+
+      destroy () {
+        if (this.guid === 'excluded-before-construction') excludedDestructions++
+        super.destroy()
+      }
+    }
+    host = new TargetDoc({ gc: false, sparseExactResolution: true })
+    const update = encodeStructGroups([
+      [new Y.Item(Y.createID(60, 0), null, null, null, null, 'docs', null, new Y.ContentDoc('scheduled-once', {}))],
+      [new Y.Item(Y.createID(59, 0), null, null, null, null, 'docs', null, new Y.ContentDoc('excluded-before-construction', {}))]
+    ], Encoder)
+    apply(host, update)
+    t.assert(scheduledConstructions === 1, `${Encoder.name} scheduled subdoc constructs once across revision rebuild`)
+    t.assert(excludedConstructions === 0 && excludedDestructions === 0, `${Encoder.name} invalidated later subdoc has no lifecycle`)
+    t.assert(host.store.getStruct(Y.createID(59, 0))?.constructor === Y.Item)
+    t.assert(/** @type {Y.Doc} */ (host.get('docs').get(0)).guid === 'scheduled-once')
+
+    apply(host, update)
+    t.assert(scheduledConstructions === 1 && excludedConstructions === 0 && excludedDestructions === 0, `${Encoder.name} duplicate-known subdocs have no lifecycle`)
+
+    apply(host, encodeStructs([
+      new Y.Item(Y.createID(58, 0), null, Y.createID(57, 0), null, null, 'docs', null, new Y.ContentDoc('excluded-before-construction', {}))
+    ], Encoder))
+    t.assert(host.store.pendingStructs !== null)
+    t.assert(excludedConstructions === 0 && excludedDestructions === 0, `${Encoder.name} unresolved subdocs have no lifecycle`)
+  })
+}
+
+export const testSubdocRevisionRebuildPreservesSparseSplitPlan = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, apply }) => {
+    let host = /** @type {Y.Doc|null} */ (null)
+    let constructions = 0
+    class TargetDoc extends Y.Doc {
+      /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+      constructor (opts) {
+        super(opts)
+        if (opts?.guid === 'split-rebuild') {
+          constructions++
+          host?.get('constructor-root')
+        }
+      }
+    }
+    host = new TargetDoc({ gc: false, sparseExactResolution: true })
+    apply(host, encodeCausalHoles([
+      new CausalHole(Y.createID(61, 0), 1, null, null, 'text', null)
+    ], Encoder))
+    apply(host, encodeStructGroups([
+      [new Y.Item(Y.createID(62, 0), null, null, null, null, 'docs', null, new Y.ContentDoc('split-rebuild', {}))],
+      [new Y.Item(Y.createID(61, 0), null, null, null, null, 'text', null, new Y.ContentString('xy'))]
+    ], Encoder))
+    t.assert(constructions === 1, `${Encoder.name} target-mutating constructor constructs once`)
+    t.assert(host.get('text').toString() === 'xy' && host.store.causalHoles.isEmpty())
+    t.assert(/** @type {Y.Doc} */ (host.get('docs').get(0)).guid === 'split-rebuild')
   })
 }
 
@@ -1032,6 +1115,106 @@ export const testSparseFailedPlanDoesNotLatchSameResolverWithRelevantMaterial = 
   })
 }
 
+export const testSparseFailedPlanCacheInvalidatesForSeparateParentAndRootArrival = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, apply }) => {
+    const target = new Y.Doc({ gc: false, sparseExactResolution: true })
+    apply(target, encodeStructs([
+      new Y.Item(Y.createID(2, 0), null, Y.createID(1, 0), null, null, null, null, new Y.ContentString('b'))
+    ], Encoder))
+    const resolver = encodeCausalHoles([
+      new CausalHole(Y.createID(1, 0), 1, null, null, Y.createID(4, 0), null)
+    ], Encoder)
+    t.fails(() => apply(target, resolver))
+    t.fails(() => apply(target, resolver))
+    t.assert(_testOnlyGetSparseFailedPlanRuns(target) === 1, `${Encoder.name} exact unchanged retry is cached`)
+
+    apply(target, encodeStructs([
+      new Y.Item(Y.createID(4, 0), null, null, null, null, 'root', null, new Y.ContentType(new Y.Type()))
+    ], Encoder))
+    apply(target, resolver)
+    t.assert(_testOnlyGetSparseFailedPlanRuns(target) === 2, `${Encoder.name} separate parent arrival invalidates failure`)
+    t.assert(target.store.pendingStructs === null && target.store.getStruct(Y.createID(1, 0))?.constructor === CausalHole)
+
+    const conflicting = encodeCausalHoles([
+      new CausalHole(Y.createID(8, 0), 1, null, null, 'wrong', null)
+    ], Encoder)
+    apply(target, encodeStructs([
+      new Y.Item(Y.createID(10, 0), null, null, null, null, 'right', null, new Y.ContentString('r'))
+    ], Encoder))
+    apply(target, encodeStructs([
+      new Y.Item(Y.createID(9, 0), null, Y.createID(8, 0), null, Y.createID(10, 0), null, null, new Y.ContentString('x'))
+    ], Encoder))
+    t.fails(() => apply(target, conflicting))
+    const beforeRoot = _testOnlyGetSparseFailedPlanRuns(target)
+    t.fails(() => apply(target, conflicting))
+    t.assert(_testOnlyGetSparseFailedPlanRuns(target) === beforeRoot)
+    target.get('cache-root')
+    t.fails(() => apply(target, conflicting))
+    t.assert(_testOnlyGetSparseFailedPlanRuns(target) === beforeRoot + 1, `${Encoder.name} root creation invalidates failure`)
+  })
+}
+
+export const testSparseStructuralRevisionTracksOnlyAuthoritativeChanges = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, apply }) => {
+    const sparse = new Y.Doc({ gc: false, sparseExactResolution: true })
+    const empty = Encoder === Y.UpdateEncoderV1
+      ? Y.encodeStateAsUpdate(new Y.Doc())
+      : Y.encodeStateAsUpdateV2(new Y.Doc())
+    apply(sparse, empty)
+    t.assert(getStructuralRevision(sparse.store) === 0, `${Encoder.name} empty update is structurally inert`)
+
+    const unresolved = encodeStructs([
+      new Y.Item(Y.createID(21, 0), null, Y.createID(20, 0), null, null, 'text', null, new Y.ContentString('x'))
+    ], Encoder)
+    apply(sparse, unresolved)
+    t.assert(sparse.store.pendingStructs !== null && getStructuralRevision(sparse.store) === 0, `${Encoder.name} unresolved-only update is structurally inert`)
+
+    const material = encodeStructs([
+      new Y.Item(Y.createID(30, 2), null, null, null, null, 'text', null, new Y.ContentString('m'))
+    ], Encoder)
+    apply(sparse, material)
+    const materialRevision = getStructuralRevision(sparse.store)
+    t.assert(materialRevision >= 2, `${Encoder.name} generated Skip and material insert advance revision`)
+    apply(sparse, material)
+    t.assert(getStructuralRevision(sparse.store) === materialRevision, `${Encoder.name} duplicate-known update is structurally inert`)
+
+    sparse.get('new-root')
+    t.assert(getStructuralRevision(sparse.store) === materialRevision + 1, `${Encoder.name} root creation advances revision once`)
+
+    const split = new Y.Doc({ gc: false, sparseExactResolution: true })
+    apply(split, encodeStructs([
+      new Y.Item(Y.createID(31, 0), null, null, null, null, 'text', null, new Y.ContentString('ab'))
+    ], Encoder))
+    const beforeSplit = getStructuralRevision(split.store)
+    split.transact(transaction => { getItemCleanStart(transaction, Y.createID(31, 1)) })
+    t.assert(getStructuralRevision(split.store) === beforeSplit + 1, `${Encoder.name} store split advances revision once`)
+    const beforeDelete = getStructuralRevision(split.store)
+    split.get('text').delete(0, 1)
+    t.assert(getStructuralRevision(split.store) > beforeDelete, `${Encoder.name} authoritative delete advances revision`)
+
+    const replacement = new Y.Doc({ gc: false, sparseExactResolution: true })
+    apply(replacement, encodeCausalHoles([
+      new CausalHole(Y.createID(32, 0), 1, null, null, 'text', null)
+    ], Encoder))
+    const beforeReplacement = getStructuralRevision(replacement.store)
+    apply(replacement, encodeStructs([
+      new Y.Item(Y.createID(32, 0), null, null, null, null, 'text', null, new Y.ContentString('r'))
+    ], Encoder))
+    t.assert(getStructuralRevision(replacement.store) > beforeReplacement, `${Encoder.name} sparse replacement advances revision`)
+    t.assert(replacement.get('text').toString() === 'r' && replacement.store.causalHoles.isEmpty())
+
+    const ordinary = new Y.Doc({ gc: false })
+    ordinary.get('text').insert(0, 'x')
+    t.assert(getStructuralRevision(ordinary.store) === 0, `${Encoder.name} ordinary stores have no revision state`)
+  })
+}
+
 export const testSparseFailedPlanCacheIgnoresBulkContentSize = () => {
   const target = new Y.Doc({ gc: false, sparseExactResolution: true })
   Y.applyUpdateV2(target, encodeStructs([
@@ -1093,6 +1276,36 @@ export const testOrdinaryPendingRetryIgnoresSkipAndUnrelatedMissingClients = () 
     apply(target, encode(unrelated))
     t.assert(target.store.pendingStructs === retained && missingIterations === 1)
     t.assert(target.get('other').toString() === 'z')
+  })
+}
+
+export const testOrdinaryPendingResyncNormalizesDeletedAndUndefinedFields = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, event: 'update', apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, event: 'updateV2', apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, event, apply }) => {
+    const source = new Y.Doc({ gc: false })
+    source.clientID = 74
+    /** @type {Array<Uint8Array<ArrayBuffer>>} */
+    const updates = []
+    source.on(/** @type {'update'|'updateV2'} */ (event), update => updates.push(update))
+    source.get('pending').insert(0, 'a')
+    source.get('pending').insert(1, 'b')
+
+    const descriptor = Object.getOwnPropertyDescriptor(new Y.Doc().store, 'pendingStructs')
+    const deleted = new Y.Doc({ gc: false })
+    apply(deleted, updates[1])
+    delete /** @type {{pendingStructs?:unknown}} */ (deleted.store).pendingStructs
+    apply(deleted, encodeStructs([new Y.GC(Y.createID(74, 0), 1)], Encoder))
+    const deletedDescriptor = Object.getOwnPropertyDescriptor(deleted.store, 'pendingStructs')
+    t.assert(deleted.store.pendingStructs === null && JSON.stringify(deletedDescriptor) === JSON.stringify(descriptor), `${Encoder.name} deleted field normalizes to upstream own null`)
+
+    const undefinedField = new Y.Doc({ gc: false })
+    apply(undefinedField, updates[1])
+    ;/** @type {{pendingStructs:unknown}} */ (undefinedField.store).pendingStructs = undefined
+    apply(undefinedField, encodeStructs([new Y.GC(Y.createID(74, 0), 1)], Encoder))
+    const undefinedDescriptor = Object.getOwnPropertyDescriptor(undefinedField.store, 'pendingStructs')
+    t.assert(undefinedField.store.pendingStructs === null && JSON.stringify(undefinedDescriptor) === JSON.stringify(descriptor), `${Encoder.name} undefined field normalizes and clears retry marker`)
   })
 }
 
