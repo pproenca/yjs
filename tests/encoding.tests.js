@@ -684,6 +684,124 @@ export const testOrdinaryLargeApplyBypassesSparseSchedule = () => {
   })
 }
 
+export const testSparseLaterAdjacentFailureIsAtomicAndRetryable = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2 }
+  ].forEach(({ Encoder, apply, encode }) => {
+    class ThrowingDoc extends Y.Doc {
+      throwOnGet = false
+
+      /** @param {string} name @param {string|null} [typeName] */
+      get (name, typeName) {
+        if (this.throwOnGet) throw new Error('host get failure')
+        return super.get(name, typeName)
+      }
+    }
+    const target = new ThrowingDoc({ gc: false, sparseExactResolution: true })
+    target.clientID = 1
+    target.get('text').insert(0, 'a')
+    const laterAdjacent = encodeStructs([
+      new CausalHole(Y.createID(2, 0), 1, Y.createID(1, 0), null, 'text', null),
+      new Y.Item(Y.createID(2, 1), null, Y.createID(2, 0), null, null, null, null, new Y.ContentString('Y'))
+    ], Encoder)
+    const beforeState = Array.from(Y.encodeStateVector(target))
+    const beforeUpdate = Array.from(encode(target))
+    let updates = 0
+    let transactions = 0
+    target.on('update', () => { updates++ })
+    target.on('updateV2', () => { updates++ })
+    target.on('afterTransaction', () => { transactions++ })
+
+    target.throwOnGet = true
+    t.fails(() => apply(target, laterAdjacent))
+    target.throwOnGet = false
+    t.compareArrays(Array.from(Y.encodeStateVector(target)), beforeState)
+    t.compareArrays(Array.from(encode(target)), beforeUpdate)
+    t.assert(target.get('text').toString() === 'a' && target.store.causalHoles.isEmpty())
+    t.assert(updates === 0 && transactions === 0, `${Encoder.name} late dependency failure is zero-event`)
+
+    apply(target, laterAdjacent)
+    t.assert(target.get('text').toString() === 'aY', `${Encoder.name} fresh retry integrates later adjacent content`)
+    t.assert(target.store.getStruct(Y.createID(2, 0))?.constructor === CausalHole)
+    t.assert(target.store.getStruct(Y.createID(2, 1))?.constructor === Y.Item)
+  })
+}
+
+export const testOrdinaryDuplicateKnownContentDocSkipsInvalidOptions = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2 }
+  ].forEach(({ Encoder, apply, encode }) => {
+    ;[null, { sparseExactResolution: true }].forEach((opts, index) => {
+      const target = new Y.Doc({ gc: false })
+      apply(target, encodeStructs([
+        new Y.Item(Y.createID(41, 0), null, null, null, null, 'text', null, new Y.ContentString('x'))
+      ], Encoder))
+      const beforeState = Array.from(Y.encodeStateVector(target))
+      const beforeUpdate = Array.from(encode(target))
+      let updates = 0
+      let subdocs = 0
+      target.on('update', () => { updates++ })
+      target.on('updateV2', () => { updates++ })
+      target.on('subdocs', () => { subdocs++ })
+
+      apply(target, encodeStructs([
+        new Y.Item(
+          Y.createID(41, 0),
+          null,
+          null,
+          null,
+          null,
+          'docs',
+          null,
+          new Y.ContentDoc(`duplicate-invalid-${index}`, /** @type {any} */ (opts))
+        )
+      ], Encoder))
+
+      t.compareArrays(Array.from(Y.encodeStateVector(target)), beforeState)
+      t.compareArrays(Array.from(encode(target)), beforeUpdate)
+      t.assert(target.get('text').toString() === 'x' && target.subdocs.size === 0)
+      t.assert(updates === 0 && subdocs === 0, `${Encoder.name} duplicate-known invalid subdoc is inert`)
+    })
+  })
+}
+
+export const testSparseFailedResolverRecomputesWithinOpenTransaction = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, apply }) => {
+    const target = new Y.Doc({ gc: false, sparseExactResolution: true })
+    apply(target, encodeStructs([
+      new Y.Item(Y.createID(2, 0), null, Y.createID(1, 0), null, null, Y.createID(4, 0), null, new Y.ContentString('x'))
+    ], Encoder))
+    const resolver = encodeCausalHoles([
+      new CausalHole(Y.createID(1, 0), 1, null, null, Y.createID(4, 0), null)
+    ], Encoder)
+    const parent = encodeStructs([
+      new Y.Item(Y.createID(4, 0), null, null, null, null, 'root', null, new Y.ContentType(new Y.Type()))
+    ], Encoder)
+
+    target.transact(() => {
+      t.fails(() => apply(target, resolver))
+      t.assert(_testOnlyGetSparseFailedPlanRuns(target) === 1)
+      apply(target, parent)
+      apply(target, resolver)
+      const storedParent = target.store.getStruct(Y.createID(4, 0))
+      const storedChild = target.store.getStruct(Y.createID(2, 0))
+      t.assert(storedParent?.constructor === Y.Item && storedParent.content instanceof Y.ContentType)
+      t.assert(
+        storedChild?.constructor === Y.Item &&
+        storedChild.parent === /** @type {Y.ContentType} */ (/** @type {Y.Item} */ (storedParent).content).type,
+        `${Encoder.name} identical resolver recomputes before transaction cleanup`
+      )
+      t.assert(_testOnlyGetSparseFailedPlanRuns(target) === 2)
+      t.assert(target.store.pendingStructs === null)
+    })
+  })
+}
+
 export const testSparsePendingStateSerializesWithDocumentContext = () => {
   ;[
     {

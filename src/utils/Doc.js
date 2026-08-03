@@ -26,6 +26,19 @@ export const getDocTransactionGeneration = doc => {
     : { generation: state.generation, settled: state.pendingTransactions === 0 && doc._transaction === null, destroyed: state.destroyed }
 }
 
+/** @param {Doc} doc */
+export const stageDocRootType = doc => {
+  const type = new YType(null)
+  type._integrate(doc, null)
+  return type
+}
+
+/** @param {Doc} doc @param {string} key @param {YType} type */
+export const installStagedDocRootType = (doc, key, type) => {
+  doc.share.set(key, type)
+  markStructuralChange(doc.store)
+}
+
 /**
  * Validate fork-owned document options without changing the supplied record. Sparse capability is
  * enabled only by own data properties so decoded or inherited values cannot opt a document in.
@@ -165,7 +178,7 @@ export class Doc extends ObservableV2 {
         ) {
           transactionGeneration.generation++
         }
-        if (this.sparseExactResolution && (!transaction.insertSet.isEmpty() || !transaction.deleteSet.isEmpty())) markStructuralChange(this.store)
+        if (!transaction.deleteSet.isEmpty()) markStructuralChange(this.store)
       })
       this.on('afterTransactionCleanup', transaction => {
         transactionGeneration.pendingTransactions--

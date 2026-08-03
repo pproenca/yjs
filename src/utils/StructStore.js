@@ -274,6 +274,9 @@ const sameSparseMetadataAt = (left, right, clock, end) => {
 }
 
 export class StructStore {
+  /** @type {boolean} */
+  #tracksStructuralChanges
+
   /** @param {boolean} [indexedPending] */
   constructor (indexedPending = false) {
     /**
@@ -281,6 +284,7 @@ export class StructStore {
      * @type {Map<number,Array<GC|Item|Skip>>}
      */
     this.clients = new Map()
+    this.#tracksStructuralChanges = indexedPending
     /** @type {PendingStructs|null} */
     this.pendingStructs = null
     /** @type {Uint8Array<ArrayBuffer>|null} */
@@ -352,7 +356,7 @@ export class StructStore {
     }
     structs.push(struct)
     if (struct.constructor === CausalHole) this._indexCausalHole(/** @type {CausalHole} */ (struct))
-    if (struct.constructor === Skip || struct.constructor === CausalHole) markStructuralChange(this)
+    if (this.#tracksStructuralChanges || struct.constructor === Skip || struct.constructor === CausalHole) markStructuralChange(this)
     markOrdinaryPendingResolution(this, struct)
   }
 

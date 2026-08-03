@@ -33,7 +33,7 @@ import { Skip } from '../structs/Skip.js'
 import { ContentDoc, ContentType, Item, findItemInsertionLeft } from '../structs/Item.js'
 import { GC } from '../structs/GC.js'
 import { CausalHole, CausalHoleIndex, createCausalHoleFromItem, normalizeCausalHoleParent, sameCausalHoleMetadata, sameCausalHoleParent } from '../structs/CausalHole.js'
-import { Doc, getDocTransactionGeneration, normalizeDocOptions } from './Doc.js'
+import { Doc, getDocTransactionGeneration, installStagedDocRootType, normalizeDocOptions, stageDocRootType } from './Doc.js'
 import { writeStructs } from './encoding-helpers.js'
 
 /**
@@ -517,6 +517,44 @@ const prepareContentDocs = (ordered, target, prepared, isStable) => {
   return true
 }
 
+/**
+ * Resolve user-dispatched root lookup while the sparse schedule is still restartable. The commit
+ * path consumes these exact type references and never calls an overridable Doc method.
+ *
+ * @param {Array<{struct:GC|Item|CausalHole,clock:number,gap:number}>} ordered
+ * @param {Doc} target
+ * @param {ReturnType<typeof createSparseIntegrationPlan>} sparsePlan
+ * @param {Map<string,YType>} stagedRoots
+ */
+const prepareStringRootParents = (ordered, target, sparsePlan, stagedRoots) => {
+  /** @type {Map<Item,YType>} */
+  const resolved = new Map()
+  /** @type {Set<Item>} */
+  const required = new Set()
+  for (const entry of ordered) {
+    if (entry.struct.constructor !== Item) continue
+    const item = /** @type {Item} */ (entry.struct)
+    const metadata = typeof item.parent === 'string' ? null : sparsePlan?.getParentMetadata(item) ?? null
+    const parent = typeof item.parent === 'string' ? item.parent : metadata?.parent
+    if (typeof parent !== 'string') continue
+    required.add(item)
+    const existing = target.share.get(parent)
+    let type
+    if (existing === undefined) {
+      type = stagedRoots.get(parent)
+      if (type === undefined) {
+        type = stageDocRootType(target)
+        stagedRoots.set(parent, type)
+      }
+    } else {
+      type = target.get(parent)
+      if (target.share.get(parent) !== type) throw new Error(`Root type lookup did not preserve ${parent}`)
+    }
+    resolved.set(item, type)
+  }
+  return { required, resolved }
+}
+
 /** @param {Array<ContentDoc>} contents */
 const disposeUnintegratedContentDocs = contents => {
   const disposable = contents.filter(content => content.doc?._item === null)
@@ -602,6 +640,16 @@ const hasMaterializedDeleteTarget = (transaction, store, deletes) => {
  * @param {any} origin
  */
 const applyOrdinaryUpdate = (structDecoder, structs, doc, origin) => {
+  const known = createIdSet()
+  structs.clients.forEach((_, client) => {
+    const stored = doc.store.clients.get(client)
+    if (stored === undefined) return
+    const last = stored[stored.length - 1]
+    known.add(client, 0, last.id.clock + last.length)
+    doc.store.skips.clients.get(client)?.getIds().forEach(range => known.delete(client, range.clock, range.len))
+    doc.store.causalHoles.clients.get(client)?.getIds().forEach(range => known.delete(client, range.clock, range.len))
+  })
+  structs.exclude(known)
   structs.clients.forEach(range => range.refs.forEach(struct => {
     if (struct.constructor === Item && /** @type {Item} */ (struct).content instanceof ContentDoc) {
       normalizeDocOptions(/** @type {ContentDoc} */ (/** @type {Item} */ (struct).content).opts)
@@ -609,16 +657,6 @@ const applyOrdinaryUpdate = (structDecoder, structs, doc, origin) => {
   }))
   return doc.transact(transaction => {
     transaction.local = false
-    const known = createIdSet()
-    structs.clients.forEach((_, client) => {
-      const stored = doc.store.clients.get(client)
-      if (stored === undefined) return
-      const last = stored[stored.length - 1]
-      known.add(client, 0, last.id.clock + last.length)
-      doc.store.skips.clients.get(client)?.getIds().forEach(range => known.delete(client, range.clock, range.len))
-      doc.store.causalHoles.clients.get(client)?.getIds().forEach(range => known.delete(client, range.clock, range.len))
-    })
-    structs.exclude(known)
     const rest = integrateOrdinaryStructs(transaction, doc.store, structs)
     const pending = readPendingStructs(doc.store)
     if (pending !== null && rest !== null) {
@@ -734,6 +772,12 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
       }
   /** @type {ReturnType<typeof scheduleStructs>} */
   let schedule = { ordered: [], rest: null }
+  /** @type {Map<Item,YType>} */
+  let preparedStringRootParents = new Map()
+  /** @type {Set<Item>} */
+  let requiredStringRootParents = new Set()
+  /** @type {Map<string,YType>} */
+  let stagedStringRoots = new Map()
   let stable = false
   let scheduledStructuralRevision = getStructuralRevision(store)
   let scheduledPendingRevision = ydoc.sparseExactResolution ? getPendingRevision(store) : 0
@@ -758,8 +802,23 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     }
     stable = prepareContentDocs(schedule.ordered, ydoc, preparedContentDocs, revisionsStable) && revisionsStable()
     if (stable) {
-      scheduledStructuralRevision = structuralRevision
-      scheduledPendingRevision = pendingRevision
+      let attemptStringRootParents
+      const attemptStagedStringRoots = new Map()
+      try {
+        attemptStringRootParents = prepareStringRootParents(schedule.ordered, ydoc, sparsePlan, attemptStagedStringRoots)
+        stable = revisionsStable()
+      } catch (failure) {
+        disposeUnintegratedContentDocs(preparedContentDocs)
+        preparedContentDocs.length = 0
+        throw failure
+      }
+      if (stable) {
+        preparedStringRootParents = attemptStringRootParents.resolved
+        requiredStringRootParents = attemptStringRootParents.required
+        stagedStringRoots = attemptStagedStringRoots
+        scheduledStructuralRevision = structuralRevision
+        scheduledPendingRevision = pendingRevision
+      }
     }
   }
   if (!stable) {
@@ -780,6 +839,15 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     ) {
       throw new Error('Integration schedule invalidated before commit')
     }
+    for (const item of requiredStringRootParents) {
+      if (!preparedStringRootParents.has(item)) {
+        throw new Error('Sparse root parent preparation is incomplete')
+      }
+    }
+    for (const key of stagedStringRoots.keys()) {
+      if (ydoc.share.has(key)) throw new Error('Staged sparse root was installed before commit')
+    }
+    stagedStringRoots.forEach((type, key) => installStagedDocRootType(ydoc, key, type))
     if (consumeSparsePending) {
       commitPendingStructs(store, null)
       commitPendingDs(store, null)
@@ -788,7 +856,7 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
       const clock = store.getClock(entry.struct.id.client)
       if (entry.gap > 0) new Skip(createID(entry.struct.id.client, clock), entry.gap).integrate(transaction, 0)
       if (entry.struct.constructor === Item || entry.struct.constructor === CausalHole) {
-        getMissing(/** @type {Item|CausalHole} */ (entry.struct), transaction, store, sparsePlan)
+        getMissing(/** @type {Item|CausalHole} */ (entry.struct), transaction, store, sparsePlan, preparedStringRootParents)
       }
       entry.struct.integrate(transaction, 0)
     }
@@ -1704,6 +1772,7 @@ const createSparseIntegrationPlan = (blockSet, store, doc, validation) => {
 
   return {
     getStructuralParentDependency: (/** @type {Item|CausalHole} */ struct) => validation.structuralParentDependencies.get(struct) ?? null,
+    getParentMetadata: (/** @type {Item} */ item) => validation.getParentMetadata(item),
     applySplits: () => {
       blockSet.clients.forEach(range => {
         for (let index = 0; index < range.refs.length; index++) {
@@ -2169,9 +2238,10 @@ export const encodeStateVector = doc => encodeStateVectorV2(doc, new IdSetEncode
  * @param {Transaction} transaction
  * @param {StructStore} store
  * @param {ReturnType<typeof createSparseIntegrationPlan>} sparsePlan
+ * @param {Map<Item,YType>|null} [preparedStringRootParents]
  * @return {null | number}
  */
-const getMissing = (struct, transaction, store, sparsePlan) => {
+const getMissing = (struct, transaction, store, sparsePlan, preparedStringRootParents = null) => {
   if (struct.constructor !== Item && struct.constructor !== CausalHole) return null
   // we may not access these variables anymore after they have been written!
   const origin = struct.origin
@@ -2216,7 +2286,15 @@ const getMissing = (struct, transaction, store, sparsePlan) => {
     item.parent = null
   } else if (originHole !== null || rightOriginHole !== null) {
     const hole = /** @type {CausalHole} */ (originHole ?? rightOriginHole)
-    item.parent = resolveCausalHoleParent(transaction, store, hole)
+    if (typeof hole.parent === 'string') {
+      if (preparedStringRootParents === null) {
+        item.parent = transaction.doc.get(hole.parent)
+      } else {
+        item.parent = /** @type {YType} */ (preparedStringRootParents.get(item))
+      }
+    } else {
+      item.parent = resolveCausalHoleParent(transaction, store, hole)
+    }
     item.parentSub = hole.parentSub
   } else if (parent == null) {
     // only set parent if this shouldn't be garbage collected
@@ -2238,7 +2316,11 @@ const getMissing = (struct, transaction, store, sparsePlan) => {
       item.parent = /** @type {ContentType} */ (/** @type {Item} */ (parentItem).content).type
     }
   } else if (typeof parent === 'string') {
-    item.parent = transaction.doc.get(parent)
+    if (preparedStringRootParents === null) {
+      item.parent = transaction.doc.get(parent)
+    } else {
+      item.parent = /** @type {YType} */ (preparedStringRootParents.get(item))
+    }
   }
   const bounds = sparsePlan?.getBounds(item, transaction) ?? null
   if (bounds !== null) {
