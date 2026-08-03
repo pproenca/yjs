@@ -20,7 +20,7 @@ import { CausalHole, sameCausalHoleMetadata } from '../src/structs/CausalHole.js
 import { normalizeDocOptions } from '../src/utils/Doc.js'
 import { readBlockSet, writeBlockSet } from '../src/utils/BlockSet.js'
 import { commitPendingDs, commitPendingStructs, getPendingRevision, readIndexedPendingStructs, readPendingStructs } from '../src/utils/StructStore.js'
-import { _testOnlyGetSparsePendingProofRuns, writeStateAsUpdate } from '../src/utils/encoding.js'
+import { _testOnlyGetSparseFailedPlanRuns, _testOnlyGetSparsePendingProofRuns, writeStateAsUpdate } from '../src/utils/encoding.js'
 import { writeStructsFromIdSetWithCausalHoles } from '../src/utils/encoding-helpers.js'
 import { UpdateDecoderV1, UpdateDecoderV2 } from '../src/utils/UpdateDecoder.js'
 
@@ -327,6 +327,80 @@ export const testSubdocSparseOptionsRejectBeforeMutation = () => {
         t.assert(restored.sparseExactResolution && restored.gc === false)
       })
     })
+  })
+}
+
+export const testSparseCompositeSubdocsMaterializeBeforeTargetMutation = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, event: 'update', apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate },
+    { Encoder: Y.UpdateEncoderV2, event: 'updateV2', apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2 }
+  ].forEach(({ Encoder, event, apply, encode }) => {
+    let constructions = 0
+    let failConstruction = true
+    class TargetDoc extends Y.Doc {
+      /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+      constructor (opts) {
+        super(opts)
+        if (opts?.guid === 'composite-subdoc') {
+          constructions++
+          if (failConstruction) throw new Error('subdoc construction failed')
+        }
+      }
+    }
+    const createPendingTarget = () => {
+      const target = new TargetDoc({ gc: false, sparseExactResolution: true })
+      apply(target, encodeStructs([
+        new Y.Item(
+          Y.createID(2, 0),
+          null,
+          Y.createID(1, 0),
+          null,
+          null,
+          'docs',
+          null,
+          new Y.ContentDoc('composite-subdoc', {})
+        )
+      ], Encoder))
+      t.assert(target.store.pendingStructs !== null && constructions === 0)
+      return target
+    }
+    const resolving = encodeCausalHoles([
+      new CausalHole(Y.createID(1, 0), 1, null, null, 'docs', null)
+    ], Encoder)
+
+    const failed = createPendingTarget()
+    const indexedPending = readIndexedPendingStructs(failed.store)
+    const pending = /** @type {NonNullable<typeof failed.store.pendingStructs>} */ (failed.store.pendingStructs)
+    const pendingBytes = Array.from(pending.update)
+    const state = Y.encodeStateVector(failed)
+    const snapshot = encode(failed)
+    let updatesV1 = 0
+    let updatesV2 = 0
+    let transactions = 0
+    let subdocs = 0
+    failed.on('update', () => { updatesV1++ })
+    failed.on('updateV2', () => { updatesV2++ })
+    failed.on('afterTransaction', () => { transactions++ })
+    failed.on('subdocs', () => { subdocs++ })
+    t.fails(() => apply(failed, resolving))
+    t.assert(constructions === 1)
+    t.assert(readIndexedPendingStructs(failed.store) === indexedPending)
+    t.compareArrays(Array.from(/** @type {NonNullable<typeof failed.store.pendingStructs>} */ (failed.store.pendingStructs).update), pendingBytes)
+    t.compareArrays(Array.from(Y.encodeStateVector(failed)), Array.from(state))
+    t.compareArrays(Array.from(encode(failed)), Array.from(snapshot))
+    t.assert(failed.store.clients.size === 0 && failed.share.size === 0 && failed.subdocs.size === 0)
+    t.assert(updatesV1 === 0 && updatesV2 === 0 && transactions === 0 && subdocs === 0, `${event} constructor failure is zero-event`)
+
+    failConstruction = false
+    apply(failed, resolving)
+    t.assert(constructions === 2 && failed.store.pendingStructs === null)
+    t.assert(/** @type {Y.Doc} */ (failed.get('docs').get(0)).guid === 'composite-subdoc')
+
+    constructions = 0
+    const successful = createPendingTarget()
+    apply(successful, resolving)
+    t.assert(constructions === 1 && successful.store.pendingStructs === null)
+    t.assert(/** @type {Y.Doc} */ (successful.get('docs').get(0)).guid === 'composite-subdoc')
   })
 }
 
@@ -899,6 +973,86 @@ export const testSparsePendingReplayFailureIsAtomic = () => {
   })
 }
 
+export const testSparseFailedCompositePlansCacheExactSemanticEnvelopes = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, apply }) => {
+    const target = new Y.Doc({ gc: false, sparseExactResolution: true })
+    apply(target, encodeStructs([
+      new Y.Item(Y.createID(3, 0), null, null, null, null, 'text', null, new Y.ContentString('c'))
+    ], Encoder))
+    apply(target, encodeStructs([
+      new Y.Item(Y.createID(2, 0), null, Y.createID(1, 0), null, Y.createID(3, 0), null, null, new Y.ContentString('b'))
+    ], Encoder))
+    const badHole = new CausalHole(Y.createID(1, 0), 1, null, null, 'other', null)
+    const bad = encodeCausalHoles([badHole], Encoder)
+    t.fails(() => apply(target, bad))
+    t.assert(_testOnlyGetSparseFailedPlanRuns(target) === 1)
+    t.fails(() => apply(target, bad))
+    t.assert(_testOnlyGetSparseFailedPlanRuns(target) === 1, `${Encoder.name} exact retry uses cache`)
+
+    const noisyBad = encodeStructGroups([
+      [new CausalHole(Y.createID(1, 0), 1, null, null, 'other', null)],
+      [new Y.Item(Y.createID(9, 0), null, null, null, null, 'unrelated', null, new Y.ContentString('noise'))]
+    ], Encoder)
+    t.fails(() => apply(target, noisyBad))
+    t.assert(_testOnlyGetSparseFailedPlanRuns(target) === 2, `${Encoder.name} distinct semantic envelope runs a fresh plan`)
+    t.assert(target.store.getStruct(Y.createID(9, 0)) === null)
+
+    const good = encodeCausalHoles([
+      new CausalHole(Y.createID(1, 0), 1, null, null, 'text', null)
+    ], Encoder)
+    apply(target, good)
+    t.assert(_testOnlyGetSparseFailedPlanRuns(target) === 3, `${Encoder.name} distinct resolver runs a fresh plan`)
+    t.assert(target.store.pendingStructs === null && target.get('text').toString() === 'bc')
+  })
+}
+
+export const testSparseFailedPlanDoesNotLatchSameResolverWithRelevantMaterial = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, apply }) => {
+    const target = new Y.Doc({ gc: false, sparseExactResolution: true })
+    apply(target, encodeStructs([
+      new Y.Item(Y.createID(2, 0), null, Y.createID(1, 0), null, null, null, null, new Y.ContentString('b'))
+    ], Encoder))
+    const resolver = new CausalHole(Y.createID(1, 0), 1, null, null, Y.createID(4, 0), null)
+    t.fails(() => apply(target, encodeCausalHoles([resolver], Encoder)))
+    t.assert(_testOnlyGetSparseFailedPlanRuns(target) === 1)
+
+    const resolverWithParent = encodeStructGroups([
+      [new CausalHole(Y.createID(1, 0), 1, null, null, Y.createID(4, 0), null)],
+      [new Y.Item(Y.createID(4, 0), null, null, null, null, 'root', null, new Y.ContentType(new Y.Type()))]
+    ], Encoder)
+    apply(target, resolverWithParent)
+    t.assert(_testOnlyGetSparseFailedPlanRuns(target) === 2)
+    t.assert(target.store.pendingStructs === null && target.store.getStruct(Y.createID(4, 0))?.constructor === Y.Item)
+  })
+}
+
+export const testSparseFailedPlanCacheIgnoresBulkContentSize = () => {
+  const target = new Y.Doc({ gc: false, sparseExactResolution: true })
+  Y.applyUpdateV2(target, encodeStructs([
+    new Y.Item(Y.createID(3, 0), null, null, null, null, 'text', null, new Y.ContentString('c'))
+  ], Y.UpdateEncoderV2))
+  Y.applyUpdateV2(target, encodeStructs([
+    new Y.Item(Y.createID(2, 0), null, Y.createID(1, 0), null, Y.createID(3, 0), null, null, new Y.ContentString('b'))
+  ], Y.UpdateEncoderV2))
+
+  ;[250_000, 1_000_000, 4_000_000, 16_000_000].forEach((size, index) => {
+    const update = encodeStructGroups([
+      [new CausalHole(Y.createID(1, 0), 1, null, null, 'other', null)],
+      [new Y.Item(Y.createID(9, 0), null, null, null, null, 'bulk', null, new Y.ContentString('x'.repeat(size)))]
+    ], Y.UpdateEncoderV2)
+    t.fails(() => Y.applyUpdateV2(target, update))
+    t.assert(_testOnlyGetSparseFailedPlanRuns(target) === index + 1)
+    t.fails(() => Y.applyUpdateV2(target, update))
+    t.assert(_testOnlyGetSparseFailedPlanRuns(target) === index + 1, `${size} byte exact semantic retry uses bounded plan cache`)
+  })
+}
+
 export const testOrdinaryPendingRetryIgnoresSkipAndUnrelatedMissingClients = () => {
   ;[
     { Encoder: Y.UpdateEncoderV1, event: 'update', apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate },
@@ -937,8 +1091,39 @@ export const testOrdinaryPendingRetryIgnoresSkipAndUnrelatedMissingClients = () 
     unrelated.clientID = 20_000
     unrelated.get('other').insert(0, 'z')
     apply(target, encode(unrelated))
-    t.assert(target.store.pendingStructs === retained && missingIterations === 0)
+    t.assert(target.store.pendingStructs === retained && missingIterations === 1)
     t.assert(target.get('other').toString() === 'z')
+  })
+}
+
+export const testOrdinaryPendingRetryWaitsForNextRemoteEnvelopeAfterLocalMaterialization = () => {
+  ;[
+    { event: 'update', apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate },
+    { event: 'updateV2', apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2 }
+  ].forEach(({ event, apply, encode }) => {
+    const source = new Y.Doc({ gc: false })
+    source.clientID = 75
+    /** @type {Array<Uint8Array<ArrayBuffer>>} */
+    const updates = []
+    source.on(/** @type {'update'|'updateV2'} */ (event), update => updates.push(update))
+    source.get('pending').insert(0, 'a')
+    source.get('pending').insert(1, 'b')
+
+    const target = new Y.Doc({ gc: false })
+    apply(target, updates[1])
+    target.clientID = 75
+    target.get('pending').insert(0, 'a')
+    t.assert(target.store.pendingStructs !== null && target.get('pending').toString() === 'a')
+
+    const remote = new Y.Doc({ gc: false })
+    remote.clientID = 76
+    remote.get('other').insert(0, 'x')
+    let events = 0
+    target.on(/** @type {'update'|'updateV2'} */ (event), () => { events++ })
+    apply(target, encode(remote))
+    t.assert(target.store.pendingStructs === null)
+    t.assert(target.get('pending').toString() === 'ab' && target.get('other').toString() === 'x')
+    t.assert(events === 1, `${event} retry coalesces into the remote transaction`)
   })
 }
 

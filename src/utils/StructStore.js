@@ -19,6 +19,48 @@ import { findIndexSS } from './transaction-helpers.js'
 /** @type {WeakMap<StructStore,PendingState>} */
 const pendingStates = new WeakMap()
 
+/** @type {WeakMap<StructStore,{pending:PendingStructs,resolved:boolean}>} */
+const ordinaryPendingStates = new WeakMap()
+
+/** @param {GC|Item|Skip|CausalHole} struct */
+const isOrdinaryPendingMaterial = struct => struct.constructor === GC || struct.isItem
+
+/**
+ * Ordinary stores retain their public upstream fields. Build the retry index only while an exact
+ * pending object is installed; local integration can then mark a dependency in constant time.
+ *
+ * @param {StructStore} store
+ */
+export const resyncOrdinaryPendingState = store => {
+  if (pendingStates.has(store)) return
+  const pending = /** @type {PendingStructs|null} */ (store.pendingStructs)
+  if (pending === null) {
+    ordinaryPendingStates.delete(store)
+    return
+  }
+  if (ordinaryPendingStates.get(store)?.pending === pending) return
+  let resolved = false
+  for (const [client, clock] of pending.missing) {
+    const struct = store.getStruct(createID(client, clock))
+    if (struct !== null && isOrdinaryPendingMaterial(struct)) {
+      resolved = true
+      break
+    }
+  }
+  ordinaryPendingStates.set(store, { pending, resolved })
+}
+
+/** @param {StructStore} store */
+export const hasOrdinaryPendingResolution = store => ordinaryPendingStates.get(store)?.resolved === true
+
+/** @param {StructStore} store @param {GC|Item|Skip|CausalHole} struct */
+const markOrdinaryPendingResolution = (store, struct) => {
+  const pending = ordinaryPendingStates.get(store)
+  if (pending === undefined || pending.resolved || !isOrdinaryPendingMaterial(struct)) return
+  const clock = pending.pending.missing.get(struct.id.client)
+  if (clock !== undefined && struct.id.clock <= clock && struct.id.clock + struct.length > clock) pending.resolved = true
+}
+
 /** @param {Uint8Array} left @param {Uint8Array} right */
 const equalPendingBytes = (left, right) => {
   if (left === right) return true
@@ -152,6 +194,7 @@ export const commitPendingStructs = (store, pending, index) => {
   const state = pendingStates.get(store)
   if (state === undefined) {
     store.pendingStructs = pending
+    resyncOrdinaryPendingState(store)
     return
   }
   if (equalPendingStructState(state.structs, pending)) return
@@ -270,11 +313,13 @@ export class StructStore {
       const lastStruct = structs[structs.length - 1]
       if (lastStruct.id.clock + lastStruct.length !== struct.id.clock) {
         this._replaceSparseRange(structs, struct)
+        markOrdinaryPendingResolution(this, struct)
         return
       }
     }
     structs.push(struct)
     if (struct.constructor === CausalHole) this._indexCausalHole(/** @type {CausalHole} */ (struct))
+    markOrdinaryPendingResolution(this, struct)
   }
 
   /**

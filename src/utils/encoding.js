@@ -20,7 +20,7 @@ import * as map from 'lib0/map'
 import * as math from 'lib0/math'
 import * as array from 'lib0/array'
 
-import { commitPendingDs, commitPendingStructs, getPendingRevision, getStateVector, readIndexedPendingDs, readIndexedPendingStructs, readPendingDs, readPendingStructs, StructStore } from './StructStore.js'
+import { commitPendingDs, commitPendingStructs, getPendingRevision, getStateVector, hasOrdinaryPendingResolution, readIndexedPendingDs, readIndexedPendingStructs, readPendingDs, readPendingStructs, resyncOrdinaryPendingState, StructStore } from './StructStore.js'
 import { findIndexSS, getItemCleanStart, getItemCleanEnd } from './transaction-helpers.js'
 import { createIdSet, IdRange, readAndApplyDeleteSet, readIdSet, mergeIdSets, writeIdSet } from './ids.js'
 import { compareIDs, createID, ID } from './ID.js'
@@ -295,49 +295,151 @@ const collectMissingDependencyCoverage = (missing, incoming, sparse) => {
   return coverage
 }
 
-/** @param {StructStore} store @param {Array<MissingDependencyCoverage>} coverage */
-const hasResolvedMissingDependency = (store, coverage) => coverage.some(({ client, clock, type }) =>
-  store.getStruct(createID(client, clock))?.constructor === type
+/**
+ * Failed sparse composite plans are deterministic for a settled authoritative generation, pending
+ * revision, and structural envelope. Content payload is deliberately absent because sparse planning
+ * observes only ranges, causal metadata, and whether content materializes a nested type.
+ *
+ * @typedef {{generation:number,pendingRevision:number,canonical:string,error:Error}} SparseFailedPlan
+ * @typedef {{entries:Array<SparseFailedPlan>}} SparseFailedPlanState
+ */
+
+/** @type {WeakMap<Doc,SparseFailedPlanState>} */
+const sparseFailedPlans = new WeakMap()
+/** @type {WeakMap<Doc,number>} */
+const sparseFailedPlanRuns = new WeakMap()
+const maxSparseFailedPlans = 16
+const maxCachedSparseEnvelopeCharacters = 4 * 1024
+
+/** @param {Doc} doc */
+export const _testOnlyGetSparseFailedPlanRuns = doc => sparseFailedPlanRuns.get(doc) ?? 0
+
+/** @param {ID|null} id */
+const semanticID = id => id === null ? null : [id.client, id.clock]
+
+/** @param {ID|string|import('../ytype.js').YType|null} parent */
+const semanticParent = parent => parent === null
+  ? null
+  : typeof parent === 'string'
+    ? ['root', parent]
+    : parent instanceof ID
+      ? ['id', parent.client, parent.clock]
+      : ['type']
+
+/** @param {BlockSet} blocks */
+const encodeSemanticEnvelope = blocks => JSON.stringify(
+  array.from(blocks.clients.entries())
+    .sort((left, right) => right[0] - left[0])
+    .map(([client, range]) => [client, range.refs.map(struct => {
+      if (struct.constructor === Skip) return ['skip', struct.id.clock, struct.length]
+      if (struct.constructor === GC) return ['gc', struct.id.clock, struct.length]
+      if (struct.constructor === CausalHole) {
+        const hole = /** @type {CausalHole} */ (struct)
+        return ['hole', hole.id.clock, hole.length, semanticID(hole.origin), semanticID(hole.rightOrigin), semanticParent(hole.parent), hole.parentSub]
+      }
+      const item = /** @type {Item} */ (struct)
+      return ['item', item.id.clock, item.length, semanticID(item.origin), semanticID(item.rightOrigin), semanticParent(item.parent), item.parentSub, item.content instanceof ContentType ? 'type' : 'value']
+    })])
 )
 
-/** @type {WeakSet<Doc>} */
-const sparseReplayPreflightDocs = new WeakSet()
+/** @param {Doc} doc */
+const getSparseFailureCoordinates = doc => ({
+  generation: getDocTransactionGeneration(doc).generation,
+  pendingRevision: getPendingRevision(doc.store)
+})
 
 /**
- * Resolve retained sparse transport on a scratch document before the target transaction begins.
- * A retained update can be valid while unresolved and invalid once its missing anchor materializes.
- *
  * @param {Doc} doc
- * @param {BlockSet} incoming
- * @param {IdSet} incomingDeletes
- * @param {Array<MissingDependencyCoverage>} coverage
+ * @param {string} canonical
  */
-const preflightSparsePendingReplay = (doc, incoming, incomingDeletes, coverage) => {
-  if (coverage.length === 0 || sparseReplayPreflightDocs.has(doc)) return
-  const pendingStructs = readIndexedPendingStructs(doc.store)
-  if (pendingStructs === null) return
-  const pendingDs = readIndexedPendingDs(doc.store)
-  const incomingEncoder = new UpdateEncoderV2()
-  writeBlockSet(incomingEncoder, incoming)
-  writeIdSet(incomingEncoder, incomingDeletes)
+const getCachedSparsePlanFailure = (doc, canonical) => {
+  const state = sparseFailedPlans.get(doc)
+  if (state === undefined) return null
+  const coordinates = getSparseFailureCoordinates(doc)
+  const semantic = canonical.length > maxCachedSparseEnvelopeCharacters
+    ? undefined
+    : state.entries.find(entry =>
+      entry.generation === coordinates.generation &&
+      entry.pendingRevision === coordinates.pendingRevision &&
+      entry.canonical === canonical
+    )
+  if (semantic === undefined) return null
+  return semantic.error
+}
 
-  const scratch = new Doc({ guid: doc.guid, gc: false, sparseExactResolution: true })
-  const occupied = new Set(doc.store.clients.keys())
-  pendingStructs.blocks.clients.forEach((_, client) => occupied.add(client))
-  incoming.clients.forEach((_, client) => occupied.add(client))
-  let scratchClientID = Number.MAX_SAFE_INTEGER
-  while (occupied.has(scratchClientID)) scratchClientID--
-  sparseReplayPreflightDocs.add(scratch)
-  try {
-    scratch.clientID = scratchClientID
-    applyUpdateV2(scratch, encodeAuthoritativeSparseState(doc))
-    applyUpdateV2(scratch, pendingStructs.update)
-    if (pendingDs !== null) applyUpdateV2(scratch, pendingDs.update)
-    applyUpdateV2(scratch, incomingEncoder.toUint8Array())
-  } finally {
-    sparseReplayPreflightDocs.delete(scratch)
-    scratch.destroy()
+/**
+ * @param {Doc} doc
+ * @param {string} canonical
+ * @param {unknown} failure
+ */
+const cacheSparsePlanFailure = (doc, canonical, failure) => {
+  const error = failure instanceof Error ? failure : new Error(String(failure))
+  const coordinates = getSparseFailureCoordinates(doc)
+  const entry = {
+    ...coordinates,
+    canonical,
+    error
   }
+  const state = sparseFailedPlans.get(doc) ?? { entries: [] }
+  if (canonical.length <= maxCachedSparseEnvelopeCharacters) {
+    state.entries.push(entry)
+    if (state.entries.length > maxSparseFailedPlans) state.entries.shift()
+    sparseFailedPlans.set(doc, state)
+  }
+  return error
+}
+
+/**
+ * Construct every decoded subdocument before target mutation. ContentDoc.integrate reuses `doc`.
+ *
+ * @param {BlockSet} blocks
+ * @param {Doc} target
+ * @param {boolean} materialize
+ */
+const prepareContentDocs = (blocks, target, materialize) => {
+  /** @type {Array<ContentDoc>} */
+  const contents = []
+  blocks.clients.forEach(range => range.refs.forEach(struct => {
+    if (struct.constructor !== Item || !(/** @type {Item} */ (struct).content instanceof ContentDoc)) return
+    const content = /** @type {ContentDoc} */ (/** @type {Item} */ (struct).content)
+    normalizeDocOptions(content.opts)
+    if (materialize && content.doc === null) contents.push(content)
+  }))
+  /** @type {Array<ContentDoc>} */
+  const created = []
+  try {
+    for (const content of contents) {
+      const opts = content.opts
+      content.doc = /** @type {Doc} */ (new /** @type {any} */ (target.constructor)({
+        guid: content.guid,
+        ...opts,
+        shouldLoad: opts.shouldLoad || opts.autoLoad || false
+      }))
+      created.push(content)
+    }
+  } catch (failure) {
+    const docs = created.map(content => content.doc)
+    created.forEach(content => { content.doc = null })
+    docs.forEach(doc => {
+      try {
+        doc?.destroy()
+      } catch (_) {}
+    })
+    throw failure
+  }
+  return created
+}
+
+/** @param {Array<ContentDoc>} contents */
+const disposeUnintegratedContentDocs = contents => {
+  const disposable = contents.filter(content => content.doc?._item === null)
+  const docs = disposable.map(content => content.doc)
+  disposable.forEach(content => { content.doc = null })
+  docs.forEach(doc => {
+    try {
+      doc?.destroy()
+    } catch (_) {}
+  })
 }
 
 /** @param {Transaction} transaction @param {StructStore} store @param {IdSet} deletes */
@@ -373,13 +475,8 @@ const hasMaterializedDeleteTarget = (transaction, store, deletes) => {
  * @function
  */
 export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = new UpdateDecoderV2(decoder)) => {
-  const ss = readBlockSet(structDecoder)
+  let ss = readBlockSet(structDecoder)
   const ranges = array.from(ss.clients.values())
-  ranges.forEach(range => range.refs.forEach(struct => {
-    if (struct.constructor === Item && /** @type {Item} */ (struct).content instanceof ContentDoc) {
-      normalizeDocOptions(/** @type {ContentDoc} */ (/** @type {Item} */ (struct).content).opts)
-    }
-  }))
   const hasIncomingHoles = ranges.some(range => range.refs.some(struct => struct.constructor === CausalHole))
   const hasIncomingGc = ranges.some(range => range.refs.some(struct => struct.constructor === GC))
   if (hasIncomingHoles && !ydoc.sparseExactResolution) {
@@ -389,7 +486,7 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     throw new Error('Sparse exact-resolution documents reject plain GC')
   }
   const store = ydoc.store
-  if (hasIncomingHoles) normalizeIncomingCausalHoles(ss, store)
+  if (!ydoc.sparseExactResolution) resyncOrdinaryPendingState(store)
   const hasSparseCausality = hasIncomingHoles || (!store.causalHoles.isEmpty() && ranges.some(range => range.refs.some(struct =>
     struct.constructor === Item && (
       (struct.origin !== null && store.causalHoles.hasId(struct.origin)) ||
@@ -400,19 +497,49 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
   // Sparse documents decode the complete envelope before opening a transaction. Besides validating
   // causal-hole updates, this keeps malformed ordinary Item updates from partially mutating them.
   const sparseDeleteSet = ydoc.sparseExactResolution || hasSparseCausality ? readIdSet(structDecoder) : null
-  const sparseValidation = validateCausalHoleEnvelope(ss, store)
-  const sparsePlan = sparseValidation === null ? null : createSparseIntegrationPlan(ss, store, ydoc, sparseValidation)
   const pendingBefore = readPendingStructs(store)
   const missingDependencyCoverage = pendingBefore === null
     ? []
     : collectMissingDependencyCoverage(pendingBefore.missing, ss, ydoc.sparseExactResolution)
-  if (ydoc.sparseExactResolution && sparseDeleteSet !== null) {
-    preflightSparsePendingReplay(ydoc, ss, sparseDeleteSet, missingDependencyCoverage)
+  let selectedDeleteSet = sparseDeleteSet
+  let consumeSparsePending = false
+  let sparsePlan = null
+  if (ydoc.sparseExactResolution && sparseDeleteSet !== null && pendingBefore !== null && missingDependencyCoverage.length > 0) {
+    const canonical = encodeSemanticEnvelope(ss)
+    const cachedFailure = getCachedSparsePlanFailure(ydoc, canonical)
+    if (cachedFailure !== null) throw cachedFailure
+    sparseFailedPlanRuns.set(ydoc, (sparseFailedPlanRuns.get(ydoc) ?? 0) + 1)
+    try {
+      const retained = indexPendingStructs(pendingBefore.update)
+      const deletes = [retained.deletes, sparseDeleteSet]
+      const pendingDeletes = readIndexedPendingDs(store)
+      if (pendingDeletes !== null) deletes.push(pendingDeletes.deletes)
+      retained.blocks.insertInto(ss)
+      ss = retained.blocks
+      selectedDeleteSet = mergeIdSets(deletes)
+      consumeSparsePending = true
+      if (array.from(ss.clients.values()).some(range => range.refs.some(struct => struct.constructor === CausalHole))) {
+        normalizeIncomingCausalHoles(ss, store)
+      }
+      const validation = validateCausalHoleEnvelope(ss, store)
+      sparsePlan = validation === null ? null : createSparseIntegrationPlan(ss, store, ydoc, validation)
+    } catch (failure) {
+      throw cacheSparsePlanFailure(ydoc, canonical, failure)
+    }
+  } else {
+    if (hasIncomingHoles) normalizeIncomingCausalHoles(ss, store)
+    const validation = validateCausalHoleEnvelope(ss, store)
+    sparsePlan = validation === null ? null : createSparseIntegrationPlan(ss, store, ydoc, validation)
   }
+  const preparedContentDocs = prepareContentDocs(ss, ydoc, consumeSparsePending)
 
-  return ydoc.transact(transaction => {
+  const apply = () => ydoc.transact(transaction => {
     // force that transaction.local is set to non-local
     transaction.local = false
+    if (consumeSparsePending) {
+      commitPendingStructs(store, null)
+      commitPendingDs(store, null)
+    }
     // let start = performance.now()
     sparsePlan?.applySplits(transaction)
     const knownState = createIdSet()
@@ -456,9 +583,9 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     }
     // console.log('time to integrate: ', performance.now() - start) // @todo remove
     // start = performance.now()
-    const dsRest = sparseDeleteSet === null
+    const dsRest = selectedDeleteSet === null
       ? readAndApplyDeleteSet(structDecoder, transaction, store)
-      : applyDecodedDeleteSet(sparseDeleteSet, transaction, store)
+      : applyDecodedDeleteSet(selectedDeleteSet, transaction, store)
     const pendingDs = readPendingDs(store)
     const pendingDeleteIndex = pendingDs === null
       ? null
@@ -488,12 +615,17 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     // console.log('time to resume delete readers: ', performance.now() - start) // @todo remove
     // start = performance.now()
     const retryPending = readPendingStructs(store)
-    if (retryPending !== null && hasResolvedMissingDependency(store, missingDependencyCoverage)) {
+    if (!ydoc.sparseExactResolution && retryPending !== null && hasOrdinaryPendingResolution(store)) {
       const update = retryPending.update
       commitPendingStructs(store, null)
       applyUpdateV2(transaction.doc, update)
     }
   }, transactionOrigin, false)
+  try {
+    return apply()
+  } finally {
+    disposeUnintegratedContentDocs(preparedContentDocs)
+  }
 }
 
 /**
