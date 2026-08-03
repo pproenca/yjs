@@ -16,13 +16,14 @@
 
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
+import * as map from 'lib0/map'
 import * as math from 'lib0/math'
 import * as array from 'lib0/array'
 
-import { commitPendingDs, commitPendingStructs, getPendingRevision, getStateVector, hasOrdinaryPendingResolution, readIndexedPendingDs, readIndexedPendingStructs, readPendingDs, readPendingStructs, resyncOrdinaryPendingState, StructStore } from './StructStore.js'
+import { capturePendingSnapshot, commitPendingDs, commitPendingStructs, getPendingRevision, getStateVector, hasOrdinaryPendingResolution, matchesPendingSnapshot, readIndexedPendingDs, readIndexedPendingStructs, readPendingDs, readPendingStructs, resyncOrdinaryPendingState, StructStore } from './StructStore.js'
 import { getStructuralRevision } from './structural-revision.js'
 import { findIndexSS, getItemCleanStart, getItemCleanEnd } from './transaction-helpers.js'
-import { createIdSet, IdRange, readAndApplyDeleteSet, readIdSet, mergeIdSets, writeIdSet } from './ids.js'
+import { createIdSet, equalIdSets, IdRange, readAndApplyDeleteSet, readIdSet, mergeIdSets, writeIdSet } from './ids.js'
 import { compareIDs, createID, ID } from './ID.js'
 import { UpdateDecoderV1, UpdateDecoderV2, IdSetDecoderV1 } from './UpdateDecoder.js'
 import { UpdateEncoderV1, UpdateEncoderV2, IdSetEncoderV1, IdSetEncoderV2 } from './UpdateEncoder.js'
@@ -66,6 +67,95 @@ export const writeClientsStructs = (encoder, store, _sm) => {
     const lastStruct = structs[structs.length - 1]
     writeStructs(encoder, structs, client, [new IdRange(clock, lastStruct.id.clock + lastStruct.length - clock)])
   })
+}
+
+/**
+ * Upstream one-pass integration for ordinary documents.
+ *
+ * @param {Transaction} transaction
+ * @param {StructStore} store
+ * @param {BlockSet} clientsStructRefs
+ * @return {null|{update:Uint8Array<ArrayBuffer>,missing:Map<number,number>}}
+ */
+const integrateOrdinaryStructs = (transaction, store, clientsStructRefs) => {
+  /** @type {Array<Item|GC|Skip|CausalHole>} */
+  const stack = []
+  let clientIds = array.from(clientsStructRefs.clients.keys()).sort((a, b) => a - b)
+  if (clientIds.length === 0) return null
+  const nextTarget = () => {
+    while (clientIds.length > 0) {
+      const target = /** @type {{i:number,refs:Array<GC|Item|Skip|CausalHole>}} */ (clientsStructRefs.clients.get(clientIds[clientIds.length - 1]))
+      if (target.i < target.refs.length) return target
+      clientIds.pop()
+    }
+    return null
+  }
+  let target = nextTarget()
+  if (target === null) return null
+  const rest = new StructStore()
+  const missing = new Map()
+  const state = new Map()
+  /** @type {GC|Item|Skip|CausalHole} */
+  let head = target.refs[target.i++]
+  /** @param {number} client @param {number} clock */
+  const recordMissing = (client, clock) => {
+    const current = missing.get(client)
+    if (current == null || current > clock) missing.set(client, clock)
+  }
+  const moveStackToRest = () => {
+    for (const struct of stack) {
+      const range = clientsStructRefs.clients.get(struct.id.client)
+      if (range !== undefined) {
+        range.i--
+        rest.clients.set(struct.id.client, /** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ (range.refs.slice(range.i))))
+        clientsStructRefs.clients.delete(struct.id.client)
+        range.i = 0
+        range.refs = []
+      } else {
+        rest.clients.set(struct.id.client, /** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ ([struct])))
+      }
+      clientIds = clientIds.filter(client => client !== struct.id.client)
+    }
+    stack.length = 0
+  }
+  while (true) {
+    if (head.constructor !== Skip) {
+      const localClock = map.setIfUndefined(state, head.id.client, () => store.getClock(head.id.client))
+      const offset = localClock - head.id.clock
+      const missingClient = head.constructor === Item || head.constructor === CausalHole
+        ? getMissing(/** @type {Item|CausalHole} */ (head), transaction, store, null)
+        : null
+      if (missingClient !== null) {
+        stack.push(head)
+        const range = clientsStructRefs.clients.get(missingClient) ?? { refs: [], i: 0 }
+        if (range.i === range.refs.length || missingClient === head.id.client || stack.some(struct => struct.id.client === missingClient)) {
+          recordMissing(missingClient, store.getClock(missingClient))
+          moveStackToRest()
+        } else {
+          head = range.refs[range.i++]
+          continue
+        }
+      } else {
+        if (offset < 0) new Skip(createID(head.id.client, localClock), -offset).integrate(transaction, 0)
+        head.integrate(transaction, 0)
+        state.set(head.id.client, math.max(head.id.clock + head.length, localClock))
+      }
+    }
+    if (stack.length > 0) {
+      head = /** @type {GC|Item|CausalHole} */ (stack.pop())
+    } else if (target.i < target.refs.length) {
+      head = target.refs[target.i++]
+    } else {
+      target = nextTarget()
+      if (target === null) break
+      head = target.refs[target.i++]
+    }
+  }
+  if (rest.clients.size === 0) return null
+  const encoder = new UpdateEncoderV2()
+  writeClientsStructs(encoder, rest, new Map())
+  encoding.writeVarUint(encoder.restEncoder, 0)
+  return { missing, update: encoder.toUint8Array() }
 }
 
 /**
@@ -439,14 +529,38 @@ const disposeUnintegratedContentDocs = contents => {
   })
 }
 
-/** @param {BlockSet} blocks @param {StructStore} store */
-const excludeKnownStructs = (blocks, store) => {
-  const filtered = new BlockSet()
-  blocks.clients.forEach((range, client) => {
-    filtered.clients.set(client, { i: range.i, refs: range.refs.slice(), startClock: range.startClock })
+/** @param {GC|Item|Skip|CausalHole} struct */
+const cloneWorkingStruct = struct => {
+  if (struct.constructor === Item) {
+    const item = /** @type {Item} */ (struct)
+    const clone = new Item(
+      item.id,
+      null,
+      item.origin,
+      null,
+      item.rightOrigin,
+      item.parent,
+      item.parentSub,
+      item.content instanceof ContentDoc ? item.content : item.content.copy()
+    )
+    if (item.deleted) clone.markDeleted()
+    clone.keep = item.keep
+    clone.redone = item.redone
+    return clone
+  }
+  if (struct.constructor === GC) return new GC(struct.id, struct.length)
+  if (struct.constructor === Skip) return new Skip(struct.id, struct.length)
+  return /** @type {CausalHole} */ (struct).slice(struct.id.clock, struct.length)
+}
+
+/** @param {BlockSet} canonical @param {StructStore} store */
+const createSparseWorkingSet = (canonical, store) => {
+  const working = new BlockSet()
+  canonical.clients.forEach((range, client) => {
+    working.clients.set(client, { i: 0, refs: range.refs.map(cloneWorkingStruct), startClock: range.startClock })
   })
   const known = createIdSet()
-  filtered.clients.forEach((_, client) => {
+  working.clients.forEach((_, client) => {
     const structs = store.clients.get(client)
     if (structs === undefined) return
     const last = structs[structs.length - 1]
@@ -454,8 +568,8 @@ const excludeKnownStructs = (blocks, store) => {
     store.skips.clients.get(client)?.getIds().forEach(range => known.delete(client, range.clock, range.len))
     store.causalHoles.clients.get(client)?.getIds().forEach(range => known.delete(client, range.clock, range.len))
   })
-  filtered.exclude(known)
-  return filtered
+  working.exclude(known)
+  return working
 }
 
 /** @param {Transaction} transaction @param {StructStore} store @param {IdSet} deletes */
@@ -476,6 +590,67 @@ const hasMaterializedDeleteTarget = (transaction, store, deletes) => {
     }
   })
   return found
+}
+
+/**
+ * Keep ordinary documents on the upstream one-pass path. Sparse planning must never become part of
+ * their hot loop or change constructor reentrancy.
+ *
+ * @param {UpdateDecoderV1|UpdateDecoderV2} structDecoder
+ * @param {BlockSet} structs
+ * @param {Doc} doc
+ * @param {any} origin
+ */
+const applyOrdinaryUpdate = (structDecoder, structs, doc, origin) => {
+  structs.clients.forEach(range => range.refs.forEach(struct => {
+    if (struct.constructor === Item && /** @type {Item} */ (struct).content instanceof ContentDoc) {
+      normalizeDocOptions(/** @type {ContentDoc} */ (/** @type {Item} */ (struct).content).opts)
+    }
+  }))
+  return doc.transact(transaction => {
+    transaction.local = false
+    const known = createIdSet()
+    structs.clients.forEach((_, client) => {
+      const stored = doc.store.clients.get(client)
+      if (stored === undefined) return
+      const last = stored[stored.length - 1]
+      known.add(client, 0, last.id.clock + last.length)
+      doc.store.skips.clients.get(client)?.getIds().forEach(range => known.delete(client, range.clock, range.len))
+      doc.store.causalHoles.clients.get(client)?.getIds().forEach(range => known.delete(client, range.clock, range.len))
+    })
+    structs.exclude(known)
+    const rest = integrateOrdinaryStructs(transaction, doc.store, structs)
+    const pending = readPendingStructs(doc.store)
+    if (pending !== null && rest !== null) {
+      const missing = new Map(pending.missing)
+      rest.missing.forEach((clock, client) => {
+        const current = missing.get(client)
+        if (current == null || current > clock) missing.set(client, clock)
+      })
+      commitPendingStructs(doc.store, { missing, update: mergeUpdatesV2([pending.update, rest.update]) })
+    } else if (pending === null) {
+      commitPendingStructs(doc.store, rest)
+    }
+    const dsRest = readAndApplyDeleteSet(structDecoder, transaction, doc.store)
+    const pendingDs = readPendingDs(doc.store)
+    const pendingDeleteIndex = pendingDs === null ? null : indexPendingDeletes(pendingDs.update)
+    if (dsRest !== null || pendingDeleteIndex !== null) {
+      const deleteRests = []
+      if (dsRest !== null) deleteRests.push(indexPendingDeletes(dsRest))
+      if (pendingDeleteIndex !== null) {
+        const next = applyDecodedDeleteSet(pendingDeleteIndex, transaction, doc.store)
+        if (next !== null) deleteRests.push(indexPendingDeletes(next))
+      }
+      const update = deleteRests.length === 0 ? null : encodePendingDeletes(mergeIdSets(deleteRests))
+      commitPendingDs(doc.store, update === null ? null : { update })
+    }
+    const retry = readPendingStructs(doc.store)
+    if (retry !== null && hasOrdinaryPendingResolution(doc.store)) {
+      const update = retry.update
+      commitPendingStructs(doc.store, null)
+      applyUpdateV2(transaction.doc, update)
+    }
+  }, origin, false)
 }
 
 /**
@@ -502,7 +677,10 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     throw new Error('Sparse exact-resolution documents reject plain GC')
   }
   const store = ydoc.store
-  if (!ydoc.sparseExactResolution) resyncOrdinaryPendingState(store)
+  if (!ydoc.sparseExactResolution) {
+    resyncOrdinaryPendingState(store)
+    return applyOrdinaryUpdate(structDecoder, ss, ydoc, transactionOrigin)
+  }
   const hasSparseCausality = hasIncomingHoles || (!store.causalHoles.isEmpty() && ranges.some(range => range.refs.some(struct =>
     struct.constructor === Item && (
       (struct.origin !== null && store.causalHoles.hasId(struct.origin)) ||
@@ -513,7 +691,8 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
   // Sparse documents decode the complete envelope before opening a transaction. Besides validating
   // causal-hole updates, this keeps malformed ordinary Item updates from partially mutating them.
   const sparseDeleteSet = ydoc.sparseExactResolution || hasSparseCausality ? readIdSet(structDecoder) : null
-  const pendingBefore = readPendingStructs(store)
+  const pendingSnapshot = capturePendingSnapshot(store)
+  const pendingBefore = pendingSnapshot.structs
   const missingDependencyCoverage = pendingBefore === null
     ? []
     : collectMissingDependencyCoverage(pendingBefore.missing, ss, ydoc.sparseExactResolution)
@@ -529,7 +708,7 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     try {
       const retained = indexPendingStructs(pendingBefore.update)
       const deletes = [retained.deletes, sparseDeleteSet]
-      const pendingDeletes = readIndexedPendingDs(store)
+      const pendingDeletes = pendingSnapshot.deletes
       if (pendingDeletes !== null) deletes.push(pendingDeletes.deletes)
       retained.blocks.insertInto(ss)
       ss = retained.blocks
@@ -546,6 +725,13 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
   }
   /** @type {Array<ContentDoc>} */
   const preparedContentDocs = []
+  const planningTransaction = ydoc._transaction
+  const transactionBaseline = planningTransaction === null
+    ? { inserts: createIdSet(), deletes: createIdSet() }
+    : {
+        inserts: mergeIdSets([planningTransaction.insertSet]),
+        deletes: mergeIdSets([planningTransaction.deleteSet])
+      }
   /** @type {ReturnType<typeof scheduleStructs>} */
   let schedule = { ordered: [], rest: null }
   let stable = false
@@ -553,18 +739,23 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
   let scheduledPendingRevision = ydoc.sparseExactResolution ? getPendingRevision(store) : 0
   for (let attempt = 0; attempt < 32 && !stable; attempt++) {
     const structuralRevision = getStructuralRevision(store)
-    const pendingRevision = ydoc.sparseExactResolution ? getPendingRevision(store) : 0
+    const pendingRevision = getPendingRevision(store)
     try {
-      const validation = validateCausalHoleEnvelope(ss, store)
-      sparsePlan = validation === null ? null : createSparseIntegrationPlan(ss, store, ydoc, validation)
+      const working = createSparseWorkingSet(ss, store)
+      const validation = validateCausalHoleEnvelope(working, store)
+      sparsePlan = validation === null ? null : createSparseIntegrationPlan(working, store, ydoc, validation)
       sparsePlan?.applySplits()
-      schedule = scheduleStructs(store, excludeKnownStructs(ss, store), sparsePlan)
+      schedule = scheduleStructs(store, working, sparsePlan)
     } catch (failure) {
       if (failureCanonical !== null) throw cacheSparsePlanFailure(ydoc, failureCanonical, failure)
       throw failure
     }
-    const revisionsStable = () => structuralRevision === getStructuralRevision(store) &&
-      pendingRevision === (ydoc.sparseExactResolution ? getPendingRevision(store) : 0)
+    const revisionsStable = () => {
+      if (!matchesPendingSnapshot(store, pendingSnapshot)) {
+        throw new Error('Pending state changed during sparse integration planning')
+      }
+      return structuralRevision === getStructuralRevision(store) && pendingRevision === getPendingRevision(store)
+    }
     stable = prepareContentDocs(schedule.ordered, ydoc, preparedContentDocs, revisionsStable) && revisionsStable()
     if (stable) {
       scheduledStructuralRevision = structuralRevision
@@ -580,8 +771,12 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     // force that transaction.local is set to non-local
     transaction.local = false
     if (
+      !matchesPendingSnapshot(store, pendingSnapshot) ||
       scheduledStructuralRevision !== getStructuralRevision(store) ||
-      scheduledPendingRevision !== (ydoc.sparseExactResolution ? getPendingRevision(store) : 0)
+      scheduledPendingRevision !== getPendingRevision(store) ||
+      (planningTransaction !== null && transaction !== planningTransaction) ||
+      !equalIdSets(transaction.insertSet, transactionBaseline.inserts) ||
+      !equalIdSets(transaction.deleteSet, transactionBaseline.deletes)
     ) {
       throw new Error('Integration schedule invalidated before commit')
     }
@@ -591,13 +786,9 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     }
     for (const entry of schedule.ordered) {
       const clock = store.getClock(entry.struct.id.client)
-      if (clock !== entry.clock) throw new Error('Integration schedule invalidated before commit')
       if (entry.gap > 0) new Skip(createID(entry.struct.id.client, clock), entry.gap).integrate(transaction, 0)
-      if (
-        (entry.struct.constructor === Item || entry.struct.constructor === CausalHole) &&
-        getMissing(/** @type {Item|CausalHole} */ (entry.struct), transaction, store, sparsePlan) !== null
-      ) {
-        throw new Error('Integration schedule has an unresolved dependency')
+      if (entry.struct.constructor === Item || entry.struct.constructor === CausalHole) {
+        getMissing(/** @type {Item|CausalHole} */ (entry.struct), transaction, store, sparsePlan)
       }
       entry.struct.integrate(transaction, 0)
     }

@@ -487,6 +487,203 @@ export const testSubdocRevisionRebuildPreservesSparseSplitPlan = () => {
   })
 }
 
+export const testSparseSubdocReentrancyPreservesNewPendingWork = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, apply }) => {
+    const nested = encodeStructs([
+      new Y.Item(Y.createID(71, 0), null, Y.createID(70, 0), null, null, 'nested', null, new Y.ContentString('n'))
+    ], Encoder)
+    const dependency = encodeStructs([
+      new Y.Item(Y.createID(70, 0), null, null, null, null, 'nested', null, new Y.ContentString('d'))
+    ], Encoder)
+    let host = /** @type {Y.Doc|null} */ (null)
+    let injectConstructor = true
+    class TargetDoc extends Y.Doc {
+      /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+      constructor (opts) {
+        super(opts)
+        if (opts?.guid === 'pending-from-constructor' && host !== null && injectConstructor) {
+          injectConstructor = false
+          apply(host, nested)
+        }
+      }
+    }
+    host = new TargetDoc({ gc: false, sparseExactResolution: true })
+    apply(host, encodeStructs([
+      new Y.Item(
+        Y.createID(2, 0),
+        null,
+        Y.createID(1, 0),
+        null,
+        null,
+        'docs',
+        null,
+        new Y.ContentDoc('pending-from-constructor', {})
+      )
+    ], Encoder))
+    const resolving = encodeCausalHoles([
+      new CausalHole(Y.createID(1, 0), 1, null, null, 'docs', null)
+    ], Encoder)
+    t.fails(() => apply(host, resolving))
+    t.assert(host.store.getStruct(Y.createID(1, 0)) === null && host.share.size === 0, `${Encoder.name} constructor epoch abort is atomic`)
+    t.assert(host.store.pendingStructs !== null, `${Encoder.name} constructor pending survives aborted commit`)
+    apply(host, resolving)
+    t.assert(host.store.pendingStructs !== null, `${Encoder.name} unresolved constructor work survives fresh retry`)
+    t.assert(/** @type {Y.Doc} */ (host.get('docs').get(0)).guid === 'pending-from-constructor')
+    apply(host, dependency)
+    t.assert(host.get('nested').toString() === 'dn' && host.store.pendingStructs === null)
+
+    const beforeTransaction = new Y.Doc({ gc: false, sparseExactResolution: true })
+    apply(beforeTransaction, encodeStructs([
+      new Y.Item(Y.createID(4, 0), null, Y.createID(3, 0), null, null, 'outer', null, new Y.ContentString('o'))
+    ], Encoder))
+    const nestedDelete = Y.createIdSet()
+    nestedDelete.add(90, 0, 1)
+    let inject = true
+    beforeTransaction.on('beforeTransaction', () => {
+      if (!inject) return
+      inject = false
+      apply(beforeTransaction, encodeStructs([
+        new Y.Item(Y.createID(81, 0), null, Y.createID(80, 0), null, null, 'hook', null, new Y.ContentString('h'))
+      ], Encoder))
+      apply(beforeTransaction, encodeDeleteSet(nestedDelete, Encoder))
+    })
+    const resolvesOuter = encodeCausalHoles([
+      new CausalHole(Y.createID(3, 0), 1, null, null, 'outer', null)
+    ], Encoder)
+    t.fails(() => apply(beforeTransaction, resolvesOuter))
+    t.assert(beforeTransaction.store.getStruct(Y.createID(3, 0)) === null && beforeTransaction.share.size === 0, `${Encoder.name} beforeTransaction epoch abort is atomic`)
+    t.assert(beforeTransaction.store.pendingStructs !== null, `${Encoder.name} beforeTransaction pending survives aborted commit`)
+    t.assert(beforeTransaction.store.pendingDs !== null, `${Encoder.name} beforeTransaction pending delete survives aborted commit`)
+    apply(beforeTransaction, resolvesOuter)
+    t.assert(beforeTransaction.get('outer').toString() === 'o', `${Encoder.name} fresh resolver retry succeeds`)
+    apply(beforeTransaction, encodeStructGroups([
+      [new Y.Item(Y.createID(90, 0), null, null, null, null, 'deleted', null, new Y.ContentString('x'))],
+      [new Y.Item(Y.createID(80, 0), null, null, null, null, 'hook', null, new Y.ContentString('d'))]
+    ], Encoder))
+    const deleted = beforeTransaction.store.getStruct(Y.createID(90, 0))
+    t.assert(beforeTransaction.get('hook').toString() === 'dh' && beforeTransaction.store.pendingStructs === null)
+    t.assert(deleted?.constructor === Y.Item && deleted.deleted && beforeTransaction.store.pendingDs === null)
+  })
+}
+
+export const testSubdocRevisionRebuildKeepsPartialKnownSuffix = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, apply }) => {
+    let host = /** @type {Y.Doc|null} */ (null)
+    class TargetDoc extends Y.Doc {
+      /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+      constructor (opts) {
+        super(opts)
+        if (opts?.guid === 'partial-known-rebuild') host?.get('constructor-root')
+      }
+    }
+    host = new TargetDoc({ gc: false, sparseExactResolution: true })
+    apply(host, encodeStructs([
+      new Y.Item(Y.createID(2, 0), null, null, null, null, 'text', null, new Y.ContentString('a'))
+    ], Encoder))
+    const update = encodeStructGroups([
+      [new Y.Item(Y.createID(60, 0), null, null, null, null, 'docs', null, new Y.ContentDoc('partial-known-rebuild', {}))],
+      [new Y.Item(Y.createID(2, 0), null, null, null, null, 'text', null, new Y.ContentString('ab'))]
+    ], Encoder)
+    const canonicalBytes = Array.from(update)
+    apply(host, update)
+
+    const suffix = host.store.getStruct(Y.createID(2, 1))
+    t.compareArrays(Array.from(update), canonicalBytes)
+    t.assert(host.get('text').toString() === 'ab', `${Encoder.name} valid partial-known suffix integrates`)
+    t.assert(
+      suffix?.constructor === Y.Item && suffix.id.clock <= 1 && suffix.id.clock + suffix.length >= 2,
+      `${Encoder.name} suffix remains materialized after transaction cleanup`
+    )
+    t.assert(/** @type {Y.Doc} */ (host.get('docs').get(0)).guid === 'partial-known-rebuild')
+    t.assert(host.store.pendingStructs === null && host.store.pendingDs === null)
+  })
+}
+
+export const testOrdinarySubdocConstructorReentrancyMatchesSequentialApply = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, event: 'updateV2' }
+  ].forEach(({ Encoder, apply, encode, event }) => {
+    const later = encodeStructs([
+      new Y.Item(Y.createID(10, 0), null, null, null, null, 'text', null, new Y.ContentString('x'))
+    ], Encoder)
+    const composite = encodeStructGroups([
+      [new Y.Item(Y.createID(30, 0), null, null, null, null, 'docs', null, new Y.ContentDoc('ordinary-reentrant', {}))],
+      [new Y.Item(Y.createID(10, 0), null, null, null, null, 'text', null, new Y.ContentString('x'))]
+    ], Encoder)
+    const expected = new Y.Doc({ gc: false })
+    apply(expected, later)
+    apply(expected, composite)
+
+    let host = /** @type {Y.Doc|null} */ (null)
+    class TargetDoc extends Y.Doc {
+      /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+      constructor (opts) {
+        super(opts)
+        if (opts?.guid === 'ordinary-reentrant' && host !== null) apply(host, later)
+      }
+    }
+    host = new TargetDoc({ gc: false })
+    /** @type {Array<Array<number>>} */
+    const actualEvents = []
+    let transactions = 0
+    host.on(/** @type {'update'|'updateV2'} */ (event), update => actualEvents.push(Array.from(update)))
+    host.on('afterTransaction', () => { transactions++ })
+    apply(host, composite)
+
+    t.compareArrays(Array.from(encode(host)), Array.from(encode(expected)), `${Encoder.name} ordinary bytes`)
+    t.compareArrays(Array.from(Y.encodeStateVector(host)), Array.from(Y.encodeStateVector(expected)), `${Encoder.name} ordinary state`)
+    t.assert(actualEvents.length === 1, `${Encoder.name} reentrant apply remains in the outer transaction`)
+    t.compareArrays(actualEvents[0], Array.from(composite), `${Encoder.name} outer event retains upstream bytes`)
+    t.assert(transactions === 1 && host.get('text').toString() === 'xx', `${Encoder.name} ordinary linked state matches upstream reentrancy`)
+    t.assert(/** @type {Y.Doc} */ (host.get('docs').get(0)).guid === 'ordinary-reentrant')
+    t.assert(host.store.pendingStructs === null && host.store.pendingDs === null)
+  })
+}
+
+export const testOrdinaryLargeApplyBypassesSparseSchedule = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, apply }) => {
+    const clients = 512
+    const update = encodeStructGroups(Array.from({ length: clients }, (_, index) => [
+      new Y.Item(Y.createID(1000 + index, 0), null, null, null, null, `root-${index}`, null, new Y.ContentString('x'))
+    ]), Encoder)
+    const originalPush = Array.prototype.push
+    let sparseScheduleEntries = 0
+    /** @this {Array<unknown>} @param {...unknown} values */
+    const countedPush = function (...values) {
+      values.forEach(value => {
+        if (
+          value !== null && typeof value === 'object' &&
+          Object.prototype.hasOwnProperty.call(value, 'struct') &&
+          Object.prototype.hasOwnProperty.call(value, 'clock') &&
+          Object.prototype.hasOwnProperty.call(value, 'gap')
+        ) sparseScheduleEntries++
+      })
+      return Reflect.apply(originalPush, this, values)
+    }
+    // eslint-disable-next-line no-extend-native
+    Array.prototype.push = /** @type {typeof Array.prototype.push} */ (countedPush)
+    const ordinary = new Y.Doc({ gc: false })
+    try {
+      apply(ordinary, update)
+    } finally {
+      // eslint-disable-next-line no-extend-native
+      Array.prototype.push = originalPush
+    }
+    t.assert(sparseScheduleEntries === 0, `${Encoder.name} ordinary apply never builds sparse schedule (${sparseScheduleEntries})`)
+    t.assert(ordinary.store.clients.size === clients && ordinary.store.pendingStructs === null)
+  })
+}
+
 export const testSparsePendingStateSerializesWithDocumentContext = () => {
   ;[
     {

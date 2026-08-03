@@ -60,7 +60,7 @@ export const findIndexCleanStart = (transaction, structs, clock) => {
   const struct = structs[index]
   if (struct.id.clock < clock) {
     structs.splice(index + 1, 0, splitStruct(transaction, struct, clock - struct.id.clock))
-    if (transaction !== null) markStructuralChange(transaction.doc.store)
+    if (transaction?.doc.sparseExactResolution) markStructuralChange(transaction.doc.store)
     return index + 1
   }
   return index
@@ -98,7 +98,7 @@ export const getItemCleanEnd = (transaction, store, id) => {
   const struct = structs[index]
   if (id.clock !== struct.id.clock + struct.length - 1 && struct.isItem) {
     structs.splice(index + 1, 0, /** @type {Item} */ (struct).split(transaction, id.clock - struct.id.clock + 1))
-    markStructuralChange(transaction.doc.store)
+    if (transaction.doc.sparseExactResolution) markStructuralChange(transaction.doc.store)
   }
   return /** @type {Item} */ (struct)
 }
@@ -115,7 +115,7 @@ export const getItemCleanEnd = (transaction, store, id) => {
 export const replaceStruct = (tr, struct, newStruct) => {
   const structs = /** @type {Array<GC|Item>} */ (tr.doc.store.clients.get(struct.id.client))
   structs[findIndexSS(structs, struct.id.clock)] = newStruct
-  markStructuralChange(tr.doc.store)
+  if (tr.doc.sparseExactResolution) markStructuralChange(tr.doc.store)
   tr._mergeStructs.push(newStruct)
 }
 

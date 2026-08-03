@@ -14,7 +14,8 @@ import { initializeStructuralRevision, markStructuralChange } from './structural
  * @typedef {PendingStructs & {blocks:BlockSet,deletes:IdSet,sensitive:IdSet}} IndexedPendingStructs
  * @typedef {{update:Uint8Array<ArrayBuffer>}} PendingDeletes
  * @typedef {PendingDeletes & {deletes:IdSet}} IndexedPendingDeletes
- * @typedef {{structs:IndexedPendingStructs|null,deletes:IndexedPendingDeletes|null,revision:number,batchDepth:number,batchBase:{structs:IndexedPendingStructs|null,deletes:IndexedPendingDeletes|null}|null}} PendingState
+ * @typedef {{structs:IndexedPendingStructs|null,deletes:IndexedPendingDeletes|null,revision:number,mutationEpoch:number,batchDepth:number,batchBase:{structs:IndexedPendingStructs|null,deletes:IndexedPendingDeletes|null}|null}} PendingState
+ * @typedef {{structs:IndexedPendingStructs|null,deletes:IndexedPendingDeletes|null,mutationEpoch:number}} PendingSnapshot
  */
 
 /** @type {WeakMap<StructStore,PendingState>} */
@@ -107,6 +108,18 @@ const equalPendingDeleteState = (left, right) => left === null || right === null
 
 /** @param {StructStore} store */
 export const getPendingRevision = store => getPendingState(store).revision
+
+/** @param {StructStore} store @returns {PendingSnapshot} */
+export const capturePendingSnapshot = store => {
+  const state = getPendingState(store)
+  return { structs: state.structs, deletes: state.deletes, mutationEpoch: state.mutationEpoch }
+}
+
+/** @param {StructStore} store @param {PendingSnapshot} snapshot */
+export const matchesPendingSnapshot = (store, snapshot) => {
+  const state = getPendingState(store)
+  return state.mutationEpoch === snapshot.mutationEpoch && state.structs === snapshot.structs && state.deletes === snapshot.deletes
+}
 
 /** @param {StructStore} store @returns {PendingStructs|null} */
 export const readPendingStructs = store => {
@@ -216,6 +229,7 @@ export const commitPendingStructs = (store, pending, index) => {
       sensitive: createPendingSensitivity(pending.missing, indexed.blocks, indexed.deletes)
     }
   }
+  state.mutationEpoch++
   if (state.batchDepth === 0) state.revision++
 }
 
@@ -238,6 +252,7 @@ export const commitPendingDs = (store, pending, index) => {
     const update = pending.update.slice()
     state.deletes = { update, deletes: index(update) }
   }
+  state.mutationEpoch++
   if (state.batchDepth === 0) state.revision++
 }
 
@@ -272,7 +287,7 @@ export class StructStore {
     this.pendingDs = null
     if (indexedPending) {
       /** @type {PendingState} */
-      const state = { structs: null, deletes: null, revision: 0, batchDepth: 0, batchBase: null }
+      const state = { structs: null, deletes: null, revision: 0, mutationEpoch: 0, batchDepth: 0, batchBase: null }
       pendingStates.set(this, state)
       initializeStructuralRevision(this)
       Object.defineProperties(this, {
@@ -317,6 +332,18 @@ export class StructStore {
     } else {
       const lastStruct = structs[structs.length - 1]
       if (lastStruct.id.clock + lastStruct.length !== struct.id.clock) {
+        if (!pendingStates.has(this)) {
+          let index = findIndexSS(/** @type {Array<GC|Item|Skip>} */ (/** @type {unknown} */ (structs)), struct.id.clock)
+          const skipped = structs[index]
+          const before = struct.id.clock - skipped.id.clock
+          const after = skipped.id.clock + skipped.length - struct.id.clock - struct.length
+          if (before > 0) structs.splice(index++, 0, new Skip(createID(struct.id.client, skipped.id.clock), before))
+          if (after > 0) structs.splice(index + 1, 0, new Skip(createID(struct.id.client, struct.id.clock + struct.length), after))
+          structs[index] = struct
+          this.skips.delete(struct.id.client, struct.id.clock, struct.length)
+          markOrdinaryPendingResolution(this, struct)
+          return
+        }
         const replaced = this._replaceSparseRange(structs, struct)
         if (replaced) markStructuralChange(this)
         markOrdinaryPendingResolution(this, struct)
@@ -325,7 +352,7 @@ export class StructStore {
     }
     structs.push(struct)
     if (struct.constructor === CausalHole) this._indexCausalHole(/** @type {CausalHole} */ (struct))
-    markStructuralChange(this)
+    if (struct.constructor === Skip || struct.constructor === CausalHole) markStructuralChange(this)
     markOrdinaryPendingResolution(this, struct)
   }
 

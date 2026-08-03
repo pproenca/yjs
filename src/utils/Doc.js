@@ -4,6 +4,7 @@
 
 import { ObservableV2 } from 'lib0/observable'
 import * as random from 'lib0/random'
+import * as map from 'lib0/map'
 import * as array from 'lib0/array'
 import * as promise from 'lib0/promise'
 
@@ -164,7 +165,7 @@ export class Doc extends ObservableV2 {
         ) {
           transactionGeneration.generation++
         }
-        if (transaction.deleteSet.clients.size > 0) markStructuralChange(this.store)
+        if (this.sparseExactResolution && (!transaction.insertSet.isEmpty() || !transaction.deleteSet.isEmpty())) markStructuralChange(this.store)
       })
       this.on('afterTransactionCleanup', transaction => {
         transactionGeneration.pendingTransactions--
@@ -281,12 +282,14 @@ export class Doc extends ObservableV2 {
    * @return {YType}
    */
   get (key = '', name = null) {
-    const existing = this.share.get(key)
-    if (existing !== undefined) return existing
-    const type = new YType(name)
-    type._integrate(this, null)
-    this.share.set(key, type)
-    markStructuralChange(this.store)
+    let created = false
+    const type = map.setIfUndefined(this.share, key, () => {
+      created = true
+      const type = new YType(name)
+      type._integrate(this, null)
+      return type
+    })
+    if (created && this.sparseExactResolution) markStructuralChange(this.store)
     return type
   }
 
