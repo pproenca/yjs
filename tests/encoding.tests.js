@@ -813,29 +813,133 @@ export const testSparsePendingProofInvalidatesOnlyForDependencies = () => {
 }
 
 export const testPendingStructsRetryForGcAndCausalHoleCoverage = () => {
-  const source = new Y.Doc({ gc: false })
-  source.clientID = 73
-  /** @type {Array<Uint8Array<ArrayBuffer>>} */
-  const updates = []
-  source.on('updateV2', update => updates.push(update))
-  source.get('pending').insert(0, 'a')
-  source.get('pending').insert(1, 'b')
+  ;[
+    { Encoder: Y.UpdateEncoderV1, event: 'update', apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, event: 'updateV2', apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, event, apply }) => {
+    const source = new Y.Doc({ gc: false })
+    source.clientID = 73
+    /** @type {Array<Uint8Array<ArrayBuffer>>} */
+    const updates = []
+    source.on(/** @type {'update'|'updateV2'} */ (event), update => updates.push(update))
+    source.get('pending').insert(0, 'a')
+    source.get('pending').insert(1, 'b')
 
-  const ordinary = new Y.Doc({ gc: false })
-  Y.applyUpdateV2(ordinary, updates[1])
-  t.assert(ordinary.store.pendingStructs !== null)
-  Y.applyUpdateV2(ordinary, encodeStructs([new Y.GC(Y.createID(73, 0), 1)], Y.UpdateEncoderV2))
-  t.assert(ordinary.store.pendingStructs === null)
-  Y.encodeStateAsUpdateV2(ordinary)
+    const item = new Y.Doc({ gc: false })
+    apply(item, updates[1])
+    t.assert(item.store.pendingStructs !== null)
+    apply(item, updates[0])
+    t.assert(item.store.pendingStructs === null && item.get('pending').toString() === 'ab')
 
-  const sparse = new Y.Doc({ gc: false, sparseExactResolution: true })
-  Y.applyUpdateV2(sparse, updates[1])
-  t.assert(sparse.store.pendingStructs !== null)
-  Y.applyUpdateV2(sparse, encodeCausalHoles([
-    new CausalHole(Y.createID(73, 0), 1, null, null, 'pending', null)
-  ], Y.UpdateEncoderV2))
-  t.assert(sparse.store.pendingStructs === null && sparse.get('pending').toString() === 'b')
-  Y.encodeStateAsUpdateV2(sparse)
+    const ordinary = new Y.Doc({ gc: false })
+    apply(ordinary, updates[1])
+    t.assert(ordinary.store.pendingStructs !== null)
+    apply(ordinary, encodeStructs([new Y.GC(Y.createID(73, 0), 1)], Encoder))
+    t.assert(ordinary.store.pendingStructs === null)
+
+    const sparse = new Y.Doc({ gc: false, sparseExactResolution: true })
+    apply(sparse, updates[1])
+    t.assert(sparse.store.pendingStructs !== null)
+    apply(sparse, encodeCausalHoles([
+      new CausalHole(Y.createID(73, 0), 1, null, null, 'pending', null)
+    ], Encoder))
+    t.assert(sparse.store.pendingStructs === null && sparse.get('pending').toString() === 'b')
+  })
+}
+
+export const testSparsePendingReplayFailureIsAtomic = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, event: 'update', apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate },
+    { Encoder: Y.UpdateEncoderV2, event: 'updateV2', apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2 }
+  ].forEach(({ Encoder, event, apply, encode }) => {
+    const target = new Y.Doc({ gc: false, sparseExactResolution: true })
+    const dependent = encodeStructs([
+      new Y.Item(
+        Y.createID(2, 0),
+        null,
+        Y.createID(1, 0),
+        null,
+        Y.createID(1, 0),
+        'text',
+        null,
+        new Y.ContentString('b')
+      )
+    ], Encoder)
+    apply(target, dependent)
+    const pendingDeleteSet = Y.createIdSet()
+    pendingDeleteSet.add(9, 0, 1)
+    apply(target, encodeDeleteSet(pendingDeleteSet, Encoder))
+    const pending = /** @type {NonNullable<typeof target.store.pendingStructs>} */ (target.store.pendingStructs)
+    const pendingDeletes = /** @type {Uint8Array<ArrayBuffer>} */ (target.store.pendingDs)
+    const pendingBytes = Array.from(pending.update)
+    const pendingDeleteBytes = Array.from(pendingDeletes)
+    const pendingMissing = Array.from(pending.missing.entries())
+    const state = Y.encodeStateVector(target)
+    const snapshot = encode(target)
+    let updateEvents = 0
+    let transactions = 0
+    target.on(/** @type {'update'|'updateV2'} */ (event), () => { updateEvents++ })
+    target.on('afterTransaction', () => { transactions++ })
+
+    const resolvingHole = encodeCausalHoles([
+      new CausalHole(Y.createID(1, 0), 1, null, null, 'text', null)
+    ], Encoder)
+    t.fails(() => apply(target, resolvingHole))
+
+    const retained = /** @type {NonNullable<typeof target.store.pendingStructs>} */ (target.store.pendingStructs)
+    const retainedDeletes = /** @type {Uint8Array<ArrayBuffer>} */ (target.store.pendingDs)
+    t.compareArrays(Array.from(retained.update), pendingBytes, `${Encoder.name} pending bytes`)
+    t.compareArrays(Array.from(retainedDeletes), pendingDeleteBytes, `${Encoder.name} pending delete bytes`)
+    t.assert(JSON.stringify(Array.from(retained.missing.entries())) === JSON.stringify(pendingMissing))
+    t.compareArrays(Array.from(Y.encodeStateVector(target)), Array.from(state), `${Encoder.name} state vector`)
+    t.compareArrays(Array.from(encode(target)), Array.from(snapshot), `${Encoder.name} snapshot`)
+    t.assert(target.store.getStruct(Y.createID(1, 0)) === null)
+    t.assert(target.store.causalHoles.isEmpty() && target.get('text').toString() === '')
+    t.assert(updateEvents === 0 && transactions === 0, `${Encoder.name} emits no target events`)
+  })
+}
+
+export const testOrdinaryPendingRetryIgnoresSkipAndUnrelatedMissingClients = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, event: 'update', apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate },
+    { Encoder: Y.UpdateEncoderV2, event: 'updateV2', apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2 }
+  ].forEach(({ Encoder, event, apply, encode }) => {
+    const source = new Y.Doc({ gc: false })
+    source.clientID = 74
+    /** @type {Array<Uint8Array<ArrayBuffer>>} */
+    const updates = []
+    source.on(/** @type {'update'|'updateV2'} */ (event), update => updates.push(update))
+    source.get('pending').insert(0, 'a')
+    source.get('pending').insert(1, 'x'.repeat(2_000_000))
+
+    const target = new Y.Doc({ gc: false })
+    apply(target, updates[1])
+    const pending = /** @type {NonNullable<typeof target.store.pendingStructs>} */ (target.store.pendingStructs)
+    const pendingBytes = Array.from(pending.update)
+    const pendingMissing = Array.from(pending.missing.entries())
+    apply(target, encodeStructs([new Y.Skip(Y.createID(74, 0), 1)], Encoder))
+    t.assert(target.store.pendingStructs === pending, `${Encoder.name} Skip retains pending identity`)
+    t.compareArrays(Array.from(pending.update), pendingBytes, `${Encoder.name} Skip retains pending bytes`)
+    t.assert(JSON.stringify(Array.from(pending.missing.entries())) === JSON.stringify(pendingMissing))
+
+    const missing = new Map()
+    for (let client = 1_000; client < 11_000; client++) missing.set(client, 0)
+    let missingIterations = 0
+    Object.defineProperty(missing, Symbol.iterator, {
+      value: () => {
+        missingIterations++
+        return Map.prototype[Symbol.iterator].call(missing)
+      }
+    })
+    const retained = { missing, update: Y.encodeStateAsUpdateV2(new Y.Doc()) }
+    target.store.pendingStructs = retained
+    const unrelated = new Y.Doc({ gc: false })
+    unrelated.clientID = 20_000
+    unrelated.get('other').insert(0, 'z')
+    apply(target, encode(unrelated))
+    t.assert(target.store.pendingStructs === retained && missingIterations === 0)
+    t.assert(target.get('other').toString() === 'z')
+  })
 }
 
 export const testLargePendingTransportIgnoresEmptyTransactions = () => {

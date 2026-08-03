@@ -262,27 +262,82 @@ const indexPendingDeletes = update => {
 }
 
 /**
- * @param {Transaction} transaction
- * @param {StructStore} store
+ * @typedef {{client:number,clock:number,type:typeof Item|typeof GC|typeof CausalHole}} MissingDependencyCoverage
+ */
+
+/**
+ * Find only missing clocks covered by material structs in this envelope. Driving the lookup from
+ * incoming refs avoids scanning all retained missing clients and prevents Skip from causing retry.
+ *
  * @param {Map<number,number>} missing
  * @param {BlockSet} incoming
  * @param {boolean} sparse
+ * @return {Array<MissingDependencyCoverage>}
  */
-const hasResolvedMissingDependency = (transaction, store, missing, incoming, sparse) => {
-  for (const [client, clock] of missing) {
-    if (!sparse && (incoming.clients.has(client) || clock < store.getClock(client))) return true
-    const resolved = store.getStruct(createID(client, clock))
-    if (transaction.insertSet.has(client, clock) && resolved?.constructor === Item) return true
-    if (
-      sparse && resolved?.constructor === CausalHole &&
-      incoming.clients.get(client)?.refs.some(struct =>
-        struct.constructor === CausalHole && struct.id.clock <= clock && struct.id.clock + struct.length > clock
+const collectMissingDependencyCoverage = (missing, incoming, sparse) => {
+  /** @type {Array<MissingDependencyCoverage>} */
+  const coverage = []
+  incoming.clients.forEach((range, client) => {
+    const clock = missing.get(client)
+    if (clock === undefined) return
+    const struct = range.refs.find(struct =>
+      struct.id.clock <= clock && struct.id.clock + struct.length > clock && (
+        struct.constructor === Item ||
+        (!sparse && struct.constructor === GC) ||
+        (sparse && struct.constructor === CausalHole)
       )
-    ) {
-      return true
+    )
+    if (struct !== undefined) {
+      const type = struct.constructor === Item ? Item : struct.constructor === GC ? GC : CausalHole
+      coverage.push({ client, clock, type })
     }
+  })
+  return coverage
+}
+
+/** @param {StructStore} store @param {Array<MissingDependencyCoverage>} coverage */
+const hasResolvedMissingDependency = (store, coverage) => coverage.some(({ client, clock, type }) =>
+  store.getStruct(createID(client, clock))?.constructor === type
+)
+
+/** @type {WeakSet<Doc>} */
+const sparseReplayPreflightDocs = new WeakSet()
+
+/**
+ * Resolve retained sparse transport on a scratch document before the target transaction begins.
+ * A retained update can be valid while unresolved and invalid once its missing anchor materializes.
+ *
+ * @param {Doc} doc
+ * @param {BlockSet} incoming
+ * @param {IdSet} incomingDeletes
+ * @param {Array<MissingDependencyCoverage>} coverage
+ */
+const preflightSparsePendingReplay = (doc, incoming, incomingDeletes, coverage) => {
+  if (coverage.length === 0 || sparseReplayPreflightDocs.has(doc)) return
+  const pendingStructs = readIndexedPendingStructs(doc.store)
+  if (pendingStructs === null) return
+  const pendingDs = readIndexedPendingDs(doc.store)
+  const incomingEncoder = new UpdateEncoderV2()
+  writeBlockSet(incomingEncoder, incoming)
+  writeIdSet(incomingEncoder, incomingDeletes)
+
+  const scratch = new Doc({ guid: doc.guid, gc: false, sparseExactResolution: true })
+  const occupied = new Set(doc.store.clients.keys())
+  pendingStructs.blocks.clients.forEach((_, client) => occupied.add(client))
+  incoming.clients.forEach((_, client) => occupied.add(client))
+  let scratchClientID = Number.MAX_SAFE_INTEGER
+  while (occupied.has(scratchClientID)) scratchClientID--
+  sparseReplayPreflightDocs.add(scratch)
+  try {
+    scratch.clientID = scratchClientID
+    applyUpdateV2(scratch, encodeAuthoritativeSparseState(doc))
+    applyUpdateV2(scratch, pendingStructs.update)
+    if (pendingDs !== null) applyUpdateV2(scratch, pendingDs.update)
+    applyUpdateV2(scratch, incomingEncoder.toUint8Array())
+  } finally {
+    sparseReplayPreflightDocs.delete(scratch)
+    scratch.destroy()
   }
-  return false
 }
 
 /** @param {Transaction} transaction @param {StructStore} store @param {IdSet} deletes */
@@ -347,6 +402,13 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
   const sparseDeleteSet = ydoc.sparseExactResolution || hasSparseCausality ? readIdSet(structDecoder) : null
   const sparseValidation = validateCausalHoleEnvelope(ss, store)
   const sparsePlan = sparseValidation === null ? null : createSparseIntegrationPlan(ss, store, ydoc, sparseValidation)
+  const pendingBefore = readPendingStructs(store)
+  const missingDependencyCoverage = pendingBefore === null
+    ? []
+    : collectMissingDependencyCoverage(pendingBefore.missing, ss, ydoc.sparseExactResolution)
+  if (ydoc.sparseExactResolution && sparseDeleteSet !== null) {
+    preflightSparsePendingReplay(ydoc, ss, sparseDeleteSet, missingDependencyCoverage)
+  }
 
   return ydoc.transact(transaction => {
     // force that transaction.local is set to non-local
@@ -426,7 +488,7 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     // console.log('time to resume delete readers: ', performance.now() - start) // @todo remove
     // start = performance.now()
     const retryPending = readPendingStructs(store)
-    if (retryPending !== null && hasResolvedMissingDependency(transaction, store, retryPending.missing, ss, ydoc.sparseExactResolution)) {
+    if (retryPending !== null && hasResolvedMissingDependency(store, missingDependencyCoverage)) {
       const update = retryPending.update
       commitPendingStructs(store, null)
       applyUpdateV2(transaction.doc, update)
