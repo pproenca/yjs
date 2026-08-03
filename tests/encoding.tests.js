@@ -19,7 +19,7 @@ import * as Y from '../src/index.js'
 import { CausalHole, sameCausalHoleMetadata } from '../src/structs/CausalHole.js'
 import { normalizeDocOptions } from '../src/utils/Doc.js'
 import { readBlockSet, writeBlockSet } from '../src/utils/BlockSet.js'
-import { commitPendingDs, commitPendingStructs, getPendingRevision, readPendingStructs } from '../src/utils/StructStore.js'
+import { commitPendingDs, commitPendingStructs, getPendingRevision, readIndexedPendingStructs, readPendingStructs } from '../src/utils/StructStore.js'
 import { _testOnlyGetSparsePendingProofRuns, writeStateAsUpdate } from '../src/utils/encoding.js'
 import { writeStructsFromIdSetWithCausalHoles } from '../src/utils/encoding-helpers.js'
 import { UpdateDecoderV1, UpdateDecoderV2 } from '../src/utils/UpdateDecoder.js'
@@ -564,11 +564,20 @@ export const testOrdinaryPendingFieldsKeepUpstreamDescriptors = () => {
   store.pendingDs = pendingDs
   t.assert(store.pendingStructs === pendingStructs && store.pendingDs === pendingDs)
   t.compareArrays(Object.keys(store).slice(0, 3), ['clients', 'pendingStructs', 'pendingDs'])
+  t.assert(Reflect.deleteProperty(store, 'pendingStructs') && store.pendingStructs === undefined)
+  t.assert(Reflect.deleteProperty(store, 'pendingDs') && store.pendingDs === undefined)
+  store.pendingStructs = pendingStructs
+  store.pendingDs = pendingDs
+  t.assert(store.pendingStructs === pendingStructs && store.pendingDs === pendingDs)
 
   const sparseStore = new Y.Doc({ gc: false, sparseExactResolution: true }).store
+  const sparseStructsDescriptor = Object.getOwnPropertyDescriptor(sparseStore, 'pendingStructs')
+  const sparseDeletesDescriptor = Object.getOwnPropertyDescriptor(sparseStore, 'pendingDs')
   t.assert(
-    !Object.prototype.hasOwnProperty.call(sparseStore, 'pendingStructs') &&
-    !Object.prototype.hasOwnProperty.call(sparseStore, 'pendingDs')
+    typeof sparseStructsDescriptor?.get === 'function' && typeof sparseStructsDescriptor.set === 'function' &&
+    sparseStructsDescriptor.enumerable && !sparseStructsDescriptor.configurable &&
+    typeof sparseDeletesDescriptor?.get === 'function' && typeof sparseDeletesDescriptor.set === 'function' &&
+    sparseDeletesDescriptor.enumerable && !sparseDeletesDescriptor.configurable
   )
   t.fails(() => { sparseStore.pendingStructs = pendingStructs })
   t.fails(() => { sparseStore.pendingDs = pendingDs })
@@ -646,14 +655,14 @@ export const testSparseSkipAndIndexedPendingScalingInvariants = () => {
     t.assert(Y.encodeStateAsUpdate(doc, stateVector).byteLength < 256)
     const revision = getPendingRevision(doc.store)
     const proofRuns = _testOnlyGetSparsePendingProofRuns(doc)
-    const pending = readPendingStructs(doc.store)
+    const pending = readIndexedPendingStructs(doc.store)
     const blocks = pending?.blocks
     for (let index = 0; index < 50; index++) Y.applyUpdate(doc, skip)
     t.assert(getPendingRevision(doc.store) === revision)
     t.assert(Y.encodeStateAsUpdate(doc, stateVector).byteLength < 256)
     t.assert(Y.encodeStateAsUpdateV2(doc, stateVector).byteLength < 256)
     t.assert(_testOnlyGetSparsePendingProofRuns(doc) === proofRuns)
-    t.assert(readPendingStructs(doc.store)?.blocks === blocks)
+    t.assert(readIndexedPendingStructs(doc.store)?.blocks === blocks)
   })
 
   ;[8_000_000, 16_000_000].forEach(size => {
@@ -667,12 +676,12 @@ export const testSparseSkipAndIndexedPendingScalingInvariants = () => {
     const doc = new Y.Doc({ gc: false, sparseExactResolution: true })
     Y.applyUpdate(doc, updates[1])
     Y.encodeStateAsUpdate(doc, encodeStateVectorMap(new Map([[63, size + 1]])))
-    const pending = readPendingStructs(doc.store)
+    const pending = readIndexedPendingStructs(doc.store)
     const revision = getPendingRevision(doc.store)
     const proofRuns = _testOnlyGetSparsePendingProofRuns(doc)
     ;[size - 2, size - 1, size, size + 1].forEach(clock => {
       Y.encodeStateAsUpdateV2(doc, encodeStateVectorMap(new Map([[63, clock]])))
-      t.assert(readPendingStructs(doc.store)?.blocks === pending?.blocks)
+      t.assert(readIndexedPendingStructs(doc.store)?.blocks === pending?.blocks)
     })
     t.assert(getPendingRevision(doc.store) === revision && _testOnlyGetSparsePendingProofRuns(doc) === proofRuns)
   })
@@ -801,6 +810,32 @@ export const testSparsePendingProofInvalidatesOnlyForDependencies = () => {
   Y.encodeStateAsUpdateV2(deleteDoc)
   t.assert(deleteDoc.store.pendingDs === null && deleteDoc.get('text').toString() === '')
   t.assert(getPendingRevision(deleteDoc.store) > deleteRevision && _testOnlyGetSparsePendingProofRuns(deleteDoc) === 1)
+}
+
+export const testPendingStructsRetryForGcAndCausalHoleCoverage = () => {
+  const source = new Y.Doc({ gc: false })
+  source.clientID = 73
+  /** @type {Array<Uint8Array<ArrayBuffer>>} */
+  const updates = []
+  source.on('updateV2', update => updates.push(update))
+  source.get('pending').insert(0, 'a')
+  source.get('pending').insert(1, 'b')
+
+  const ordinary = new Y.Doc({ gc: false })
+  Y.applyUpdateV2(ordinary, updates[1])
+  t.assert(ordinary.store.pendingStructs !== null)
+  Y.applyUpdateV2(ordinary, encodeStructs([new Y.GC(Y.createID(73, 0), 1)], Y.UpdateEncoderV2))
+  t.assert(ordinary.store.pendingStructs === null)
+  Y.encodeStateAsUpdateV2(ordinary)
+
+  const sparse = new Y.Doc({ gc: false, sparseExactResolution: true })
+  Y.applyUpdateV2(sparse, updates[1])
+  t.assert(sparse.store.pendingStructs !== null)
+  Y.applyUpdateV2(sparse, encodeCausalHoles([
+    new CausalHole(Y.createID(73, 0), 1, null, null, 'pending', null)
+  ], Y.UpdateEncoderV2))
+  t.assert(sparse.store.pendingStructs === null && sparse.get('pending').toString() === 'b')
+  Y.encodeStateAsUpdateV2(sparse)
 }
 
 export const testLargePendingTransportIgnoresEmptyTransactions = () => {
