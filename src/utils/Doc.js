@@ -12,35 +12,36 @@ import { beginPendingTransaction, endPendingTransaction, getPendingRevision, pen
 import { markStructuralChange } from './structural-revision.js'
 import { transact, generateNewClientId } from './Transaction.js'
 import { hasSparseTransport } from './sparse-transport.js'
+import { beginDocDestroy, cancelDocDestroy, clearDestroyedDocSubdocs, commitDocDestroy, commitDocDestroyAfterParentTermination, commitDocDestroyReplacement, destroyParentIsPreparing, destroyParentIsTerminating, docDestroyOwnershipCommitted, docLifecycleIsDestroyed, getDocDestroyAttachment, getDocSubdocsSnapshot, initializeDocDestroyCleanup, loadTransactionSubdoc, prepareDocDestroyReplacement, reconcileDocDestroyPublicState, registerConstructedDoc, runDocDestroyCleanup } from './doc-lifecycle.js'
 import { YType } from '../ytype.js'
 import { $ydoc } from './schemas.js'
 
 const applyIntrinsic = Reflect.apply
+const definePropertyIntrinsic = Object.defineProperty
+const getOwnPropertyDescriptorIntrinsic = Object.getOwnPropertyDescriptor
+const hasOwnPropertyIntrinsic = Object.prototype.hasOwnProperty
 const mapForEachIntrinsic = Map.prototype.forEach
+const mapClearIntrinsic = Map.prototype.clear
 const mapGetIntrinsic = Map.prototype.get
 const mapHasIntrinsic = Map.prototype.has
 const mapSetIntrinsic = Map.prototype.set
+const mapSizeDescriptor = /** @type {PropertyDescriptor} */ (Object.getOwnPropertyDescriptor(Map.prototype, 'size'))
+const mapSizeGetter = /** @type {function():number} */ (mapSizeDescriptor.get)
+const setAddIntrinsic = Set.prototype.add
+const setHasIntrinsic = Set.prototype.has
 const weakMapGetIntrinsic = WeakMap.prototype.get
-const weakMapSetIntrinsic = WeakMap.prototype.set
 
-/** @type {WeakMap<Doc,{revision:number,destroyed:boolean}>} */
-const docConstructionStates = new WeakMap()
-let docConstructionRevision = 0
-
-export const captureDocConstructionRevision = () => docConstructionRevision
-
-/** @param {Doc} doc @param {number} revision */
-export const isFreshDocConstruction = (doc, revision) => {
-  const state = applyIntrinsic(weakMapGetIntrinsic, docConstructionStates, [doc])
-  return state !== undefined && state.revision > revision && !state.destroyed
+/** @param {object} target @param {PropertyKey} key */
+const hasOwn = (target, key) => applyIntrinsic(hasOwnPropertyIntrinsic, target, [key])
+/** @template T @param {Array<T>} target @param {T} value */
+const appendArrayValue = (target, value) => {
+  applyIntrinsic(definePropertyIntrinsic, Object, [target, target.length, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true
+  }])
 }
-
-/** @param {Doc} doc @param {number} revision */
-export const revokeFreshDocConstruction = (doc, revision) => {
-  const state = applyIntrinsic(weakMapGetIntrinsic, docConstructionStates, [doc])
-  if (state !== undefined && state.revision > revision && !state.destroyed) state.destroyed = true
-}
-
 /** @type {WeakMap<Doc,{generation:number,pendingTransactions:number,destroyed:boolean,pendingBefore:WeakMap<object,number>}>} */
 const transactionGenerations = new WeakMap()
 
@@ -48,7 +49,7 @@ const transactionGenerations = new WeakMap()
 export const getDocTransactionGeneration = doc => {
   const state = transactionGenerations.get(doc)
   return state === undefined
-    ? { generation: 0, settled: doc._transaction === null, destroyed: false }
+    ? { generation: 0, settled: doc._transaction === null, destroyed: docLifecycleIsDestroyed(doc) }
     : { generation: state.generation, settled: state.pendingTransactions === 0 && doc._transaction === null, destroyed: state.destroyed }
 }
 
@@ -107,14 +108,14 @@ export const normalizeDocOptions = opts => {
   if (opts === null || typeof opts !== 'object' || Array.isArray(opts)) {
     throw new TypeError('Document options must be a non-null record')
   }
-  const sparse = Object.getOwnPropertyDescriptor(opts, 'sparseExactResolution')
+  const sparse = applyIntrinsic(getOwnPropertyDescriptorIntrinsic, Object, [opts, 'sparseExactResolution'])
   if (sparse === undefined) return { opts, sparseExactResolution: false }
-  if (!Object.prototype.hasOwnProperty.call(sparse, 'value') || typeof sparse.value !== 'boolean') {
+  if (!hasOwn(sparse, 'value') || typeof sparse.value !== 'boolean') {
     throw new TypeError('sparseExactResolution must be an own boolean')
   }
   if (sparse.value) {
-    const gc = Object.getOwnPropertyDescriptor(opts, 'gc')
-    if (gc === undefined || !Object.prototype.hasOwnProperty.call(gc, 'value') || gc.value !== false) {
+    const gc = applyIntrinsic(getOwnPropertyDescriptorIntrinsic, Object, [opts, 'gc'])
+    if (gc === undefined || !hasOwn(gc, 'value') || gc.value !== false) {
       throw new Error('Sparse exact resolution requires own gc:false')
     }
   }
@@ -167,7 +168,7 @@ export class Doc extends ObservableV2 {
     super()
     this.gc = gc
     if (sparseExactResolution) {
-      Object.defineProperty(this, 'gc', {
+      applyIntrinsic(definePropertyIntrinsic, Object, [this, 'gc', {
         get: () => false,
         set: value => {
           if (value !== false) {
@@ -176,7 +177,7 @@ export class Doc extends ObservableV2 {
         },
         enumerable: true,
         configurable: false
-      })
+      }])
     }
     this.gcFilter = gcFilter
     this.clientID = generateNewClientId()
@@ -184,20 +185,20 @@ export class Doc extends ObservableV2 {
     this.collectionid = collectionid
     this.isSuggestionDoc = isSuggestionDoc
     this.sparseExactResolution = sparseExactResolution
-    Object.defineProperty(this, 'sparseExactResolution', {
+    applyIntrinsic(definePropertyIntrinsic, Object, [this, 'sparseExactResolution', {
       value: sparseExactResolution,
       enumerable: true,
       writable: false,
       configurable: false
-    })
+    }])
     this.cleanupFormatting = !isSuggestionDoc
     if (sparseExactResolution) {
-      Object.defineProperty(this, 'share', {
+      applyIntrinsic(definePropertyIntrinsic, Object, [this, 'share', {
         value: /** @type {Map<string, YType>} */ (new Map()),
         enumerable: true,
         writable: false,
         configurable: false
-      })
+      }])
     } else {
       /**
        * @type {Map<string, YType>}
@@ -304,8 +305,7 @@ export class Doc extends ObservableV2 {
      * Note the documentation about the `isSynced` property.
      */
     this.whenSynced = provideSyncedPromise()
-    docConstructionRevision++
-    applyIntrinsic(weakMapSetIntrinsic, docConstructionStates, [this, { revision: docConstructionRevision, destroyed: false }])
+    registerConstructedDoc(this, normalized.opts, docDestroyIntrinsic)
   }
 
   /**
@@ -319,7 +319,7 @@ export class Doc extends ObservableV2 {
     const item = this._item
     if (item !== null && !this.shouldLoad) {
       transact(/** @type {any} */ (item.parent).doc, transaction => {
-        transaction.subdocsLoaded.add(this)
+        loadTransactionSubdoc(transaction, this)
       }, null, true)
     }
     this.shouldLoad = true
@@ -395,38 +395,162 @@ export class Doc extends ObservableV2 {
   }
 
   /**
-   * Emit `destroy` event and unregister all event handlers.
-   */
+  * Emit `destroy` event and unregister all event handlers.
+  */
   destroy () {
-    const constructionState = applyIntrinsic(weakMapGetIntrinsic, docConstructionStates, [this])
-    if (constructionState !== undefined) constructionState.destroyed = true
-    const transactionGeneration = transactionGenerations.get(this)
-    if (transactionGeneration !== undefined) transactionGeneration.destroyed = true
-    this.isDestroyed = true
-    // Tear down the top-level shared types as RDTs (emits their `'destroy'` event so any bindings
-    // unsubscribe). Only top-level types are destroyed here; nested child types are not recursed.
-    this.share.forEach(type => type.destroy())
-    array.from(this.subdocs).forEach(subdoc => subdoc.destroy())
-    const item = this._item
-    if (item !== null) {
-      this._item = null
-      const content = /** @type {ContentDoc} */ (item.content)
-      /**
-       * new content doc which replaces the new one
-       */
-      const contentDoc = new Doc({ guid: this.guid, ...content.opts, shouldLoad: false })
-      content.doc = contentDoc
-      contentDoc._item = item
-      transact(/** @type {any} */ (item).parent.doc, transaction => {
-        if (!item.deleted) {
-          transaction.subdocsAdded.add(contentDoc)
-        }
-        transaction.subdocsRemoved.add(this)
-      }, null, true)
+    const attempt = beginDocDestroy(this)
+    if (attempt === null) return
+    if (docDestroyOwnershipCommitted(attempt)) {
+      runDocDestroyCleanup(this, attempt)
+      return
     }
-    this.emit('destroy', [this])
-    super.destroy()
+    /** @type {Map<string,YType>} */
+    let share
+    /** @type {Map<YType,function():void>} */
+    let rootDestroyers
+    /** @type {Map<string,Set<function(...any):any>>} */
+    let observers
+    try {
+      const shareDescriptor = applyIntrinsic(getOwnPropertyDescriptorIntrinsic, Object, [this, 'share'])
+      if (shareDescriptor === undefined || !hasOwn(shareDescriptor, 'value')) {
+        throw new Error('Document roots must remain an own Map')
+      }
+      share = shareDescriptor.value
+      applyIntrinsic(mapSizeGetter, share, [])
+      rootDestroyers = new Map()
+      applyIntrinsic(mapForEachIntrinsic, share, [type => {
+        const destroy = type.destroy
+        if (typeof destroy !== 'function') {
+          throw new Error('Document root destroy must remain callable')
+        }
+        applyIntrinsic(mapSetIntrinsic, rootDestroyers, [type, destroy])
+      }])
+      const observersDescriptor = applyIntrinsic(getOwnPropertyDescriptorIntrinsic, Object, [this, '_observers'])
+      if (observersDescriptor === undefined || !hasOwn(observersDescriptor, 'value')) {
+        throw new Error('Document observers must remain an own Map')
+      }
+      observers = observersDescriptor.value
+      applyIntrinsic(mapSizeGetter, observers, [])
+    } catch (failure) {
+      cancelDocDestroy(this, attempt)
+      throw failure
+    }
+    const transactionGeneration = applyIntrinsic(weakMapGetIntrinsic, transactionGenerations, [this])
+    let hasOwnershipFailure = false
+    let ownershipFailure = null
+    if (!docDestroyOwnershipCommitted(attempt)) {
+      const attachment = getDocDestroyAttachment(attempt)
+      if (attachment !== null && destroyParentIsPreparing(attempt)) {
+        cancelDocDestroy(this, attempt)
+        return
+      }
+      try {
+        if (attachment !== null && !destroyParentIsTerminating(attempt)) {
+          const { content, parentDoc } = attachment
+          const replacement = new Doc({ guid: this.guid, ...content.opts, shouldLoad: false })
+          prepareDocDestroyReplacement(this, attempt, replacement)
+          transact(/** @type {any} */ (parentDoc), transaction => {
+            commitDocDestroyReplacement(transaction, this, attempt, replacement)
+          }, null, true)
+        } else {
+          commitDocDestroy(this, attempt)
+        }
+      } catch (failure) {
+        if (!docDestroyOwnershipCommitted(attempt)) {
+          if (attachment !== null && destroyParentIsTerminating(attempt)) {
+            commitDocDestroyAfterParentTermination(this, attempt)
+          } else {
+            cancelDocDestroy(this, attempt)
+            throw failure
+          }
+        }
+        hasOwnershipFailure = true
+        ownershipFailure = failure
+      }
+    }
+    /** @type {Array<()=>void>} */
+    const cleanup = []
+    appendArrayValue(cleanup, () => {
+      if (transactionGeneration !== undefined) transactionGeneration.destroyed = true
+      reconcileDocDestroyPublicState(this, attempt)
+    })
+    const destroyedTypes = new Set()
+    appendArrayValue(cleanup, () => {
+      let hasFailure = false
+      /** @type {any} */
+      let firstFailure = null
+      applyIntrinsic(mapForEachIntrinsic, share, [type => {
+        if (applyIntrinsic(setHasIntrinsic, destroyedTypes, [type])) return
+        try {
+          let destroy = applyIntrinsic(mapGetIntrinsic, rootDestroyers, [type])
+          if (destroy === undefined && !applyIntrinsic(mapHasIntrinsic, rootDestroyers, [type])) {
+            destroy = type.destroy
+            if (typeof destroy !== 'function') {
+              throw new Error('Document root destroy must remain callable')
+            }
+            applyIntrinsic(mapSetIntrinsic, rootDestroyers, [type, destroy])
+          }
+          applyIntrinsic(destroy, type, [])
+          applyIntrinsic(setAddIntrinsic, destroyedTypes, [type])
+        } catch (failure) {
+          if (!hasFailure) {
+            hasFailure = true
+            firstFailure = failure
+          }
+        }
+      }])
+      if (hasFailure) throw firstFailure
+    })
+    const subdocs = getDocSubdocsSnapshot(this)
+    for (let index = 0; index < subdocs.length; index++) {
+      const subdoc = subdocs[index]
+      let overrideDone = subdoc.destroy === subdoc.destroyIntrinsic
+      let intrinsicDone = false
+      appendArrayValue(cleanup, () => {
+        let hasFailure = false
+        let firstFailure = null
+        if (!overrideDone) {
+          try {
+            applyIntrinsic(subdoc.destroy, subdoc.doc, [])
+            overrideDone = true
+          } catch (failure) {
+            hasFailure = true
+            firstFailure = failure
+          }
+        }
+        if (!intrinsicDone) {
+          try {
+            applyIntrinsic(subdoc.destroyIntrinsic, subdoc.doc, [])
+            intrinsicDone = true
+            if (hasFailure) overrideDone = true
+          } catch (failure) {
+            if (!hasFailure) {
+              hasFailure = true
+              firstFailure = failure
+            }
+          }
+        }
+        if (hasFailure) throw firstFailure
+      })
+    }
+    appendArrayValue(cleanup, () => clearDestroyedDocSubdocs(this))
+    appendArrayValue(cleanup, () => {
+      this.emit('destroy', [this])
+      applyIntrinsic(mapClearIntrinsic, observers, [])
+      try {
+        super.destroy()
+      } catch (_failure) {}
+    })
+    initializeDocDestroyCleanup(this, attempt, cleanup)
+    if (hasOwnershipFailure) {
+      try {
+        runDocDestroyCleanup(this, attempt)
+      } catch (_cleanupFailure) {}
+      throw ownershipFailure
+    }
+    runDocDestroyCleanup(this, attempt)
   }
 }
 
+const docDestroyIntrinsic = Doc.prototype.destroy
 Doc.prototype.$type = $ydoc

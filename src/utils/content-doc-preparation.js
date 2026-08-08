@@ -1,42 +1,108 @@
 import { ContentDoc, Item } from '../structs/Item.js'
-import { captureDocConstructionRevision, isFreshDocConstruction, normalizeDocOptions, revokeFreshDocConstruction } from './Doc.js'
+import { normalizeDocOptions } from './Doc.js'
+import { adoptPreparedSubdocs, createDocConstructionPermit, prepareConstructedSubdoc, preparedSubdocIsStable, retargetPreparedSubdoc, revokeDocConstructionPermit, revokePreparedSubdoc } from './doc-lifecycle.js'
+import { decodeAny, encodeAny } from 'lib0/buffer'
 
 const applyIntrinsic = Reflect.apply
+const definePropertyIntrinsic = Object.defineProperty
+const getOwnPropertyDescriptorIntrinsic = Object.getOwnPropertyDescriptor
+const getPrototypeOfIntrinsic = Object.getPrototypeOf
+const hasOwnPropertyIntrinsic = Object.prototype.hasOwnProperty
+const mapDeleteIntrinsic = Map.prototype.delete
 const mapGetIntrinsic = Map.prototype.get
 const mapSetIntrinsic = Map.prototype.set
-const getOwnPropertyDescriptorIntrinsic = Object.getOwnPropertyDescriptor
+const setAddIntrinsic = Set.prototype.add
+const setHasIntrinsic = Set.prototype.has
+
+/** @param {object} target @param {PropertyKey} key */
+const hasOwn = (target, key) => applyIntrinsic(hasOwnPropertyIntrinsic, target, [key])
+/** @template T @param {Array<T>} target @param {T} value */
+const appendArrayValue = (target, value) => {
+  applyIntrinsic(definePropertyIntrinsic, Object, [target, target.length, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true
+  }])
+}
 
 /**
- * @typedef {{content:ContentDoc,doc:import('./Doc.js').Doc,constructionRevision:number,shouldLoad:boolean,integrated:boolean}} PreparedContentDoc
+ * @typedef {{item:Item,content:ContentDoc,doc:import('./Doc.js').Doc,token:object,shouldLoad:boolean,transferred:boolean}} PreparedContentDoc
  * @typedef {{records:Array<PreparedContentDoc>,byContent:Map<ContentDoc,PreparedContentDoc>}} PreparedContentDocState
  */
 
-/** @param {import('./Doc.js').Doc} doc @param {number} constructionRevision */
-const readPreparedContentDocLifecycle = (doc, constructionRevision) => {
-  if (!isFreshDocConstruction(doc, constructionRevision)) return null
-  const item = getOwnPropertyDescriptorIntrinsic(doc, '_item')
-  const shouldLoad = getOwnPropertyDescriptorIntrinsic(doc, 'shouldLoad')
-  return item !== undefined && 'value' in item && item.value === null && item.writable === true &&
-    shouldLoad !== undefined && 'value' in shouldLoad && typeof shouldLoad.value === 'boolean'
-    ? { shouldLoad: shouldLoad.value }
-    : null
+/** @param {object} target @param {string} key */
+const readOwnDataValue = (target, key) => {
+  const descriptor = applyIntrinsic(getOwnPropertyDescriptorIntrinsic, Object, [target, key])
+  if (descriptor === undefined || !hasOwn(descriptor, 'value')) {
+    throw new Error(`Prepared ContentDoc ${key} must be an own data property`)
+  }
+  return descriptor.value
+}
+
+/** @param {object} target @param {string} key @param {any} value */
+const writeOwnDataValue = (target, key, value) => {
+  const descriptor = applyIntrinsic(getOwnPropertyDescriptorIntrinsic, Object, [target, key])
+  if (descriptor === undefined || !hasOwn(descriptor, 'value') || descriptor.writable !== true) {
+    throw new Error(`Prepared ContentDoc ${key} must remain writable`)
+  }
+  applyIntrinsic(definePropertyIntrinsic, Object, [target, key, { ...descriptor, value }])
+}
+
+/** @param {ContentDoc} content */
+const createConstructionOptions = content => {
+  const normalized = normalizeDocOptions(readOwnDataValue(content, 'opts'))
+  const source = normalized.opts
+  const guid = readOwnDataValue(content, 'guid')
+  const shouldLoad = source.shouldLoad || source.autoLoad || false
+  const options = { ...source, guid, shouldLoad }
+  const metaDescriptor = applyIntrinsic(getOwnPropertyDescriptorIntrinsic, Object, [source, 'meta'])
+  const canonicalMeta = metaDescriptor === undefined
+    ? null
+    : hasOwn(metaDescriptor, 'value')
+      ? metaDescriptor.value === undefined ? null : metaDescriptor.value
+      : (() => { throw new Error('Prepared ContentDoc meta must be an own data property') })()
+  const metaSnapshot = encodeAny(canonicalMeta)
+  const meta = decodeAny(metaSnapshot)
+  if (metaDescriptor !== undefined) {
+    applyIntrinsic(definePropertyIntrinsic, Object, [options, 'meta', {
+      value: meta,
+      enumerable: true,
+      writable: true,
+      configurable: true
+    }])
+  }
+  const construction = normalizeDocOptions(options)
+  return {
+    options,
+    expected: {
+      guid,
+      gc: options.gc === undefined ? true : options.gc,
+      sparseExactResolution: construction.sparseExactResolution,
+      autoLoad: options.autoLoad === undefined ? false : options.autoLoad,
+      shouldLoad,
+      meta,
+      metaSnapshot,
+      isSuggestionDoc: options.isSuggestionDoc === undefined ? false : options.isSuggestionDoc
+    }
+  }
 }
 
 /** @param {PreparedContentDoc} prepared */
 const preparedContentDocIsStable = prepared => {
-  if (prepared.content.doc !== prepared.doc) return false
-  const lifecycle = readPreparedContentDocLifecycle(prepared.doc, prepared.constructionRevision)
-  return lifecycle !== null && lifecycle.shouldLoad === prepared.shouldLoad
+  return !prepared.transferred && prepared.content.doc === prepared.doc &&
+    preparedSubdocIsStable(prepared.token, prepared.doc, prepared.item, prepared.content)
 }
 
 /** @param {Array<PreparedContentDoc>} prepared */
 const disposePreparedContentDocRecords = prepared => {
   for (let index = 0; index < prepared.length; index++) {
     const current = prepared[index]
-    if (current.integrated) continue
-    const stable = preparedContentDocIsStable(current)
-    if (current.content.doc === current.doc) current.content.doc = null
-    if (stable) revokeFreshDocConstruction(current.doc, current.constructionRevision)
+    if (current.transferred) continue
+    const revoked = revokePreparedSubdoc(current.token)
+    if (revoked && current.content.doc === current.doc) {
+      writeOwnDataValue(current.content, 'doc', null)
+    }
   }
 }
 
@@ -44,47 +110,68 @@ const disposePreparedContentDocRecords = prepared => {
 export const createPreparedContentDocState = () => ({ records: [], byContent: new Map() })
 
 /**
- * Construct only subdocuments in the frozen integration schedule. ContentDoc.integrate reuses `doc`.
- *
  * @param {Array<{struct:import('../structs/GC.js').GC|Item|import('../structs/CausalHole.js').CausalHole,clock:number,gap:number}>} ordered
  * @param {import('./Doc.js').Doc} target
  * @param {PreparedContentDocState} state
  * @param {()=>boolean} isStable
  */
 export const prepareContentDocs = (ordered, target, state, isStable) => {
-  const scheduled = new Set(ordered
-    .map(entry => entry.struct)
-    .filter(struct => struct.constructor === Item && /** @type {Item} */ (struct).content instanceof ContentDoc)
-    .map(struct => /** @type {ContentDoc} */ (/** @type {Item} */ (struct).content)))
-  const stale = state.records.filter(current => !scheduled.has(current.content))
-  disposePreparedContentDocRecords(stale)
+  const SubdocConstructor = target.constructor
+  const subdocPrototype = applyIntrinsic(getPrototypeOfIntrinsic, Object, [target])
+  const scheduled = new Set()
+  for (let index = 0; index < ordered.length; index++) {
+    const struct = ordered[index].struct
+    if (struct.constructor === Item && /** @type {Item} */ (struct).content instanceof ContentDoc) {
+      applyIntrinsic(setAddIntrinsic, scheduled, [(/** @type {Item} */ (struct).content)])
+    }
+  }
   for (let index = state.records.length - 1; index >= 0; index--) {
-    if (!scheduled.has(state.records[index].content)) state.records.splice(index, 1)
+    const current = state.records[index]
+    if (!applyIntrinsic(setHasIntrinsic, scheduled, [current.content])) {
+      disposePreparedContentDocRecords([current])
+      state.records.splice(index, 1)
+      applyIntrinsic(mapDeleteIntrinsic, state.byContent, [current.content])
+    }
   }
   try {
-    for (const content of scheduled) {
-      normalizeDocOptions(content.opts)
-      if (content.doc !== null) {
-        const current = applyIntrinsic(mapGetIntrinsic, state.byContent, [content])
-        if (current === undefined || !preparedContentDocIsStable(current)) {
+    for (let index = 0; index < ordered.length; index++) {
+      const struct = ordered[index].struct
+      if (struct.constructor !== Item || !(/** @type {Item} */ (struct).content instanceof ContentDoc)) continue
+      const item = /** @type {Item} */ (struct)
+      const content = /** @type {ContentDoc} */ (item.content)
+      const existing = applyIntrinsic(mapGetIntrinsic, state.byContent, [content])
+      if (existing !== undefined) {
+        if (existing.item !== item) {
+          if (!retargetPreparedSubdoc(existing.token, existing.doc, existing.item, item, content)) {
+            throw new Error('Prepared subdocument schedule changed after ownership transfer')
+          }
+          existing.item = item
+        }
+        if (!preparedContentDocIsStable(existing)) {
           throw new Error('Prepared subdocument lifecycle changed during planning')
         }
         continue
       }
-      const opts = content.opts
-      const constructionRevision = captureDocConstructionRevision()
-      const doc = /** @type {import('./Doc.js').Doc} */ (new /** @type {any} */ (target.constructor)({
-        guid: content.guid,
-        ...opts,
-        shouldLoad: opts.shouldLoad || opts.autoLoad || false
-      }))
-      const lifecycle = readPreparedContentDocLifecycle(doc, constructionRevision)
-      if (lifecycle === null) {
-        throw new Error('Prepared subdocument must be a fresh document with stable lifecycle fields')
+      if (content.doc !== null) throw new Error('Scheduled subdocument already has an unowned document')
+      const { options, expected } = createConstructionOptions(content)
+      const permit = createDocConstructionPermit(options, subdocPrototype)
+      let doc
+      try {
+        doc = /** @type {import('./Doc.js').Doc} */ (new /** @type {any} */ (SubdocConstructor)(options))
+      } catch (failure) {
+        revokeDocConstructionPermit(permit)
+        throw failure
       }
-      const current = { content, doc, constructionRevision, shouldLoad: lifecycle.shouldLoad, integrated: false }
-      content.doc = doc
-      state.records.push(current)
+      let token
+      try {
+        token = prepareConstructedSubdoc(permit, doc, item, content, expected)
+      } catch (failure) {
+        revokeDocConstructionPermit(permit)
+        throw failure
+      }
+      const current = { item, content, doc, token, shouldLoad: expected.shouldLoad, transferred: false }
+      writeOwnDataValue(content, 'doc', doc)
+      appendArrayValue(state.records, current)
       applyIntrinsic(mapSetIntrinsic, state.byContent, [content, current])
       if (!isStable()) return false
     }
@@ -109,20 +196,16 @@ export const preparedContentDocScheduleIsStable = (ordered, state) => {
     if (struct.constructor !== Item || !(/** @type {Item} */ (struct).content instanceof ContentDoc)) continue
     const content = /** @type {ContentDoc} */ (/** @type {Item} */ (struct).content)
     const current = applyIntrinsic(mapGetIntrinsic, state.byContent, [content])
-    if (current === undefined || current.content !== content) return false
+    if (current === undefined || current.item !== struct || current.content !== content) return false
   }
   return true
 }
 
-/** @param {PreparedContentDocState} state @param {ContentDoc} content */
-export const getPreparedContentDoc = (state, content) => {
-  const prepared = applyIntrinsic(mapGetIntrinsic, state.byContent, [content])
-  if (prepared === undefined) throw new Error('Prepared subdocument record is missing')
-  return prepared
+/** @param {PreparedContentDocState} state @param {object} transaction */
+export const transferPreparedContentDocs = (state, transaction) => {
+  adoptPreparedSubdocs(transaction, state.records)
+  for (let index = 0; index < state.records.length; index++) state.records[index].transferred = true
 }
-
-/** @param {PreparedContentDoc} prepared */
-export const markPreparedContentDocIntegrated = prepared => { prepared.integrated = true }
 
 /** @param {PreparedContentDocState} state */
 export const disposePreparedContentDocs = state => disposePreparedContentDocRecords(state.records)

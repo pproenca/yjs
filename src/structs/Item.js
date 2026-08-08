@@ -13,6 +13,7 @@ import {
   getItemCleanEnd,
   addChangedTypeToTransaction
 } from '../utils/transaction-helpers.js'
+import { claimSubdocItem, deleteTransactionSubdoc, integrateSubdocContent, prepareSubdocDeletion } from '../utils/doc-lifecycle.js'
 
 const isDevMode = env.getVariable('node_env') === 'development'
 
@@ -211,6 +212,7 @@ export class Item extends AbstractStruct {
     }
 
     if (this.parent) {
+      if (this.content instanceof ContentDoc) this.content.prepare(transaction, this)
       if ((!this.left && (!this.right || this.right.left !== null)) || (this.left && this.left.right !== this.right)) {
         /**
          * @type {Item|null}
@@ -359,6 +361,7 @@ export class Item extends AbstractStruct {
    */
   delete (transaction) {
     if (!this.deleted) {
+      if (this.content instanceof ContentDoc) this.content.prepareDelete(transaction)
       const parent = /** @type {YType} */ (this.parent)
       // adjust the length of parent
       if (this.countable && this.parentSub === null) {
@@ -924,18 +927,25 @@ export class ContentDoc {
    * @param {Transaction} transaction
    * @param {Item} item
    */
-  integrate (transaction, item) {
+  prepare (transaction, item) {
     const opts = this.opts
     if (this.doc == null) {
-      // we get the constructor from the existing doc to avoid import the doc module, leading to a
-      // circular dependency
-      this.doc = /** @type {Doc} */ (new /** @type {any} */ (transaction.doc.constructor)({ guid: this.guid, ...this.opts, shouldLoad: opts.shouldLoad || opts.autoLoad || false }))
+      this.doc = /** @type {Doc} */ (new /** @type {any} */ (transaction.doc.constructor)({ guid: this.guid, ...opts, shouldLoad: opts.shouldLoad || opts.autoLoad || false }))
     }
-    this.doc._item = item
-    transaction.subdocsAdded.add(this.doc)
-    if (this.doc.shouldLoad) {
-      transaction.subdocsLoaded.add(this.doc)
-    }
+    claimSubdocItem(transaction, item, this)
+  }
+
+  /**
+   * @param {Transaction} transaction
+   * @param {Item} item
+   */
+  integrate (transaction, item) {
+    integrateSubdocContent(transaction, item, this)
+  }
+
+  /** @param {Transaction} transaction */
+  prepareDelete (transaction) {
+    prepareSubdocDeletion(transaction)
   }
 
   /**
@@ -943,11 +953,7 @@ export class ContentDoc {
    */
   delete (transaction) {
     if (this.doc) {
-      if (transaction.subdocsAdded.has(this.doc)) {
-        transaction.subdocsAdded.delete(this.doc)
-      } else {
-        transaction.subdocsRemoved.add(this.doc)
-      }
+      deleteTransactionSubdoc(transaction, this.doc)
     }
   }
 

@@ -284,6 +284,132 @@ export const testSubdocLoadEdgeCasesAutoload = _tc => {
 /**
  * @param {t.TestCase} _tc
  */
+export const testC28SubdocSameTransactionAddDelete = _tc => {
+  for (const shouldLoad of [false, true]) {
+    const parent = new Y.Doc()
+    const subdocs = parent.get()
+    const child = new Y.Doc({ guid: `child-${shouldLoad}`, shouldLoad })
+    /** @type {Array<{added: Set<Y.Doc>, removed: Set<Y.Doc>, loaded: Set<Y.Doc>}>} */
+    const events = []
+    parent.on('subdocs', event => events.push(event))
+
+    parent.transact(() => {
+      subdocs.setAttr('child', child)
+      subdocs.deleteAttr('child')
+    })
+
+    t.assert(subdocs.getAttr('child') === undefined)
+    t.assert(parent.getSubdocs().size === 0)
+    if (shouldLoad) {
+      t.assert(events.length === 1)
+      t.assert(events[0].added.size === 0)
+      t.assert(events[0].removed.size === 0)
+      t.assert(events[0].loaded.size === 1 && events[0].loaded.has(child))
+    } else {
+      t.assert(events.length === 0)
+    }
+  }
+}
+
+/**
+ * @param {t.TestCase} _tc
+ */
+export const testC28SubdocMapReplacement = _tc => {
+  const parent = new Y.Doc()
+  const subdocs = parent.get()
+  const oldChild = new Y.Doc({ guid: 'old-child' })
+  const newChild = new Y.Doc({ guid: 'new-child' })
+  /** @type {Array<{added: Set<Y.Doc>, removed: Set<Y.Doc>, loaded: Set<Y.Doc>}>} */
+  const events = []
+  parent.on('subdocs', event => events.push(event))
+  subdocs.setAttr('child', oldChild)
+  events.length = 0
+
+  subdocs.setAttr('child', newChild)
+
+  t.assert(events.length === 2)
+  t.assert(events[0].added.size === 1 && events[0].added.has(newChild))
+  t.assert(events[0].removed.size === 1 && events[0].removed.has(oldChild))
+  t.assert(events[0].loaded.size === 1 && events[0].loaded.has(newChild))
+  t.assert(events[1].added.size === 0)
+  t.assert(events[1].removed.size === 1 && events[1].removed.has(oldChild))
+  t.assert(events[1].loaded.size === 0)
+  t.assert(subdocs.getAttr('child') === newChild)
+  t.assert(parent.getSubdocs().size === 1)
+  t.assert(parent.getSubdocs().has(newChild))
+}
+
+/**
+ * @param {t.TestCase} _tc
+ */
+export const testC28AutoLoadSubdocDestroyReplacement = _tc => {
+  const parent = new Y.Doc()
+  const subdocs = parent.get()
+  const child = new Y.Doc({ guid: 'child', autoLoad: true })
+  /** @type {Array<{added: Set<Y.Doc>, removed: Set<Y.Doc>, loaded: Set<Y.Doc>}>} */
+  const events = []
+  parent.on('subdocs', event => events.push(event))
+  subdocs.insert(0, [child])
+  events.length = 0
+
+  child.destroy()
+
+  const replacement = /** @type {Y.Doc} */ (subdocs.get(0))
+  t.assert(replacement !== child)
+  t.assert(events.length === 1)
+  t.assert(events[0].added.size === 1 && events[0].added.has(replacement))
+  t.assert(events[0].removed.size === 1 && events[0].removed.has(child))
+  t.assert(events[0].loaded.size === 0)
+  t.assert(parent.getSubdocs().size === 1)
+  t.assert(parent.getSubdocs().has(replacement))
+  t.assert(!parent.getSubdocs().has(child))
+  t.assert(replacement.autoLoad)
+  t.assert(!replacement.shouldLoad)
+}
+
+/**
+ * @param {t.TestCase} _tc
+ */
+export const testC28SubdocLoadCompatibility = _tc => {
+  const source = new Y.Doc()
+  source.get().insert(0, [new Y.Doc({ guid: 'remote-child' })])
+  const target = new Y.Doc()
+  /** @type {Array<{added: Set<Y.Doc>, removed: Set<Y.Doc>, loaded: Set<Y.Doc>}>} */
+  const remoteEvents = []
+  target.on('subdocs', event => remoteEvents.push(event))
+  Y.applyUpdate(target, Y.encodeStateAsUpdate(source))
+  const remoteChild = /** @type {Y.Doc} */ (target.get().get(0))
+  remoteEvents.length = 0
+
+  remoteChild.load()
+  remoteChild.load()
+
+  t.assert(remoteEvents.length === 1)
+  t.assert(remoteEvents[0].added.size === 0)
+  t.assert(remoteEvents[0].removed.size === 0)
+  t.assert(remoteEvents[0].loaded.size === 1 && remoteEvents[0].loaded.has(remoteChild))
+  t.assert(target.getSubdocs().size === 1 && target.getSubdocs().has(remoteChild))
+
+  const parent = new Y.Doc()
+  const child = new Y.Doc({ guid: 'inserted-child', shouldLoad: false })
+  /** @type {Array<{added: Set<Y.Doc>, removed: Set<Y.Doc>, loaded: Set<Y.Doc>}>} */
+  const insertEvents = []
+  parent.on('subdocs', event => insertEvents.push(event))
+  parent.transact(() => {
+    parent.get().insert(0, [child])
+    child.load()
+  })
+
+  t.assert(insertEvents.length === 1)
+  t.assert(insertEvents[0].added.size === 1 && insertEvents[0].added.has(child))
+  t.assert(insertEvents[0].removed.size === 0)
+  t.assert(insertEvents[0].loaded.size === 1 && insertEvents[0].loaded.has(child))
+  t.assert(parent.getSubdocs().size === 1 && parent.getSubdocs().has(child))
+}
+
+/**
+ * @param {t.TestCase} _tc
+ */
 export const testSubdocsUndo = _tc => {
   const ydoc = new Y.Doc()
   const elems = ydoc.get()

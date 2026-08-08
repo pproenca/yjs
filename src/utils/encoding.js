@@ -34,7 +34,7 @@ import { ContentDoc, ContentType, Item, findItemInsertionLeft } from '../structs
 import { GC } from '../structs/GC.js'
 import { CausalHole, CausalHoleIndex, createCausalHoleFromItem, normalizeCausalHoleParent, sameCausalHoleMetadata, sameCausalHoleParent } from '../structs/CausalHole.js'
 import { Doc, getDocTransactionGeneration, installStagedDocRootTypes, normalizeDocOptions, stageDocRootType } from './Doc.js'
-import { createPreparedContentDocState, disposePreparedContentDocs, getPreparedContentDoc, markPreparedContentDocIntegrated, prepareContentDocs, preparedContentDocScheduleIsStable } from './content-doc-preparation.js'
+import { createPreparedContentDocState, disposePreparedContentDocs, prepareContentDocs, preparedContentDocScheduleIsStable, transferPreparedContentDocs } from './content-doc-preparation.js'
 import { writeStructs } from './encoding-helpers.js'
 
 const applyIntrinsic = Reflect.apply
@@ -830,6 +830,7 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     ) {
       throw new Error('Integration schedule invalidated before commit')
     }
+    transferPreparedContentDocs(preparedContentDocs, transaction)
     installStagedDocRootTypes(ydoc, preparedShare, existingStringRoots, stagedStringRoots)
     if (consumeSparsePending) {
       commitPendingStructs(store, null)
@@ -837,19 +838,12 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     }
     for (let index = 0; index < schedule.ordered.length; index++) {
       const entry = schedule.ordered[index]
-      const contentDoc = entry.struct.constructor === Item && /** @type {Item} */ (entry.struct).content instanceof ContentDoc
-        ? /** @type {ContentDoc} */ (/** @type {Item} */ (entry.struct).content)
-        : null
-      const preparedContentDoc = contentDoc === null
-        ? null
-        : getPreparedContentDoc(preparedContentDocs, contentDoc)
       const clock = store.getClock(entry.struct.id.client)
       if (entry.gap > 0) new Skip(createID(entry.struct.id.client, clock), entry.gap).integrate(transaction, 0)
       if (entry.struct.constructor === Item || entry.struct.constructor === CausalHole) {
         getMissing(/** @type {Item|CausalHole} */ (entry.struct), transaction, store, sparsePlan, preparedStringRootParents)
       }
       entry.struct.integrate(transaction, 0)
-      if (preparedContentDoc !== null) markPreparedContentDocIntegrated(preparedContentDoc)
     }
     const restStructs = schedule.rest
     const pending = readPendingStructs(store)

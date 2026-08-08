@@ -15,6 +15,66 @@ import { UpdateEncoderV1, UpdateEncoderV2 } from './UpdateEncoder.js'
 import { findIndexSS, updateCurrentFormats, cleanupFormattingGap, tryGcDeleteSet, tryMerge, tryToMergeWithLefts, cleanupContextlessFormattingGap } from './transaction-helpers.js'
 import * as random from 'lib0/random'
 import { hasSparseTransportClient } from './sparse-transport.js'
+import { finalizeTransactionSubdocs, getRemovedSubdocDestroyers, getTransactionSubdocSets, prefinalizeTransactionSubdocMetadata, publishTransactionSubdocs, registerTransactionLifecycle, transactionHasAddedSubdocs, transactionHasSubdocs } from './doc-lifecycle.js'
+
+const applyIntrinsic = Reflect.apply
+const definePropertyIntrinsic = Object.defineProperty
+const setSizeDescriptor = /** @type {PropertyDescriptor} */ (Object.getOwnPropertyDescriptor(Set.prototype, 'size'))
+const setSizeGetter = /** @type {function():number} */ (setSizeDescriptor.get)
+
+/** @template T @param {Array<T>} target @param {T} value */
+const appendArrayValue = (target, value) => {
+  applyIntrinsic(definePropertyIntrinsic, Object, [target, target.length, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true
+  }])
+}
+
+/** @param {Transaction} transaction @param {Doc} doc */
+const emitAfterTransactionCleanup = (transaction, doc) => doc.emit('afterTransactionCleanup', [transaction, doc])
+
+/** @param {Transaction} transaction @param {Doc} doc */
+const emitTransactionUpdate = (transaction, doc) => {
+  if (doc._observers.has('update')) {
+    const encoder = new UpdateEncoderV1()
+    const hasContent = writeUpdateMessageFromTransaction(encoder, transaction)
+    if (hasContent) doc.emit('update', [encoder.toUint8Array(), transaction.origin, doc, transaction])
+  }
+}
+
+/** @param {Transaction} transaction @param {Doc} doc */
+const emitTransactionUpdateV2 = (transaction, doc) => {
+  if (doc._observers.has('updateV2')) {
+    const encoder = new UpdateEncoderV2()
+    const hasContent = writeUpdateMessageFromTransaction(encoder, transaction)
+    if (hasContent) doc.emit('updateV2', [encoder.toUint8Array(), transaction.origin, doc, transaction])
+  }
+}
+
+/** @param {{doc:object,destroy:function():void,destroyIntrinsic:function():void}} entry */
+const destroySubdoc = entry => {
+  let hasFailure = false
+  let firstFailure = null
+  if (entry.destroy !== entry.destroyIntrinsic) {
+    try {
+      applyIntrinsic(entry.destroy, entry.doc, [])
+    } catch (failure) {
+      hasFailure = true
+      firstFailure = failure
+    }
+  }
+  try {
+    applyIntrinsic(entry.destroyIntrinsic, entry.doc, [])
+  } catch (failure) {
+    if (!hasFailure) {
+      hasFailure = true
+      firstFailure = failure
+    }
+  }
+  if (hasFailure) throw firstFailure
+}
 
 export const generateNewClientId = random.uint53
 
@@ -121,6 +181,7 @@ export class Transaction {
      * @type {Set<Doc>}
      */
     this.subdocsLoaded = new Set()
+    registerTransactionLifecycle(this, doc, this.subdocsAdded, this.subdocsRemoved, this.subdocsLoaded)
     /**
      * @type {boolean}
      */
@@ -217,8 +278,18 @@ const cleanupTransactions = (transactionCleanups, i) => {
     const store = doc.store
     const ds = transaction.deleteSet
     const mergeStructs = transaction._mergeStructs
+    const hasAddedSubdocs = transactionHasAddedSubdocs(transaction)
+    let addedClientIDCollision = false
+    let effectiveClientID = /** @type {number|null} */ (null)
     // insertIntoIdSet(store.ds, ds)
     try {
+      if (hasAddedSubdocs) {
+        const currentClientID = doc.clientID
+        addedClientIDCollision = !transaction.local &&
+          (transaction.insertSet.clients.has(currentClientID) || hasSparseTransportClient(transaction, currentClientID))
+        effectiveClientID = addedClientIDCollision ? generateNewClientId() : currentClientID
+        prefinalizeTransactionSubdocMetadata(transaction, effectiveClientID)
+      }
       doc.emit('beforeObserverCalls', [transaction, doc])
       /**
        * An array of event callbacks.
@@ -275,78 +346,128 @@ const cleanupTransactions = (transactionCleanups, i) => {
         cleanupYTextAfterTransaction(transaction)
       }
     } finally {
+      let lifecycleFinalized = false
+      let cleanupAdvanced = false
+      try {
       // Replace deleted items with ItemDeleted / GC.
       // This is where content is actually remove from the Yjs Doc.
-      if (doc.gc) {
-        tryGcDeleteSet(transaction, ds, doc.gcFilter)
-      }
-      tryMerge(ds, store)
+        if (doc.gc) {
+          tryGcDeleteSet(transaction, ds, doc.gcFilter)
+        }
+        tryMerge(ds, store)
 
-      // on all affected store.clients props, try to merge
-      transaction.insertSet.clients.forEach((ids, client) => {
-        const firstClock = ids.getIds()[0].clock
-        const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
-        // we iterate from right to left so we can safely remove entries
-        const firstChangePos = math.max(findIndexSS(structs, firstClock), 1)
-        for (let i = structs.length - 1; i >= firstChangePos;) {
-          i -= 1 + tryToMergeWithLefts(structs, i)
-        }
-      })
-      // try to merge mergeStructs
-      // @todo: it makes more sense to transform mergeStructs to a DS, sort it, and merge from right to left
-      //        but at the moment DS does not handle duplicates
-      for (let i = mergeStructs.length - 1; i >= 0; i--) {
-        const { client, clock } = mergeStructs[i].id
-        const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
-        const replacedStructPos = findIndexSS(structs, clock)
-        if (replacedStructPos + 1 < structs.length) {
-          if (tryToMergeWithLefts(structs, replacedStructPos + 1) > 1) {
-            continue // no need to perform next check, both are already merged
+        // on all affected store.clients props, try to merge
+        transaction.insertSet.clients.forEach((ids, client) => {
+          const firstClock = ids.getIds()[0].clock
+          const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
+          // we iterate from right to left so we can safely remove entries
+          const firstChangePos = math.max(findIndexSS(structs, firstClock), 1)
+          for (let i = structs.length - 1; i >= firstChangePos;) {
+            i -= 1 + tryToMergeWithLefts(structs, i)
           }
-        }
-        if (replacedStructPos > 0) {
-          tryToMergeWithLefts(structs, replacedStructPos)
-        }
-      }
-      if (!transaction.local && (transaction.insertSet.clients.has(doc.clientID) || hasSparseTransportClient(transaction, doc.clientID))) {
-        logging.print(logging.ORANGE, logging.BOLD, '[yjs] ', logging.UNBOLD, logging.RED, 'Changed the client-id because another client seems to be using it.')
-        doc.clientID = generateNewClientId()
-      }
-      // @todo Merge all the transactions into one and provide send the data as a single update message
-      doc.emit('afterTransactionCleanup', [transaction, doc])
-      if (doc._observers.has('update')) {
-        const encoder = new UpdateEncoderV1()
-        const hasContent = writeUpdateMessageFromTransaction(encoder, transaction)
-        if (hasContent) {
-          doc.emit('update', [encoder.toUint8Array(), transaction.origin, doc, transaction])
-        }
-      }
-      if (doc._observers.has('updateV2')) {
-        const encoder = new UpdateEncoderV2()
-        const hasContent = writeUpdateMessageFromTransaction(encoder, transaction)
-        if (hasContent) {
-          doc.emit('updateV2', [encoder.toUint8Array(), transaction.origin, doc, transaction])
-        }
-      }
-      const { subdocsAdded, subdocsLoaded, subdocsRemoved } = transaction
-      if (subdocsAdded.size > 0 || subdocsRemoved.size > 0 || subdocsLoaded.size > 0) {
-        subdocsAdded.forEach(subdoc => {
-          subdoc.clientID = doc.clientID
-          if (subdoc.collectionid == null) {
-            subdoc.collectionid = doc.collectionid
-          }
-          doc.subdocs.add(subdoc)
         })
-        subdocsRemoved.forEach(subdoc => doc.subdocs.delete(subdoc))
-        doc.emit('subdocs', [{ loaded: subdocsLoaded, added: subdocsAdded, removed: subdocsRemoved }, doc, transaction])
-        subdocsRemoved.forEach(subdoc => subdoc.destroy())
-      }
-
-      if (transactionCleanups.length <= i + 1) {
-        doc._transactionCleanups = []
-        doc.emit('afterAllTransactions', [doc, transactionCleanups])
-      } else {
-        cleanupTransactions(transactionCleanups, i + 1)
+        // try to merge mergeStructs
+        // @todo: it makes more sense to transform mergeStructs to a DS, sort it, and merge from right to left
+        //        but at the moment DS does not handle duplicates
+        for (let i = mergeStructs.length - 1; i >= 0; i--) {
+          const { client, clock } = mergeStructs[i].id
+          const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
+          const replacedStructPos = findIndexSS(structs, clock)
+          if (replacedStructPos + 1 < structs.length) {
+            if (tryToMergeWithLefts(structs, replacedStructPos + 1) > 1) {
+              continue // no need to perform next check, both are already merged
+            }
+          }
+          if (replacedStructPos > 0) {
+            tryToMergeWithLefts(structs, replacedStructPos)
+          }
+        }
+        let clientIDCollision = addedClientIDCollision
+        if (!hasAddedSubdocs) {
+          const lateClientID = doc.clientID
+          clientIDCollision = !transaction.local &&
+            (transaction.insertSet.clients.has(lateClientID) || hasSparseTransportClient(transaction, lateClientID))
+        }
+        if (clientIDCollision) {
+          logging.print(logging.ORANGE, logging.BOLD, '[yjs] ', logging.UNBOLD, logging.RED, 'Changed the client-id because another client seems to be using it.')
+          doc.clientID = hasAddedSubdocs ? /** @type {number} */ (effectiveClientID) : generateNewClientId()
+        }
+        // @todo Merge all the transactions into one and provide send the data as a single update message
+        if (!transactionHasSubdocs(transaction)) {
+          emitAfterTransactionCleanup(transaction, doc)
+          emitTransactionUpdate(transaction, doc)
+          emitTransactionUpdateV2(transaction, doc)
+        } else {
+          const { added: subdocsAdded, loaded: subdocsLoaded, removed: subdocsRemoved } = getTransactionSubdocSets(transaction)
+          const emitSubdocAfterCleanup = () => {
+            getTransactionSubdocSets(transaction)
+            emitAfterTransactionCleanup(transaction, doc)
+          }
+          const emitSubdocUpdate = () => {
+            getTransactionSubdocSets(transaction)
+            emitTransactionUpdate(transaction, doc)
+          }
+          const emitSubdocUpdateV2 = () => {
+            getTransactionSubdocSets(transaction)
+            emitTransactionUpdateV2(transaction, doc)
+          }
+          const hasSubdocEvents =
+            applyIntrinsic(setSizeGetter, subdocsAdded, []) > 0 ||
+            applyIntrinsic(setSizeGetter, subdocsRemoved, []) > 0 ||
+            applyIntrinsic(setSizeGetter, subdocsLoaded, []) > 0
+          if (!hasSubdocEvents) {
+            emitSubdocAfterCleanup()
+            emitSubdocUpdate()
+            emitSubdocUpdateV2()
+          } else {
+            const removedSubdocs = getRemovedSubdocDestroyers(transaction)
+            const destroySubdocs = /** @type {Array<()=>void>} */ ([])
+            for (let index = 0; index < removedSubdocs.length; index++) {
+              appendArrayValue(destroySubdocs, () => destroySubdoc(removedSubdocs[index]))
+            }
+            callAll([
+              emitSubdocAfterCleanup,
+              emitSubdocUpdate,
+              emitSubdocUpdateV2,
+              () => callAll([
+                () => publishTransactionSubdocs(transaction),
+                () => {
+                  getTransactionSubdocSets(transaction)
+                  doc.emit('subdocs', [{ loaded: subdocsLoaded, added: subdocsAdded, removed: subdocsRemoved }, doc, transaction])
+                },
+                () => callAll(destroySubdocs, [])
+              ], [])
+            ], [])
+          }
+        }
+        if (transactionHasSubdocs(transaction)) {
+          lifecycleFinalized = true
+          finalizeTransactionSubdocs(transaction)
+        }
+        cleanupAdvanced = true
+        if (transactionCleanups.length <= i + 1) {
+          doc._transactionCleanups = []
+          doc.emit('afterAllTransactions', [doc, transactionCleanups])
+        } else {
+          cleanupTransactions(transactionCleanups, i + 1)
+        }
+      } finally {
+        if (!cleanupAdvanced && transactionHasSubdocs(transaction)) {
+          try {
+            if (!lifecycleFinalized) {
+              lifecycleFinalized = true
+              finalizeTransactionSubdocs(transaction)
+            }
+          } finally {
+            cleanupAdvanced = true
+            if (transactionCleanups.length <= i + 1) {
+              doc._transactionCleanups = []
+              doc.emit('afterAllTransactions', [doc, transactionCleanups])
+            } else {
+              cleanupTransactions(transactionCleanups, i + 1)
+            }
+          }
+        }
       }
     }
   }
@@ -419,12 +540,14 @@ export const transact = (doc, f, origin = null, local = true) => {
     initialCall = true
     doc._transaction = new Transaction(doc, origin, local)
     transactionCleanups.push(doc._transaction)
-    if (transactionCleanups.length === 1) {
-      doc.emit('beforeAllTransactions', [doc])
-    }
-    doc.emit('beforeTransaction', [doc._transaction, doc])
   }
   try {
+    if (initialCall) {
+      if (transactionCleanups.length === 1) {
+        doc.emit('beforeAllTransactions', [doc])
+      }
+      doc.emit('beforeTransaction', [doc._transaction, doc])
+    }
     result = f(doc._transaction)
   } finally {
     if (initialCall) {

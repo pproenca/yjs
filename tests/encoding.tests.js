@@ -167,6 +167,35 @@ const createCausalHoleBase = () => {
   return doc
 }
 
+const c28Transports = [
+  { label: 'v1', apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },
+  { label: 'v2', apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, event: 'updateV2' }
+]
+
+/** @param {Y.Doc} doc @param {(doc:Y.Doc)=>Uint8Array<ArrayBuffer>} encode */
+const captureC28State = (doc, encode) => ({
+  bytes: Array.from(encode(doc)),
+  state: Array.from(Y.encodeStateVector(doc)),
+  clients: new Map(doc.store.clients),
+  pendingStructs: doc.store.pendingStructs,
+  pendingDs: doc.store.pendingDs,
+  share: doc.share,
+  roots: new Map(doc.share),
+  subdocs: new Set(doc.subdocs),
+  cleanups: doc._transactionCleanups.length
+})
+
+/** @param {Y.Doc} doc @param {(doc:Y.Doc)=>Uint8Array<ArrayBuffer>} encode @param {ReturnType<typeof captureC28State>} before @param {string} label */
+const assertC28State = (doc, encode, before, label) => {
+  t.compareArrays(Array.from(encode(doc)), before.bytes, `${label} bytes`)
+  t.compareArrays(Array.from(Y.encodeStateVector(doc)), before.state, `${label} state`)
+  t.assert(doc.store.clients.size === before.clients.size && [...before.clients].every(([client, structs]) => doc.store.clients.get(client) === structs), `${label} store`)
+  t.assert(doc.store.pendingStructs === before.pendingStructs && doc.store.pendingDs === before.pendingDs, `${label} pending`)
+  t.assert(doc.share === before.share && doc.share.size === before.roots.size && [...before.roots].every(([key, root]) => doc.share.get(key) === root), `${label} roots`)
+  t.assert(doc.subdocs.size === before.subdocs.size && [...before.subdocs].every(subdoc => doc.subdocs.has(subdoc)), `${label} subdocs`)
+  t.assert(doc._transaction === null && doc._transactionCleanups.length === before.cleanups, `${label} cleanup queue`)
+}
+
 /**
  * @param {t.TestCase} _tc
  */
@@ -1797,6 +1826,2615 @@ export const testSparseBeforeTransactionDestroyRejectsWithoutMutation = () => {
     }`)
   })
   t.assert(outcomes.every(outcome => outcome.endsWith(':true')), outcomes.join(', '))
+}
+
+export const testC28PreparedSubdocCleanupOwnsLateIdentityTaint = () => {
+  c28Transports.forEach(({ label, apply, encode, event }) => {
+    ;['clientID', 'collectionid'].forEach(property => {
+      /** @type {Array<Y.Doc>} */
+      const candidates = []
+      class TargetDoc extends Y.Doc {
+        /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+        constructor (opts) {
+          super(opts)
+          if (opts?.guid === `c28-late-${property}`) candidates.push(this)
+        }
+      }
+      const source = new Y.Doc({ gc: false })
+      source.get('docs').insert(0, [new Y.Doc({ guid: `c28-late-${property}`, autoLoad: true })])
+      source.get('text').insert(0, ['x'])
+      const host = new TargetDoc({ gc: false, sparseExactResolution: true, collectionid: 'c28-collection' })
+      let transactions = 0
+      let cleanups = 0
+      let updates = 0
+      let subdocs = 0
+      host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+      host.on('subdocs', () => { subdocs++ })
+      host.on('afterTransactionCleanup', () => { cleanups++ })
+      host.on('afterTransaction', () => {
+        transactions++
+        const candidate = candidates[candidates.length - 1]
+        Object.defineProperty(candidate, property, {
+          get: () => { throw new Error(`tainted ${property} getter`) },
+          set: () => { throw new Error(`tainted ${property} setter`) },
+          configurable: false
+        })
+      })
+
+      let failure = null
+      try { apply(host, encode(source)) } catch (error) { failure = error }
+      t.assert(failure === null, `${label} ${property} cleanup must not become a committed error`)
+      const child = /** @type {Y.Doc} */ (host.get('docs').get(0))
+      t.assert(
+        candidates.length === 1 && child === candidates[0] && child.shouldLoad &&
+        host.subdocs.size === 1 && host.subdocs.has(child),
+        `${label} ${property} child admission`
+      )
+      t.assert(transactions === 1 && cleanups === 1 && updates === 1 && subdocs === 1, `${label} ${property} events`)
+      t.assert(host._transaction === null && host._transactionCleanups.length === 0, `${label} ${property} cleanup queue`)
+      const snapshot = encode(host)
+      const reload = new Y.Doc({ gc: false, collectionid: 'c28-collection' })
+      apply(reload, snapshot)
+      const reloaded = /** @type {Y.Doc} */ (reload.get('docs').get(0))
+      t.assert(reloaded.guid === child.guid && reload.subdocs.has(reloaded) && reload.get('text').get(0) === 'x')
+    })
+  })
+}
+
+export const testC28ConstructorReturnedSubdocMustMatchWireIdentity = () => {
+  c28Transports.forEach(({ label, apply, encode, event }) => {
+    ;['guid', 'gc', 'sparse', 'shouldLoad', 'autoLoad', 'meta'].forEach(property => {
+      let hostile = true
+      /** @type {Array<Y.Doc>} */
+      const candidates = []
+      class TargetDoc extends Y.Doc {
+        /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+        constructor (opts) {
+          super(opts)
+          if (!hostile || opts?.guid !== `c28-wire-${property}`) return
+          const wrong = { ...opts }
+          if (property === 'guid') wrong.guid = 'c28-wrong-guid'
+          if (property === 'gc') wrong.gc = true
+          if (property === 'sparse') {
+            wrong.gc = false
+            wrong.sparseExactResolution = true
+          }
+          if (property === 'shouldLoad') wrong.shouldLoad = false
+          if (property === 'autoLoad') wrong.autoLoad = false
+          if (property === 'meta') wrong.meta = { value: 'wrong' }
+          const candidate = new Y.Doc(wrong)
+          candidates.push(candidate)
+          return candidate
+        }
+      }
+      const source = new Y.Doc({ gc: false })
+      source.get('docs').insert(0, [new Y.Doc({ guid: `c28-wire-${property}`, gc: false, autoLoad: true, meta: { value: 'expected' } })])
+      source.get('text').insert(0, ['x'])
+      const host = new TargetDoc({ gc: false, sparseExactResolution: true })
+      const existing = host.get('existing')
+      existing.insert(0, ['base'])
+      const before = captureC28State(host, encode)
+      let updates = 0
+      let transactions = 0
+      let subdocs = 0
+      host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+      host.on('afterTransaction', () => { transactions++ })
+      host.on('subdocs', () => { subdocs++ })
+
+      t.fails(() => apply(host, encode(source)))
+      assertC28State(host, encode, before, `${label} ${property}`)
+      t.assert(candidates.length === 1 && !candidates[0].isDestroyed && updates === 0 && transactions === 0 && subdocs === 0)
+
+      hostile = false
+      apply(host, encode(source))
+      const child = /** @type {Y.Doc} */ (host.get('docs').get(0))
+      t.assert(
+        child.guid === `c28-wire-${property}` && child.gc === false && !child.sparseExactResolution &&
+        child.shouldLoad && child.autoLoad && child.meta?.value === 'expected' && host.subdocs.has(child) &&
+        host.get('text').get(0) === 'x' && existing.get(0) === 'base',
+        `${label} ${property} clean retry`
+      )
+      t.assert(updates === 1 && transactions === 1 && subdocs === 1 && host._transactionCleanups.length === 0)
+      const reload = new Y.Doc({ gc: false })
+      apply(reload, encode(host))
+      t.assert(/** @type {Y.Doc} */ (reload.get('docs').get(0)).guid === child.guid && reload.get('text').get(0) === 'x')
+    })
+  })
+}
+
+export const testC28DestroyedSparseProxyRejectsApplyAndEncode = () => {
+  c28Transports.forEach(({ label, apply, encode }) => {
+    const source = new Y.Doc({ gc: false })
+    source.clientID = 2
+    source.get('incoming').insert(0, ['x'])
+    const backing = new Y.Doc({ gc: false, sparseExactResolution: true })
+    backing.clientID = 1
+    const base = backing.get('base')
+    base.insert(0, ['kept'])
+    const beforeBytes = Array.from(encode(backing))
+    const beforeState = Array.from(Y.encodeStateVector(backing))
+    const beforeClients = new Map(backing.store.clients)
+    const pendingStructs = backing.store.pendingStructs
+    const pendingDs = backing.store.pendingDs
+    backing.destroy()
+    const proxy = new Proxy(backing, {})
+
+    let applyFailure = null
+    try { apply(proxy, encode(source)) } catch (error) { applyFailure = error }
+    let encodeFailure = null
+    try { encode(proxy) } catch (error) { encodeFailure = error }
+    t.assert(applyFailure instanceof Error && encodeFailure instanceof Error, `${label} destroyed backing identity`)
+    t.compareArrays(Array.from(Y.encodeStateVector(backing)), beforeState)
+    t.assert(
+      backing.isDestroyed && base.get(0) === 'kept' && !backing.share.has('incoming') &&
+      backing.store.clients.size === beforeClients.size && [...beforeClients].every(([client, structs]) => backing.store.clients.get(client) === structs) &&
+      backing.store.pendingStructs === pendingStructs && backing.store.pendingDs === pendingDs && backing._transactionCleanups.length === 0 &&
+      beforeBytes.length > 0,
+      `${label} destroyed backing remains unchanged`
+    )
+  })
+}
+
+export const testC28SparseSubdocAdmissionUsesOwnedSetAdd = () => {
+  const nativeAdd = Set.prototype.add
+  const nativeClear = Set.prototype.clear
+  c28Transports.forEach(({ label, apply, encode, event }) => {
+    let candidate = /** @type {Y.Doc|null} */ (null)
+    class TargetDoc extends Y.Doc {
+      /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+      constructor (opts) {
+        super(opts)
+        if (opts?.guid === `c28-owned-${label}`) candidate = this
+      }
+    }
+    const source = new Y.Doc({ gc: false })
+    source.get('docs').insert(0, [new Y.Doc({ guid: `c28-owned-${label}`, autoLoad: true })])
+    source.get('text').insert(0, ['x'])
+    const host = new TargetDoc({ gc: false, sparseExactResolution: true })
+    const forged = new Y.Doc({ guid: `c28-forged-${label}` })
+    const existing = host.get('existing')
+    existing.insert(0, ['base'])
+    let hooks = 0
+    let taints = 0
+    let shadowCalls = 0
+    let updates = 0
+    let transactions = 0
+    let subdocs = 0
+    let subdocEvent = /** @type {{added:Set<Y.Doc>,loaded:Set<Y.Doc>,removed:Set<Y.Doc>}|null} */ (null)
+    /** @param {Y.Transaction} transaction */
+    const forgePublicSets = transaction => {
+      taints++
+      ;[transaction.subdocsAdded, transaction.subdocsLoaded, transaction.subdocsRemoved].forEach(set => {
+        Reflect.apply(nativeClear, set, [])
+        Reflect.apply(nativeAdd, set, [forged])
+      })
+    }
+    host.on('beforeTransaction', transaction => {
+      hooks++
+      transaction.subdocsAdded.add = () => {
+        shadowCalls++
+        throw new Error('shadowed subdoc admission')
+      }
+    })
+    host.on('beforeObserverCalls', forgePublicSets)
+    host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+    host.on('afterTransaction', transaction => {
+      transactions++
+      forgePublicSets(transaction)
+      const child = /** @type {Y.Doc} */ (candidate)
+      ;['clientID', 'collectionid'].forEach(property => Object.defineProperty(child, property, {
+        get: () => { throw new Error(`late ${property} read`) },
+        set: () => { throw new Error(`late ${property} write`) },
+        configurable: false
+      }))
+    })
+    host.on('subdocs', subdocSets => { subdocs++; subdocEvent = subdocSets })
+
+    let failure = null
+    try { apply(host, encode(source)) } catch (error) { failure = error }
+    t.assert(failure === null && shadowCalls === 0, `${label} admission bypasses the shadowed add`)
+    const child = /** @type {Y.Doc} */ (host.get('docs').get(0))
+    const emitted = /** @type {NonNullable<typeof subdocEvent>} */ (subdocEvent)
+    t.assert(
+      child === candidate && child.guid === `c28-owned-${label}` && host.subdocs.size === 1 && host.subdocs.has(child) && !host.subdocs.has(forged) &&
+      emitted.added.size === 1 && emitted.added.has(child) && emitted.loaded.size === 1 && emitted.loaded.has(child) &&
+      emitted.removed.size === 0 && !emitted.added.has(forged) && !emitted.loaded.has(forged) &&
+      host.get('text').get(0) === 'x' && existing.get(0) === 'base' && host.store.pendingStructs === null && host.store.pendingDs === null,
+      `${label} full subdoc commit`
+    )
+    t.assert(hooks === 1 && taints === 2 && updates === 1 && transactions === 1 && subdocs === 1 && host._transaction === null && host._transactionCleanups.length === 0)
+    const reload = new Y.Doc({ gc: false })
+    apply(reload, encode(host))
+    const reloaded = /** @type {Y.Doc} */ (reload.get('docs').get(0))
+    t.assert(reload.subdocs.has(reloaded) && reloaded.guid === child.guid && reload.get('text').get(0) === 'x')
+  })
+}
+
+export const testC28PreparedSubdocCannotEraseForeignAdmission = () => {
+  c28Transports.forEach(({ label, apply, encode, event }) => {
+    const foreignParent = new Y.Doc({ gc: false })
+    let hostile = true
+    let candidate = /** @type {Y.Doc|null} */ (null)
+    let foreignBefore = /** @type {ReturnType<typeof captureC28State>|null} */ (null)
+    class TargetDoc extends Y.Doc {
+      /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+      constructor (opts) {
+        super(opts)
+        if (!hostile || opts?.guid !== `c28-foreign-${label}`) return
+        const returned = new Y.Doc(opts)
+        const clientID = returned.clientID
+        const collectionid = returned.collectionid
+        foreignParent.get('docs').insert(0, [returned])
+        returned.clientID = clientID
+        returned.collectionid = collectionid
+        returned._item = null
+        candidate = returned
+        foreignBefore = captureC28State(foreignParent, encode)
+        return returned
+      }
+    }
+    const source = new Y.Doc({ gc: false })
+    source.get('docs').insert(0, [new Y.Doc({ guid: `c28-foreign-${label}`, gc: false })])
+    source.get('text').insert(0, ['x'])
+    const host = new TargetDoc({ gc: false, sparseExactResolution: true })
+    const existing = host.get('existing')
+    existing.insert(0, ['base'])
+    const before = captureC28State(host, encode)
+    let updates = 0
+    let transactions = 0
+    let subdocs = 0
+    host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+    host.on('afterTransaction', () => { transactions++ })
+    host.on('subdocs', () => { subdocs++ })
+
+    t.fails(() => apply(host, encode(source)))
+    assertC28State(host, encode, before, `${label} erased foreign admission`)
+    t.assert(
+      candidate !== null && candidate._item === null && !candidate.isDestroyed && foreignParent.get('docs').get(0) === candidate &&
+      foreignParent.subdocs.has(candidate) && updates === 0 && transactions === 0 && subdocs === 0,
+      `${label} private _item is not admission authority`
+    )
+    assertC28State(foreignParent, encode, /** @type {NonNullable<typeof foreignBefore>} */ (foreignBefore), `${label} foreign parent`)
+
+    hostile = false
+    apply(host, encode(source))
+    const child = /** @type {Y.Doc} */ (host.get('docs').get(0))
+    t.assert(child !== candidate && host.subdocs.has(child) && host.get('text').get(0) === 'x' && existing.get(0) === 'base')
+    const reload = new Y.Doc({ gc: false })
+    apply(reload, encode(host))
+    t.assert(/** @type {Y.Doc} */ (reload.get('docs').get(0)).guid === child.guid && reload.get('text').get(0) === 'x')
+    assertC28State(foreignParent, encode, /** @type {NonNullable<typeof foreignBefore>} */ (foreignBefore), `${label} foreign parent after retry`)
+  })
+
+  const foreignParent = new Y.Doc({ gc: false })
+  const child = new Y.Doc({ guid: 'c28-ordinary-foreign', gc: false })
+  const clientID = child.clientID
+  const collectionid = child.collectionid
+  foreignParent.get('docs').insert(0, [child])
+  child.clientID = clientID
+  child.collectionid = collectionid
+  child._item = null
+  const foreignBefore = captureC28State(foreignParent, Y.encodeStateAsUpdate)
+  const target = new Y.Doc({ gc: false })
+  const docs = target.get('docs')
+  const before = captureC28State(target, Y.encodeStateAsUpdate)
+  let updates = 0
+  let subdocs = 0
+  target.on('update', () => { updates++ })
+  target.on('subdocs', () => { subdocs++ })
+  t.fails(() => docs.insert(0, [child]))
+  assertC28State(target, Y.encodeStateAsUpdate, before, 'ordinary erased foreign admission')
+  assertC28State(foreignParent, Y.encodeStateAsUpdate, foreignBefore, 'ordinary foreign parent')
+  t.assert(foreignParent.get('docs').get(0) === child && foreignParent.subdocs.has(child) && updates === 0 && subdocs === 0)
+}
+
+export const testC28PreparedSubdocRejectsConstructorIdentityTaint = () => {
+  c28Transports.forEach(({ label, apply, encode, event }) => {
+    ;['clientID', 'collectionid'].forEach(property => {
+      let hostile = true
+      /** @type {Array<Y.Doc>} */
+      const candidates = []
+      class TargetDoc extends Y.Doc {
+        /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+        constructor (opts) {
+          super(opts)
+          if (!hostile || opts?.guid !== `c28-ctor-${property}`) return
+          if (property === 'clientID') this.clientID++
+          else this.collectionid = 'foreign-collection'
+          candidates.push(this)
+        }
+      }
+      const source = new Y.Doc({ gc: false })
+      source.get('docs').insert(0, [new Y.Doc({ guid: `c28-ctor-${property}`, autoLoad: true })])
+      source.get('text').insert(0, ['x'])
+      const host = new TargetDoc({ gc: false, sparseExactResolution: true, collectionid: 'host-collection' })
+      const existing = host.get('existing')
+      existing.insert(0, ['base'])
+      const before = captureC28State(host, encode)
+      let updates = 0
+      let transactions = 0
+      let subdocs = 0
+      host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+      host.on('afterTransaction', () => { transactions++ })
+      host.on('subdocs', () => { subdocs++ })
+
+      t.fails(() => apply(host, encode(source)))
+      assertC28State(host, encode, before, `${label} constructor ${property}`)
+      t.assert(candidates.length === 1 && !candidates[0].isDestroyed && updates === 0 && transactions === 0 && subdocs === 0)
+      hostile = false
+      apply(host, encode(source))
+      const child = /** @type {Y.Doc} */ (host.get('docs').get(0))
+      t.assert(
+        child.clientID === host.clientID && child.collectionid === host.collectionid && host.subdocs.has(child) &&
+        host.get('text').get(0) === 'x' && existing.get(0) === 'base' && host._transactionCleanups.length === 0,
+        `${label} constructor ${property} clean retry`
+      )
+      const snapshot = encode(host)
+      const reload = new Y.Doc({ gc: false, collectionid: 'host-collection' })
+      apply(reload, snapshot)
+      t.compareArrays(Array.from(encode(reload)), Array.from(snapshot))
+      t.compareArrays(Array.from(Y.encodeStateVector(reload)), Array.from(Y.encodeStateVector(host)))
+      t.assert(reload.subdocs.size === 1 && reload.get('text').get(0) === 'x' && reload.get('existing').get(0) === 'base')
+    })
+  })
+}
+
+export const testC28SubdocPublicationSurvivesPostObserverListenerFailure = () => {
+  c28Transports.forEach(({ label, apply, encode }) => {
+    ;['afterTransactionCleanup', 'update', 'updateV2'].forEach(stage => {
+      const guid = `c28-tail-${label}-${stage}`
+      let candidate = /** @type {Y.Doc|null} */ (null)
+      class TargetDoc extends Y.Doc {
+        /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+        constructor (opts) {
+          super(opts)
+          if (opts?.guid === guid) candidate = this
+        }
+      }
+      const source = new Y.Doc({ gc: false })
+      source.get('docs').insert(0, [new Y.Doc({ guid, autoLoad: true })])
+      source.get('text').insert(0, ['x'])
+      const host = new TargetDoc({ gc: false, sparseExactResolution: true })
+      const listenerError = new Error(`${stage} listener`)
+      let armed = true
+      let stageCalls = 0
+      let updatesV1 = 0
+      let updatesV2 = 0
+      let subdocs = 0
+      let subdocEvent = /** @type {{added:Set<Y.Doc>,loaded:Set<Y.Doc>,removed:Set<Y.Doc>}|null} */ (null)
+      host.on('update', () => { updatesV1++ })
+      host.on('updateV2', () => { updatesV2++ })
+      host.on('subdocs', event => { subdocs++; subdocEvent = event })
+      host.on(/** @type {'afterTransactionCleanup'|'update'|'updateV2'} */ (stage), () => {
+        stageCalls++
+        if (armed) {
+          armed = false
+          throw listenerError
+        }
+      })
+
+      let failure = null
+      try { apply(host, encode(source)) } catch (error) { failure = error }
+      t.assert(failure === listenerError && stageCalls === 1, `${label} ${stage} preserves exact listener failure`)
+      const child = /** @type {Y.Doc} */ (host.get('docs').get(0))
+      const emitted = /** @type {NonNullable<typeof subdocEvent>} */ (subdocEvent)
+      t.assert(
+        candidate !== null && child === candidate && child.guid === guid && child.shouldLoad &&
+        host.subdocs.size === 1 && host.subdocs.has(child) && subdocs === 1 &&
+        emitted.added.has(child) && emitted.loaded.has(child) && emitted.removed.size === 0,
+        `${label} ${stage} publishes the exact committed child`
+      )
+      t.assert(
+        updatesV1 === 1 && updatesV2 === 1 && host.store.pendingStructs === null && host.store.pendingDs === null &&
+        host._transaction === null && host._transactionCleanups.length === 0,
+        `${label} ${stage} drains the transaction tail`
+      )
+      const snapshot = encode(host)
+      const state = Y.encodeStateVector(host)
+      const reload = new Y.Doc({ gc: false })
+      apply(reload, snapshot)
+      const reloaded = /** @type {Y.Doc} */ (reload.get('docs').get(0))
+      t.compareArrays(Array.from(encode(reload)), Array.from(snapshot))
+      t.compareArrays(Array.from(Y.encodeStateVector(reload)), Array.from(state))
+      t.assert(reload.subdocs.has(reloaded) && reloaded.guid === guid && reload.get('text').get(0) === 'x')
+
+      host.get('next').insert(0, ['ok'])
+      t.assert(
+        stageCalls === 2 && updatesV1 === 2 && updatesV2 === 2 && subdocs === 1 &&
+        host.get('next').get(0) === 'ok' && host._transaction === null && host._transactionCleanups.length === 0,
+        `${label} ${stage} next transaction`
+      )
+    })
+  })
+}
+
+export const testC28OrdinaryRemoteSubdocAdmissionFailsBeforeOnePassWrite = () => {
+  c28Transports.forEach(({ label, apply, encode, event }) => {
+    ;['throw', 'clientID', 'collectionid'].forEach(mode => {
+      const guid = `c28-ordinary-${label}-${mode}`
+      const constructorError = new Error(`${mode} constructor failure`)
+      let hostile = true
+      let constructions = 0
+      class TargetDoc extends Y.Doc {
+        /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+        constructor (opts) {
+          super(opts)
+          if (opts?.guid !== guid) return
+          constructions++
+          if (!hostile) return
+          if (mode === 'throw') throw constructorError
+          Object.defineProperty(this, mode, {
+            get: () => { throw new Error(`hostile ${mode} read`) },
+            set: () => { throw new Error(`hostile ${mode} write`) },
+            configurable: true
+          })
+          return this
+        }
+      }
+      const source = new Y.Doc({ gc: false })
+      source.get('docs').insert(0, [new Y.Doc({ guid, autoLoad: true })])
+      source.get('text').insert(0, ['x'])
+      const update = encode(source)
+      const host = new TargetDoc({ gc: false, collectionid: 'ordinary-collection' })
+      const existing = host.get('existing')
+      existing.insert(0, ['base'])
+      const before = captureC28State(host, encode)
+      let beforeTransactions = 0
+      let afterTransactions = 0
+      let updates = 0
+      let subdocs = 0
+      host.on('beforeTransaction', () => { beforeTransactions++ })
+      host.on('afterTransaction', () => { afterTransactions++ })
+      host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+      host.on('subdocs', () => { subdocs++ })
+
+      let failure = null
+      try { apply(host, update) } catch (error) { failure = error }
+      t.assert(mode === 'throw' ? failure === constructorError : failure instanceof Error, `${label} ${mode} admission failure`)
+      t.compareArrays(Array.from(encode(host)), before.bytes, `${label} ${mode} bytes`)
+      t.compareArrays(Array.from(Y.encodeStateVector(host)), before.state, `${label} ${mode} state`)
+      t.assert(host.store.clients.size === before.clients.size && [...before.clients].every(([client, structs]) => host.store.clients.get(client) === structs), `${label} ${mode} store`)
+      t.assert(host.store.pendingStructs === before.pendingStructs && host.store.pendingDs === before.pendingDs, `${label} ${mode} pending`)
+      const preparedRoot = host.share.get('docs')
+      t.assert(
+        constructions === 1 && preparedRoot !== undefined && preparedRoot.length === 0 && existing.get(0) === 'base' &&
+        beforeTransactions === 1 && afterTransactions === 1 && updates === 0 && subdocs === 0 && host.subdocs.size === 0 &&
+        host._transaction === null && host._transactionCleanups.length === 0,
+        `${label} ${mode} failure is pre-Item`
+      )
+
+      hostile = false
+      apply(host, update)
+      const child = /** @type {Y.Doc} */ (host.get('docs').get(0))
+      t.assert(
+        constructions === 2 && host.get('docs') === preparedRoot && child.guid === guid && child.shouldLoad && child.clientID === host.clientID &&
+        child.collectionid === host.collectionid && host.subdocs.size === 1 && host.subdocs.has(child) &&
+        host.get('text').get(0) === 'x' && existing.get(0) === 'base' &&
+        host.store.pendingStructs === null && host.store.pendingDs === null,
+        `${label} ${mode} clean one-pass retry`
+      )
+      t.assert(beforeTransactions === 2 && afterTransactions === 2 && updates === 1 && subdocs === 1 && host._transactionCleanups.length === 0)
+      const snapshot = encode(host)
+      const state = Y.encodeStateVector(host)
+      const reload = new Y.Doc({ gc: false, collectionid: 'ordinary-collection' })
+      apply(reload, snapshot)
+      const reloaded = /** @type {Y.Doc} */ (reload.get('docs').get(0))
+      t.compareArrays(Array.from(encode(reload)), Array.from(snapshot))
+      t.compareArrays(Array.from(Y.encodeStateVector(reload)), Array.from(state))
+      t.assert(reload.subdocs.has(reloaded) && reloaded.guid === guid && reload.get('text').get(0) === 'x' && reload.get('existing').get(0) === 'base')
+    })
+  })
+}
+
+export const testC28NullParentContentDocRemainsGcWithoutLifecycle = () => {
+  let constructions = 0
+  class TargetDoc extends Y.Doc {
+    /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+    constructor (opts) {
+      super(opts)
+      if (opts?.guid === 'c28-null-parent') constructions++
+    }
+  }
+  const doc = new TargetDoc({ gc: false })
+  const content = new Y.ContentDoc('c28-null-parent', { autoLoad: true })
+  const id = Y.createID(280, 0)
+  const item = new Y.Item(id, null, null, null, null, null, null, content)
+  let updatesV1 = 0
+  let updatesV2 = 0
+  let transactions = 0
+  let subdocs = 0
+  doc.on('update', () => { updatesV1++ })
+  doc.on('updateV2', () => { updatesV2++ })
+  doc.on('afterTransaction', () => { transactions++ })
+  doc.on('subdocs', () => { subdocs++ })
+
+  doc.transact(transaction => item.integrate(transaction, 0))
+  const stored = doc.store.getStruct(id)
+  t.assert(
+    constructions === 0 && content.doc === null && stored?.constructor === Y.GC && stored.length === 1 &&
+    doc.share.size === 0 && doc.subdocs.size === 0 && subdocs === 0 && updatesV1 === 1 && updatesV2 === 1 && transactions === 1 &&
+    doc.store.pendingStructs === null && doc.store.pendingDs === null && doc._transaction === null && doc._transactionCleanups.length === 0,
+    'null-parent ContentDoc integrates only its GC shell'
+  )
+  ;[
+    { encode: Y.encodeStateAsUpdate, decode: Y.decodeUpdate, apply: Y.applyUpdate },
+    { encode: Y.encodeStateAsUpdateV2, decode: Y.decodeUpdateV2, apply: Y.applyUpdateV2 }
+  ].forEach(({ encode, decode, apply }) => {
+    const snapshot = encode(doc)
+    const decoded = decode(snapshot).structs
+    t.assert(decoded.length === 1 && decoded[0].constructor === Y.GC && decoded[0].id.client === id.client && decoded[0].id.clock === 0)
+    const reload = new Y.Doc({ gc: false })
+    apply(reload, snapshot)
+    t.compareArrays(Array.from(encode(reload)), Array.from(snapshot))
+    t.compareArrays(Array.from(Y.encodeStateVector(reload)), Array.from(Y.encodeStateVector(doc)))
+    t.assert(reload.store.getStruct(id)?.constructor === Y.GC && reload.subdocs.size === 0 && reload.share.size === 0)
+  })
+}
+
+export const testC28SubdocClientIdFollowsParentCollisionRotation = () => {
+  c28Transports.forEach(({ label, apply, encode, event }) => {
+    const collisionID = 28_000
+    const guid = `c28-collision-${label}`
+    let candidate = /** @type {Y.Doc|null} */ (null)
+    class TargetDoc extends Y.Doc {
+      /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+      constructor (opts) {
+        super(opts)
+        if (opts?.guid === guid) candidate = this
+      }
+    }
+    const host = new TargetDoc({ gc: false, sparseExactResolution: true })
+    host.clientID = collisionID
+    const source = new Y.Doc({ gc: false })
+    source.clientID = collisionID
+    source.get('docs').insert(0, [new Y.Doc({ guid, autoLoad: true })])
+    source.get('text').insert(0, ['x'])
+    let beforeObserverID = -1
+    let afterTransactionID = -1
+    let updateParentID = -1
+    let updates = 0
+    let subdocs = 0
+    let subdocEvent = /** @type {{added:Set<Y.Doc>,loaded:Set<Y.Doc>,removed:Set<Y.Doc>}|null} */ (null)
+    host.on('beforeObserverCalls', () => { beforeObserverID = host.clientID })
+    host.on('afterTransaction', () => { afterTransactionID = host.clientID })
+    host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++; updateParentID = host.clientID })
+    host.on('subdocs', event => { subdocs++; subdocEvent = event })
+
+    apply(host, encode(source))
+    const child = /** @type {Y.Doc} */ (host.get('docs').get(0))
+    const emitted = /** @type {NonNullable<typeof subdocEvent>} */ (subdocEvent)
+    t.assert(
+      beforeObserverID === collisionID && afterTransactionID === collisionID && host.clientID !== collisionID && updateParentID === host.clientID,
+      `${label} parent collision rotates after observers and before update`
+    )
+    t.assert(
+      candidate !== null && child === candidate && child.clientID === host.clientID && child.shouldLoad &&
+      host.subdocs.size === 1 && host.subdocs.has(child) && emitted.added.size === 1 && emitted.added.has(child) &&
+      emitted.loaded.size === 1 && emitted.loaded.has(child) && emitted.removed.size === 0 && updates === 1 && subdocs === 1 &&
+      host.get('text').get(0) === 'x' && host.store.pendingStructs === null && host.store.pendingDs === null &&
+      host._transaction === null && host._transactionCleanups.length === 0,
+      `${label} child follows the rotated parent identity`
+    )
+    const snapshot = encode(host)
+    const state = Y.encodeStateVector(host)
+    t.assert(Y.decodeStateVector(state).get(collisionID) === 2)
+    const reload = new Y.Doc({ gc: false })
+    apply(reload, snapshot)
+    const reloaded = /** @type {Y.Doc} */ (reload.get('docs').get(0))
+    t.compareArrays(Array.from(encode(reload)), Array.from(snapshot))
+    t.compareArrays(Array.from(Y.encodeStateVector(reload)), Array.from(state))
+    t.assert(reload.subdocs.has(reloaded) && reloaded.guid === guid && reloaded.clientID === reload.clientID && reload.get('text').get(0) === 'x')
+  })
+}
+
+export const testC28SparseSubdocPermitSurvivesSubclassOptionClone = () => {
+  c28Transports.forEach(({ label, apply, encode, event }) => {
+    const guid = `c28-cloned-options-${label}`
+    let candidate = /** @type {Y.Doc|null} */ (null)
+    class TargetDoc extends Y.Doc {
+      /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+      constructor (opts) {
+        super({ ...opts })
+        if (opts?.guid === guid) candidate = this
+      }
+    }
+    const source = new Y.Doc({ gc: false })
+    source.get('docs').insert(0, [new Y.Doc({ guid, gc: false, autoLoad: true, meta: { cloned: true } })])
+    source.get('text').insert(0, ['x'])
+    const host = new TargetDoc({ gc: false, sparseExactResolution: true })
+    let updates = 0
+    let transactions = 0
+    let subdocs = 0
+    host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+    host.on('afterTransaction', () => { transactions++ })
+    host.on('subdocs', () => { subdocs++ })
+
+    apply(host, encode(source))
+    const child = /** @type {Y.Doc} */ (host.get('docs').get(0))
+    t.assert(
+      candidate !== null && child === candidate && child.guid === guid && child.gc === false && child.shouldLoad && child.autoLoad &&
+      child.meta?.cloned === true && child.clientID === host.clientID && host.subdocs.size === 1 && host.subdocs.has(child) &&
+      host.get('text').get(0) === 'x' && updates === 1 && transactions === 1 && subdocs === 1 &&
+      host.store.pendingStructs === null && host.store.pendingDs === null && host._transactionCleanups.length === 0,
+      `${label} cloned constructor options retain the preparation permit`
+    )
+    const snapshot = encode(host)
+    const reload = new Y.Doc({ gc: false })
+    apply(reload, snapshot)
+    const reloaded = /** @type {Y.Doc} */ (reload.get('docs').get(0))
+    t.compareArrays(Array.from(encode(reload)), Array.from(snapshot))
+    t.assert(reload.subdocs.has(reloaded) && reloaded.guid === guid && reload.get('text').get(0) === 'x')
+  })
+}
+
+export const testC28ParentCannotInsertItselfAsSubdoc = () => {
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const doc = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const docs = doc.get('docs')
+    const before = captureC28State(doc, Y.encodeStateAsUpdateV2)
+    let updates = 0
+    let subdocs = 0
+    doc.on('update', () => { updates++ })
+    doc.on('updateV2', () => { updates++ })
+    doc.on('subdocs', () => { subdocs++ })
+
+    t.fails(() => docs.insert(0, [doc]))
+    assertC28State(doc, Y.encodeStateAsUpdateV2, before, `${label} self insertion`)
+    t.assert(docs.length === 0 && doc.subdocs.size === 0 && updates === 0 && subdocs === 0 && !doc.isDestroyed)
+  })
+}
+
+export const testC28NoSubdocCollisionUsesPostObserverClientId = () => {
+  c28Transports.forEach(({ label, apply, encode, event }) => {
+    ;['enter', 'leave'].forEach(mode => {
+      const collisionID = 28_100
+      const safeID = 28_200
+      const source = new Y.Doc({ gc: false })
+      source.clientID = collisionID
+      source.get('text').insert(0, ['x'])
+      const host = new Y.Doc({ gc: false, sparseExactResolution: true })
+      host.clientID = mode === 'enter' ? safeID : collisionID
+      const initialID = host.clientID
+      const observerID = mode === 'enter' ? collisionID : safeID
+      let beforeObserverID = -1
+      let afterTransactionID = -1
+      let updateID = -1
+      let updates = 0
+      let subdocs = 0
+      host.on('beforeObserverCalls', () => {
+        beforeObserverID = host.clientID
+        host.clientID = observerID
+      })
+      host.on('afterTransaction', () => { afterTransactionID = host.clientID })
+      host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++; updateID = host.clientID })
+      host.on('subdocs', () => { subdocs++ })
+
+      apply(host, encode(source))
+      const expectedFinal = mode === 'leave' ? safeID : host.clientID
+      t.assert(
+        beforeObserverID === initialID && afterTransactionID === observerID && updateID === host.clientID &&
+        (mode === 'enter' ? host.clientID !== collisionID : host.clientID === expectedFinal) &&
+        host.get('text').get(0) === 'x' && updates === 1 && subdocs === 0 && host.subdocs.size === 0 &&
+        host._transaction === null && host._transactionCleanups.length === 0,
+        `${label} observer ${mode} collision`
+      )
+    })
+  })
+}
+
+export const testC28OrdinarySubdocMetadataIsCanonicalizedAtCleanup = () => {
+  /** @type {Array<{local:boolean,error:string|null,equalClient:boolean,equalCollection:boolean,member:boolean,event:boolean,updatesV1:number,updatesV2:number,queue:number}>} */
+  const results = []
+  ;[true, false].forEach((local, index) => {
+    const parent = new Y.Doc({ gc: false, collectionid: 'c28-parent' })
+    parent.clientID = 28_300 + index
+    const child = new Y.Doc({ guid: `c28-metadata-${local}` })
+    let updatesV1 = 0
+    let updatesV2 = 0
+    let subdocEvent = /** @type {{added:Set<Y.Doc>,loaded:Set<Y.Doc>,removed:Set<Y.Doc>}|null} */ (null)
+    parent.on('update', () => { updatesV1++ })
+    parent.on('updateV2', () => { updatesV2++ })
+    parent.on('subdocs', event => { subdocEvent = event })
+    let error = /** @type {Error|null} */ (null)
+    try {
+      parent.transact(() => {
+        parent.get('docs').insert(0, [child])
+        child.clientID = 7
+        child.collectionid = null
+      }, null, local)
+    } catch (failure) {
+      error = /** @type {Error} */ (failure)
+    }
+    const emitted = subdocEvent
+    results.push({
+      local,
+      error: error?.message ?? null,
+      equalClient: child.clientID === parent.clientID,
+      equalCollection: child.collectionid === parent.collectionid,
+      member: parent.subdocs.size === 1 && parent.subdocs.has(child),
+      event: emitted !== null && emitted.added.size === 1 && emitted.added.has(child) && emitted.loaded.has(child) && emitted.removed.size === 0,
+      updatesV1,
+      updatesV2,
+      queue: parent._transactionCleanups.length
+    })
+  })
+  t.assert(results.every(result =>
+    result.error === null && result.equalClient && result.equalCollection && result.member && result.event &&
+    result.updatesV1 === 1 && result.updatesV2 === 1 && result.queue === 0
+  ), JSON.stringify(results))
+}
+
+export const testC28CollisionObserverReplacementUsesRotatedClientId = () => {
+  c28Transports.forEach(({ label, apply, encode }) => {
+    const collisionID = 28_400
+    const guid = `c28-reentrant-${label}`
+    let admitted = /** @type {Y.Doc|null} */ (null)
+    class TargetDoc extends Y.Doc {
+      /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+      constructor (opts) {
+        super(opts)
+        if (opts?.guid === guid) admitted = this
+      }
+    }
+    const source = new Y.Doc({ gc: false })
+    source.clientID = collisionID
+    source.get('docs').insert(0, [new Y.Doc({ guid })])
+    const host = new TargetDoc({ gc: false, sparseExactResolution: true })
+    host.clientID = collisionID
+    let armed = true
+    let events = 0
+    host.on('beforeObserverCalls', () => {
+      if (armed && admitted !== null) {
+        armed = false
+        admitted.destroy()
+      }
+    })
+    host.on('subdocs', () => { events++ })
+
+    apply(host, encode(source))
+    const replacement = /** @type {Y.Doc} */ (host.get('docs').get(0))
+    t.assert(
+      admitted !== null && replacement !== admitted && replacement.guid === guid &&
+      replacement.clientID === host.clientID && host.clientID !== collisionID &&
+      host.subdocs.size === 1 && host.subdocs.has(replacement) && !host.subdocs.has(admitted) &&
+      events === 2 && host._transaction === null && host._transactionCleanups.length === 0,
+      `${label} observer replacement follows collision rotation`
+    )
+  })
+}
+
+export const testC28AttachedSubdocDestroyRetryRetainsPrivateAttachment = () => {
+  ;['root-type', 'nested-subdoc'].forEach(mode => {
+    const parent = new Y.Doc({ gc: false })
+    const child = new Y.Doc({ guid: `c28-destroy-retry-${mode}`, gc: false })
+    const docs = parent.get('docs')
+    const listenerError = new Error(`${mode} teardown`)
+    let armed = true
+    if (mode === 'root-type') {
+      child.get('root').on('destroy', () => {
+        if (armed) {
+          armed = false
+          throw listenerError
+        }
+      })
+    } else {
+      const nested = new Y.Doc({ guid: 'c28-nested' })
+      child.get('nested').insert(0, [nested])
+      nested.on('destroy', () => {
+        if (armed) {
+          armed = false
+          throw listenerError
+        }
+      })
+    }
+    docs.insert(0, [child])
+    let events = 0
+    parent.on('subdocs', () => { events++ })
+
+    let failure = null
+    try { child.destroy() } catch (error) { failure = error }
+    const replacement = /** @type {Y.Doc} */ (docs.get(0))
+    t.assert(
+      failure === listenerError && replacement !== child && replacement.guid === child.guid &&
+      parent.subdocs.size === 1 && parent.subdocs.has(replacement) && !parent.subdocs.has(child) &&
+      events === 1 && parent._transaction === null && parent._transactionCleanups.length === 0,
+      `${mode} first destroy commits replacement`
+    )
+    child.destroy()
+    t.assert(
+      docs.get(0) === replacement && parent.subdocs.size === 1 &&
+      parent.subdocs.has(replacement) && !parent.subdocs.has(child) && events === 1 &&
+      parent._transaction === null && parent._transactionCleanups.length === 0,
+      `${mode} destroy retry is idempotent`
+    )
+  })
+}
+
+export const testC28ParentTerminationCannotRepublishDestroyReplacement = () => {
+  /** @type {Array<{label:string,error:boolean,parent:boolean,replacement:boolean,event:boolean,terminal:boolean,cleanup:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    ;['beforeObserverCalls', 'afterTransaction', 'afterTransactionCleanup'].forEach(stage => {
+      const label = `${sparse ? 'sparse' : 'ordinary'}-${stage}`
+      const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+      const docs = parent.get('docs')
+      const child = new Y.Doc({ guid: `c28-parent-termination-${label}`, gc: false })
+      docs.insert(0, [child])
+      let armed = true
+      let subdocEvents = 0
+      let destroys = 0
+      const terminate = () => {
+        if (!armed) return
+        armed = false
+        parent.destroy()
+      }
+      if (stage === 'beforeObserverCalls') parent.on('beforeObserverCalls', terminate)
+      if (stage === 'afterTransaction') parent.on('afterTransaction', terminate)
+      if (stage === 'afterTransactionCleanup') parent.on('afterTransactionCleanup', terminate)
+      parent.on('subdocs', () => { subdocEvents++ })
+      parent.on('destroy', () => { destroys++ })
+
+      let failure = null
+      try { child.destroy() } catch (error) { failure = error }
+      const replacement = /** @type {Y.Doc} */ (docs.get(0))
+      const fresh = new Y.Doc({ gc: false })
+      let attachFailure = null
+      try { fresh.get('docs').insert(0, [replacement]) } catch (error) { attachFailure = error }
+      parent.destroy()
+      child.destroy()
+      results.push({
+        label,
+        error: failure === null,
+        parent: parent.isDestroyed && parent.subdocs instanceof Set && parent.subdocs.size === 0 && parent.getSubdocs().size === 0,
+        replacement: replacement !== child && docs.get(0) === replacement && child.isDestroyed && replacement.isDestroyed,
+        event: subdocEvents === 0 && destroys === 1,
+        terminal: attachFailure instanceof Error && fresh.get('docs').length === 0 && fresh.subdocs.size === 0,
+        cleanup: parent._transaction === null && parent._transactionCleanups.length === 0 &&
+          child._transaction === null && child._transactionCleanups.length === 0 && replacement._transactionCleanups.length === 0
+      })
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28DestroyTracksRootsCreatedDuringCleanup = () => {
+  /** @type {Array<{label:string,error:boolean,late:boolean,retry:boolean,event:boolean,cleanup:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const doc = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const creator = doc.get('creator')
+    const throwing = doc.get('throwing')
+    const teardownError = new Error(`${label} root teardown`)
+    let late = /** @type {any} */ (null)
+    let creatorCalls = 0
+    let throwingCalls = 0
+    let lateCalls = 0
+    let destroyEvents = 0
+    let armed = true
+    creator.on('destroy', () => {
+      creatorCalls++
+      late = doc.get('late')
+      late.on('destroy', () => { lateCalls++ })
+    })
+    throwing.on('destroy', () => {
+      throwingCalls++
+      if (armed) {
+        armed = false
+        throw teardownError
+      }
+    })
+    doc.on('destroy', () => { destroyEvents++ })
+
+    let failure = null
+    try { doc.destroy() } catch (error) { failure = error }
+    let retryFailure = null
+    try { doc.destroy() } catch (error) { retryFailure = error }
+    const sameLate = late !== null && doc.get('late') === late
+    doc.destroy()
+    results.push({
+      label,
+      error: failure === teardownError && doc.isDestroyed,
+      late: sameLate && creatorCalls === 1 && throwingCalls === 2 && lateCalls === 1,
+      retry: retryFailure === null && creatorCalls === 1 && throwingCalls === 2 && lateCalls === 1,
+      event: destroyEvents === 1,
+      cleanup: doc._transaction === null && doc._transactionCleanups.length === 0
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28IsDestroyedAccessorCannotWedgeCleanup = () => {
+  /** @type {Array<{label:string,error:boolean,commit:boolean,retry:boolean,event:boolean,cleanup:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    ;[false, true].forEach(attached => {
+      const label = `${sparse ? 'sparse' : 'ordinary'}-${attached ? 'attached' : 'root'}`
+      const parent = attached
+        ? new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+        : null
+      const docs = parent?.get('docs') ?? null
+      const doc = new Y.Doc({ guid: `c28-destroy-setter-${label}`, gc: false })
+      const root = doc.get('root')
+      if (docs !== null) docs.insert(0, [doc])
+      const descriptor = /** @type {PropertyDescriptor} */ (Object.getOwnPropertyDescriptor(doc, 'isDestroyed'))
+      const setterError = new Error(`${label} isDestroyed setter`)
+      let rootDestroys = 0
+      let docDestroys = 0
+      let subdocEvents = 0
+      let setterCalls = 0
+      let installed = false
+      root.on('destroy', () => { rootDestroys++ })
+      doc.on('destroy', () => { docDestroys++ })
+      if (parent !== null) parent.on('subdocs', () => { subdocEvents++ })
+      const install = () => {
+        if (installed) return
+        installed = true
+        Object.defineProperty(doc, 'isDestroyed', {
+          configurable: true,
+          enumerable: descriptor.enumerable,
+          get: () => false,
+          set: () => {
+            setterCalls++
+            throw setterError
+          }
+        })
+      }
+      if (parent === null) install()
+      else parent.on('afterTransaction', install)
+
+      let failure = null
+      try { doc.destroy() } catch (error) { failure = error }
+      const replacement = docs === null ? null : /** @type {Y.Doc} */ (docs.get(0))
+      let first = false
+      let committed = false
+      if (parent === null || docs === null) {
+        first = failure instanceof Error && failure !== setterError && setterCalls === 0
+        committed = !doc.isDestroyed && rootDestroys === 0 && docDestroys === 0
+        Object.defineProperty(doc, 'isDestroyed', descriptor)
+      } else {
+        first = failure === null && setterCalls === 0 && doc.isDestroyed
+        committed = replacement !== doc && replacement !== null && parent.subdocs.size === 1 &&
+          parent.subdocs.has(replacement) && !parent.subdocs.has(doc) && subdocEvents === 1
+      }
+      let retryFailure = null
+      try { doc.destroy() } catch (error) { retryFailure = error }
+      doc.destroy()
+      const stable = parent === null || docs === null
+        ? true
+        : replacement !== null && docs.get(0) === replacement && parent.subdocs.size === 1 && parent.subdocs.has(replacement) && subdocEvents === 1
+      results.push({
+        label,
+        error: first,
+        commit: committed,
+        retry: retryFailure === null && doc.isDestroyed && rootDestroys === 1 && docDestroys === 1,
+        event: stable,
+        cleanup: doc._transaction === null && doc._transactionCleanups.length === 0 &&
+          (parent === null || (parent._transaction === null && parent._transactionCleanups.length === 0))
+      })
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28DestroyBeforeTransactionMembershipFailureIsRetryable = () => {
+  /** @type {Array<{label:string,error:boolean,state:boolean,live:boolean,retry:boolean,event:boolean,stable:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const docs = parent.get('docs')
+    const child = new Y.Doc({ guid: `c28-destroy-before-${label}`, gc: false })
+    docs.insert(0, [child])
+    const publicSubdocs = parent.subdocs
+    const before = captureC28State(parent, Y.encodeStateAsUpdateV2)
+    let armed = true
+    let updates = 0
+    let updatesV2 = 0
+    /** @type {Array<{added:Set<Y.Doc>,loaded:Set<Y.Doc>,removed:Set<Y.Doc>}>} */
+    const events = []
+    parent.on('beforeTransaction', () => {
+      if (armed) {
+        armed = false
+        parent.subdocs = /** @type {any} */ ({})
+      }
+    })
+    parent.on('update', () => { updates++ })
+    parent.on('updateV2', () => { updatesV2++ })
+    parent.on('subdocs', event => { events.push(event) })
+
+    let failure = null
+    try { child.destroy() } catch (error) { failure = error }
+    parent.subdocs = publicSubdocs
+    const unchanged =
+      Array.from(Y.encodeStateAsUpdateV2(parent)).join(',') === before.bytes.join(',') &&
+      Array.from(Y.encodeStateVector(parent)).join(',') === before.state.join(',') &&
+      parent.store.clients.size === before.clients.size && [...before.clients].every(([client, structs]) => parent.store.clients.get(client) === structs) &&
+      parent.store.pendingStructs === before.pendingStructs && parent.store.pendingDs === before.pendingDs &&
+      parent.share === before.share && parent.share.size === before.roots.size && [...before.roots].every(([key, root]) => parent.share.get(key) === root)
+    const live = docs.get(0) === child && !child.isDestroyed && parent.subdocs.size === 1 && parent.subdocs.has(child) &&
+      events.length === 0 && updates === 0 && updatesV2 === 0 && parent._transaction === null && parent._transactionCleanups.length === 0
+
+    let retryFailure = null
+    try { child.destroy() } catch (error) { retryFailure = error }
+    const replacement = /** @type {Y.Doc} */ (docs.get(0))
+    const event = events[0]
+    const retry = retryFailure === null && replacement !== child && replacement.guid === child.guid &&
+      child.isDestroyed && !replacement.isDestroyed && parent.subdocs.size === 1 && parent.subdocs.has(replacement) && !parent.subdocs.has(child)
+    const exactEvent = events.length === 1 && event.added.size === 1 && event.added.has(replacement) &&
+      event.removed.size === 1 && event.removed.has(child) && event.loaded.size === 0
+    child.destroy()
+    const reload = new Y.Doc({ gc: false })
+    Y.applyUpdateV2(reload, Y.encodeStateAsUpdateV2(parent))
+    const loaded = /** @type {Y.Doc} */ (reload.get('docs').get(0))
+    results.push({
+      label,
+      error: failure instanceof Error,
+      state: unchanged,
+      live,
+      retry,
+      event: exactEvent,
+      stable: docs.get(0) === replacement && events.length === 1 && updates === 0 && updatesV2 === 0 &&
+        loaded.guid === child.guid && reload.subdocs.size === 1 && reload.subdocs.has(loaded) &&
+        parent._transaction === null && parent._transactionCleanups.length === 0
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28DestroyBeforeTransactionThrowCancelsAndRetries = () => {
+  /** @type {Array<{label:string,error:boolean,state:boolean,live:boolean,retry:boolean,event:boolean,reload:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const docs = parent.get('docs')
+    const child = new Y.Doc({ guid: `c28-destroy-before-throw-${label}`, gc: false })
+    docs.insert(0, [child])
+    const before = captureC28State(parent, Y.encodeStateAsUpdateV2)
+    const listenerError = new Error(`${label} before transaction`)
+    let armed = true
+    let updates = 0
+    let updatesV2 = 0
+    /** @type {Array<{added:Set<Y.Doc>,loaded:Set<Y.Doc>,removed:Set<Y.Doc>}>} */
+    const events = []
+    parent.on('beforeTransaction', () => {
+      if (armed) {
+        armed = false
+        throw listenerError
+      }
+    })
+    parent.on('update', () => { updates++ })
+    parent.on('updateV2', () => { updatesV2++ })
+    parent.on('subdocs', event => { events.push(event) })
+
+    let failure = null
+    try { child.destroy() } catch (error) { failure = error }
+    const unchanged =
+      Array.from(Y.encodeStateAsUpdateV2(parent)).join(',') === before.bytes.join(',') &&
+      Array.from(Y.encodeStateVector(parent)).join(',') === before.state.join(',') &&
+      parent.store.clients.size === before.clients.size && [...before.clients].every(([client, structs]) => parent.store.clients.get(client) === structs) &&
+      parent.store.pendingStructs === before.pendingStructs && parent.store.pendingDs === before.pendingDs &&
+      parent.share === before.share && parent.share.size === before.roots.size && [...before.roots].every(([key, root]) => parent.share.get(key) === root)
+    const live = docs.get(0) === child && !child.isDestroyed && parent.subdocs.size === 1 && parent.subdocs.has(child) &&
+      events.length === 0 && updates === 0 && updatesV2 === 0 && parent._transaction === null && parent._transactionCleanups.length === 0
+
+    let retryFailure = null
+    try { child.destroy() } catch (error) { retryFailure = error }
+    const replacement = /** @type {Y.Doc} */ (docs.get(0))
+    const event = events[0]
+    const retried = retryFailure === null && replacement !== child && child.isDestroyed && !replacement.isDestroyed &&
+      parent.subdocs.size === 1 && parent.subdocs.has(replacement) && !parent.subdocs.has(child) &&
+      parent._transaction === null && parent._transactionCleanups.length === 0
+    const exactEvent = events.length === 1 && event.added.size === 1 && event.added.has(replacement) &&
+      event.removed.size === 1 && event.removed.has(child) && event.loaded.size === 0
+    child.destroy()
+    const reload = new Y.Doc({ gc: false })
+    Y.applyUpdateV2(reload, Y.encodeStateAsUpdateV2(parent))
+    const loaded = /** @type {Y.Doc} */ (reload.get('docs').get(0))
+    results.push({
+      label,
+      error: failure === listenerError,
+      state: unchanged,
+      live,
+      retry: retried,
+      event: exactEvent && events.length === 1 && updates === 0 && updatesV2 === 0 && docs.get(0) === replacement,
+      reload: loaded.guid === child.guid && reload.subdocs.size === 1 && reload.subdocs.has(loaded)
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28NullCleanupFailureIsSurfacedAndRetried = () => {
+  /** @type {Array<{label:string,error:boolean,commit:boolean,retry:boolean,event:boolean,cleanup:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    ;[false, true].forEach(attached => {
+      const label = `${sparse ? 'sparse' : 'ordinary'}-${attached ? 'attached' : 'root'}`
+      const parent = attached
+        ? new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+        : null
+      const docs = parent?.get('docs') ?? null
+      const doc = new Y.Doc({ guid: `c28-null-cleanup-${label}`, gc: false })
+      const root = doc.get('root')
+      if (docs !== null) docs.insert(0, [doc])
+      const cleanupFailure = /** @type {null} */ (null)
+      let armed = true
+      let rootDestroys = 0
+      let docDestroys = 0
+      let subdocEvents = 0
+      root.on('destroy', () => {
+        rootDestroys++
+        if (armed) {
+          armed = false
+          throw cleanupFailure
+        }
+      })
+      doc.on('destroy', () => { docDestroys++ })
+      if (parent !== null) parent.on('subdocs', () => { subdocEvents++ })
+
+      let threw = false
+      let failure = /** @type {unknown} */ (false)
+      try { doc.destroy() } catch (error) {
+        threw = true
+        failure = error
+      }
+      const replacement = docs === null ? null : /** @type {Y.Doc} */ (docs.get(0))
+      const committed = parent === null
+        ? doc.isDestroyed
+        : replacement !== doc && replacement !== null && parent.subdocs.size === 1 && parent.subdocs.has(replacement) && !parent.subdocs.has(doc) && subdocEvents === 1
+      const firstRootDestroys = rootDestroys
+      let retryFailure = null
+      try { doc.destroy() } catch (error) { retryFailure = error }
+      doc.destroy()
+      let stable = true
+      if (parent !== null && docs !== null) {
+        stable = replacement !== null && docs.get(0) === replacement && parent.subdocs.size === 1 && parent.subdocs.has(replacement) && subdocEvents === 1
+      }
+      results.push({
+        label,
+        error: threw && failure === null,
+        commit: committed && firstRootDestroys === 1 && docDestroys === 1,
+        retry: retryFailure === null && rootDestroys === 2 && docDestroys === 1,
+        event: stable,
+        cleanup: doc._transaction === null && doc._transactionCleanups.length === 0 &&
+          (parent === null || (parent._transaction === null && parent._transactionCleanups.length === 0))
+      })
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28PoisonedPendingReplacementDestroyCannotOrphan = () => {
+  /** @type {Array<{label:string,error:boolean,terminal:boolean,event:boolean,poison:boolean,cleanup:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const docs = parent.get('docs')
+    const child = new Y.Doc({ guid: `c28-poisoned-replacement-${label}`, gc: false })
+    docs.insert(0, [child])
+    let replacement = /** @type {Y.Doc|null} */ (null)
+    let poisonCalls = 0
+    let subdocEvents = 0
+    let destroyEvents = 0
+    let armed = true
+    parent.on('beforeObserverCalls', () => {
+      if (!armed) return
+      armed = false
+      replacement = /** @type {Y.Doc} */ (docs.get(0))
+      Object.defineProperty(replacement, 'destroy', {
+        configurable: true,
+        value: () => {
+          poisonCalls++
+          throw new Error(`${label} poisoned destroy`)
+        }
+      })
+      parent.destroy()
+    })
+    parent.on('subdocs', () => { subdocEvents++ })
+    parent.on('destroy', () => { destroyEvents++ })
+
+    let failure = null
+    try { child.destroy() } catch (error) { failure = error }
+    const fresh = new Y.Doc({ gc: false })
+    let attachFailure = null
+    if (replacement !== null) {
+      try { fresh.get('docs').insert(0, [replacement]) } catch (error) { attachFailure = error }
+    }
+    parent.destroy()
+    child.destroy()
+    results.push({
+      label,
+      error: failure === null,
+      terminal: replacement !== null && replacement !== child && docs.get(0) === replacement &&
+        parent.isDestroyed && child.isDestroyed && replacement.isDestroyed && parent.subdocs.size === 0 && parent.getSubdocs().size === 0 &&
+        attachFailure instanceof Error && fresh.get('docs').length === 0 && fresh.subdocs.size === 0,
+      event: subdocEvents === 0 && destroyEvents === 1,
+      poison: poisonCalls === 0,
+      cleanup: parent._transaction === null && parent._transactionCleanups.length === 0 &&
+        child._transaction === null && child._transactionCleanups.length === 0 &&
+        (replacement === null || replacement._transactionCleanups.length === 0)
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28NestedDestroyRollbackKeepsDescendantsRetryable = () => {
+  /** @type {Array<{label:string,error:boolean,rollback:boolean,retry:boolean,event:boolean,reload:boolean,cleanup:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const opts = sparse ? { gc: false, sparseExactResolution: true } : { gc: false }
+    const grandparent = new Y.Doc(opts)
+    const parent = new Y.Doc({ ...opts, guid: `c28-nested-rollback-parent-${label}` })
+    const child = new Y.Doc({ ...opts, guid: `c28-nested-rollback-child-${label}` })
+    const parents = grandparent.get('docs')
+    const children = parent.get('docs')
+    children.insert(0, [child])
+    parents.insert(0, [parent])
+    const beforeGrandparent = captureC28State(grandparent, Y.encodeStateAsUpdateV2)
+    const beforeParent = captureC28State(parent, Y.encodeStateAsUpdateV2)
+    const listenerError = new Error(`${label} grandparent before transaction`)
+    let armed = true
+    let grandparentEvents = 0
+    let parentEvents = 0
+    let parentDestroys = 0
+    let childDestroys = 0
+    grandparent.on('beforeTransaction', () => {
+      if (!armed) return
+      armed = false
+      child.destroy()
+      throw listenerError
+    })
+    grandparent.on('subdocs', () => { grandparentEvents++ })
+    parent.on('subdocs', () => { parentEvents++ })
+    parent.on('destroy', () => { parentDestroys++ })
+    child.on('destroy', () => { childDestroys++ })
+
+    let failure = null
+    try { parent.destroy() } catch (error) { failure = error }
+    const stateUnchanged =
+      Array.from(Y.encodeStateAsUpdateV2(grandparent)).join(',') === beforeGrandparent.bytes.join(',') &&
+      Array.from(Y.encodeStateAsUpdateV2(parent)).join(',') === beforeParent.bytes.join(',')
+    const rolledBack = parents.get(0) === parent && children.get(0) === child && !parent.isDestroyed && !child.isDestroyed &&
+      grandparent.subdocs.size === 1 && grandparent.subdocs.has(parent) && parent.subdocs.size === 1 && parent.subdocs.has(child) &&
+      grandparentEvents === 0 && parentEvents === 0 && parentDestroys === 0 && childDestroys === 0
+    let retryFailure = null
+    try { parent.destroy() } catch (error) { retryFailure = error }
+    const replacement = /** @type {Y.Doc} */ (parents.get(0))
+    parent.destroy()
+    child.destroy()
+    const reload = new Y.Doc({ gc: false })
+    Y.applyUpdateV2(reload, Y.encodeStateAsUpdateV2(grandparent))
+    const loaded = /** @type {Y.Doc} */ (reload.get('docs').get(0))
+    results.push({
+      label,
+      error: failure === listenerError,
+      rollback: stateUnchanged && rolledBack,
+      retry: retryFailure === null && replacement !== parent && replacement.guid === parent.guid && !replacement.isDestroyed &&
+        parent.isDestroyed && child.isDestroyed && grandparent.subdocs.size === 1 && grandparent.subdocs.has(replacement) &&
+        !grandparent.subdocs.has(parent) && parent.subdocs.size === 0,
+      event: grandparentEvents === 1 && parentEvents === 0 && parentDestroys === 1 && childDestroys === 1,
+      reload: loaded.guid === parent.guid && reload.subdocs.size === 1 && reload.subdocs.has(loaded),
+      cleanup: grandparent._transaction === null && grandparent._transactionCleanups.length === 0 &&
+        parent._transaction === null && parent._transactionCleanups.length === 0 && child._transactionCleanups.length === 0
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28ParentTerminationDuringChildPrecommitIsMonotonic = () => {
+  /** @type {Array<{label:string,error:boolean,terminal:boolean,event:boolean,retry:boolean,cleanup:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const docs = parent.get('docs')
+    const child = new Y.Doc({ guid: `c28-parent-terminal-precommit-${label}`, gc: false })
+    docs.insert(0, [child])
+    const listenerError = new Error(`${label} parent termination`)
+    let armed = true
+    let subdocEvents = 0
+    let parentDestroys = 0
+    let childDestroys = 0
+    parent.on('beforeTransaction', () => {
+      if (!armed) return
+      armed = false
+      parent.destroy()
+      throw listenerError
+    })
+    parent.on('subdocs', () => { subdocEvents++ })
+    parent.on('destroy', () => { parentDestroys++ })
+    child.on('destroy', () => { childDestroys++ })
+
+    let failure = null
+    try { child.destroy() } catch (error) { failure = error }
+    const firstTerminal = parent.isDestroyed && child.isDestroyed && docs.get(0) === child &&
+      parent.subdocs.size === 0 && parent.getSubdocs().size === 0
+    const fresh = new Y.Doc({ gc: false })
+    let attachFailure = null
+    try { fresh.get('docs').insert(0, [child]) } catch (error) { attachFailure = error }
+    let parentRetry = null
+    let childRetry = null
+    try { parent.destroy() } catch (error) { parentRetry = error }
+    try { child.destroy() } catch (error) { childRetry = error }
+    results.push({
+      label,
+      error: failure === listenerError,
+      terminal: firstTerminal && attachFailure instanceof Error && fresh.get('docs').length === 0 && fresh.subdocs.size === 0,
+      event: subdocEvents === 0 && parentDestroys === 1 && childDestroys === 1,
+      retry: parentRetry === null && childRetry === null && parent.isDestroyed && child.isDestroyed &&
+        docs.get(0) === child && parent.subdocs.size === 0 && parentDestroys === 1 && childDestroys === 1,
+      cleanup: parent._transaction === null && parent._transactionCleanups.length === 0 &&
+        child._transaction === null && child._transactionCleanups.length === 0
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28DeletedChildUsesCapturedDestroy = () => {
+  /** @type {Array<{label:string,error:boolean,terminal:boolean,event:boolean,poison:boolean,cleanup:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const docs = parent.get('docs')
+    const child = new Y.Doc({ guid: `c28-deleted-captured-destroy-${label}` })
+    docs.insert(0, [child])
+    let armed = true
+    let poisonCalls = 0
+    let updates = 0
+    let updatesV2 = 0
+    /** @type {Array<{added:Set<Y.Doc>,loaded:Set<Y.Doc>,removed:Set<Y.Doc>}>} */
+    const events = []
+    parent.on('beforeObserverCalls', () => {
+      if (!armed) return
+      armed = false
+      Object.defineProperty(child, 'destroy', {
+        configurable: true,
+        value: () => {
+          poisonCalls++
+          throw new Error(`${label} poisoned deleted destroy`)
+        }
+      })
+    })
+    parent.on('update', () => { updates++ })
+    parent.on('updateV2', () => { updatesV2++ })
+    parent.on('subdocs', event => { events.push(event) })
+    let failure = null
+    try { docs.delete(0, 1) } catch (error) { failure = error }
+    const fresh = new Y.Doc({ gc: false })
+    let attachFailure = null
+    try { fresh.get('docs').insert(0, [child]) } catch (error) { attachFailure = error }
+    results.push({
+      label,
+      error: failure === null,
+      terminal: child.isDestroyed && docs.length === 0 && parent.subdocs.size === 0 && attachFailure instanceof Error && fresh.get('docs').length === 0,
+      event: updates === 1 && updatesV2 === 1 && events.length === 2 &&
+        events.every(event => event.added.size === 0 && event.loaded.size === 0 && event.removed.size === 1 && event.removed.has(child)),
+      poison: poisonCalls === 0,
+      cleanup: parent._transaction === null && parent._transactionCleanups.length === 0 && child._transactionCleanups.length === 0
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28DestroyUsesOriginalShareAfterObserverReplacement = () => {
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const docs = parent.get('docs')
+    const child = new Y.Doc({ guid: `c28-original-share-${label}` })
+    const root = child.get('root')
+    const originalShare = child.share
+    const forgedShare = new Map()
+    docs.insert(0, [child])
+    let rootDestroys = 0
+    let childDestroys = 0
+    let events = 0
+    let armed = true
+    root.on('destroy', () => { rootDestroys++ })
+    child.on('destroy', () => { childDestroys++ })
+    parent.on('afterTransaction', () => {
+      if (armed) {
+        armed = false
+        child.share = forgedShare
+      }
+    })
+    parent.on('subdocs', () => { events++ })
+    child.destroy()
+    const replacement = /** @type {Y.Doc} */ (docs.get(0))
+    child.destroy()
+    t.assert(
+      replacement !== child && parent.subdocs.size === 1 && parent.subdocs.has(replacement) &&
+      child.isDestroyed && child.share === forgedShare && originalShare.get('root') === root &&
+      rootDestroys === 1 && childDestroys === 1 && events === 1 &&
+      parent._transaction === null && parent._transactionCleanups.length === 0 && child._transactionCleanups.length === 0,
+      `${label} original share cleanup`
+    )
+  })
+}
+
+export const testC28DestroyUsesCapturedRootCallableAfterObserverPoison = () => {
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const docs = parent.get('docs')
+    const child = new Y.Doc({ guid: `c28-captured-root-destroy-${label}` })
+    const root = child.get('root')
+    docs.insert(0, [child])
+    let armed = true
+    let poisonCalls = 0
+    let rootDestroys = 0
+    let childDestroys = 0
+    let events = 0
+    root.on('destroy', () => { rootDestroys++ })
+    child.on('destroy', () => { childDestroys++ })
+    parent.on('afterTransaction', () => {
+      if (!armed) return
+      armed = false
+      Object.defineProperty(root, 'destroy', {
+        configurable: true,
+        value: () => {
+          poisonCalls++
+          throw new Error(`${label} poisoned root destroy`)
+        }
+      })
+    })
+    parent.on('subdocs', () => { events++ })
+
+    let failure = null
+    try { child.destroy() } catch (error) { failure = error }
+    const replacement = /** @type {Y.Doc} */ (docs.get(0))
+    let retryFailure = null
+    try { child.destroy() } catch (error) { retryFailure = error }
+    child.destroy()
+    t.assert(
+      failure === null && retryFailure === null && replacement !== child && docs.get(0) === replacement &&
+      child.isDestroyed && !replacement.isDestroyed && parent.subdocs.size === 1 && parent.subdocs.has(replacement) &&
+      poisonCalls === 0 && rootDestroys === 1 && childDestroys === 1 && events === 1 &&
+      parent._transaction === null && parent._transactionCleanups.length === 0 && child._transactionCleanups.length === 0,
+      `${label} captured root destroy callable`
+    )
+  })
+}
+
+export const testC28ReplacementAdoptionIgnoresArrayPrototypeSetter = () => {
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const docs = parent.get('docs')
+    const child = new Y.Doc({ guid: `c28-array-setter-adoption-${label}` })
+    docs.insert(0, [child])
+    const originalZero = Object.getOwnPropertyDescriptor(Array.prototype, '0')
+    const poisonError = new Error(`${label} array zero setter`)
+    let armed = true
+    let poisonCalls = 0
+    let events = 0
+    let delivered = /** @type {{added:Set<Y.Doc>,loaded:Set<Y.Doc>,removed:Set<Y.Doc>}|null} */ (null)
+    /** @this {Array<any>} @param {any} value */
+    const setZero = function (value) {
+      if (value?.doc instanceof Y.Doc && value.doc !== child && value.doc.guid === child.guid) {
+        poisonCalls++
+        throw poisonError
+      }
+      Object.defineProperty(this, '0', { configurable: true, enumerable: true, writable: true, value })
+    }
+    parent.on('beforeTransaction', () => {
+      if (!armed) return
+      armed = false
+      // eslint-disable-next-line no-extend-native, accessor-pairs
+      Reflect.defineProperty(Array.prototype, '0', { configurable: true, get: () => undefined, set: setZero })
+    })
+    parent.on('subdocs', event => {
+      events++
+      delivered = event
+    })
+
+    let failure = null
+    try {
+      child.destroy()
+    } catch (error) {
+      failure = error
+    } finally {
+      if (originalZero === undefined) Reflect.deleteProperty(Array.prototype, '0')
+      // eslint-disable-next-line no-extend-native
+      else Reflect.defineProperty(Array.prototype, '0', originalZero)
+    }
+    const replacement = /** @type {Y.Doc} */ (docs.get(0))
+    const event = /** @type {NonNullable<typeof delivered>} */ (delivered)
+    let retryFailure = null
+    try { child.destroy() } catch (error) { retryFailure = error }
+    child.destroy()
+    t.assert(
+      failure === null && retryFailure === null && poisonCalls === 0 && replacement !== child && docs.get(0) === replacement &&
+      child.isDestroyed && !replacement.isDestroyed && parent.subdocs.size === 1 && parent.subdocs.has(replacement) &&
+      events === 1 && event.added.size === 1 && event.added.has(replacement) && event.loaded.size === 0 &&
+      event.removed.size === 1 && event.removed.has(child) && parent._transaction === null &&
+      parent._transactionCleanups.length === 0 && child._transactionCleanups.length === 0,
+      `${label} array prototype setter is not dispatched`
+    )
+  })
+}
+
+export const testC28DestroyRetryUsesCapturedPrivateShare = () => {
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const docs = parent.get('docs')
+    const child = new Y.Doc({ guid: `c28-private-share-retry-${label}` })
+    const root = child.get('root')
+    docs.insert(0, [child])
+    const listenerError = new Error(`${label} root share poison`)
+    const shareDescriptor = /** @type {PropertyDescriptor} */ (Object.getOwnPropertyDescriptor(child, 'share'))
+    let armed = true
+    let rootDestroys = 0
+    let childDestroys = 0
+    let events = 0
+    root.on('destroy', () => {
+      rootDestroys++
+      if (armed) {
+        armed = false
+        Object.defineProperty(child, 'share', { ...shareDescriptor, value: {} })
+        throw listenerError
+      }
+    })
+    child.on('destroy', () => { childDestroys++ })
+    parent.on('subdocs', () => { events++ })
+
+    let failure = null
+    try { child.destroy() } catch (error) { failure = error }
+    const replacement = /** @type {Y.Doc} */ (docs.get(0))
+    let retryFailure = null
+    try { child.destroy() } catch (error) { retryFailure = error }
+    let finalFailure = null
+    try { child.destroy() } catch (error) { finalFailure = error }
+    t.assert(
+      failure === listenerError && retryFailure === null && finalFailure === null && replacement !== child && docs.get(0) === replacement &&
+      child.isDestroyed && !replacement.isDestroyed && parent.subdocs.size === 1 && parent.subdocs.has(replacement) &&
+      rootDestroys === 2 && childDestroys === 1 && events === 1 && parent._transaction === null &&
+      parent._transactionCleanups.length === 0 && child._transactionCleanups.length === 0,
+      `${label} private share retry`
+    )
+  })
+}
+
+export const testC28HostilePublicStateCannotWedgePrivateCleanup = () => {
+  /** @type {Array<{label:string,error:boolean,terminal:boolean,event:boolean,retry:boolean,cleanup:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    ;['accessor', 'freeze'].forEach(mode => {
+      const label = `${sparse ? 'sparse' : 'ordinary'}-${mode}`
+      const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+      const docs = parent.get('docs')
+      const child = new Y.Doc({ guid: `c28-hostile-public-state-${label}` })
+      const root = child.get('root')
+      docs.insert(0, [child])
+      let rootDestroys = 0
+      let childDestroys = 0
+      let events = 0
+      let armed = true
+      root.on('destroy', () => { rootDestroys++ })
+      child.on('destroy', () => { childDestroys++ })
+      parent.on('subdocs', () => { events++ })
+      parent.on('afterTransaction', () => {
+        if (!armed) return
+        armed = false
+        if (mode === 'accessor') Object.defineProperty(child, 'isDestroyed', { configurable: false, get: () => false })
+        else Object.freeze(child)
+      })
+      let failure = null
+      try { child.destroy() } catch (error) { failure = error }
+      const replacement = /** @type {Y.Doc} */ (docs.get(0))
+      const fresh = new Y.Doc({ gc: false })
+      let attachFailure = null
+      try { fresh.get('docs').insert(0, [child]) } catch (error) { attachFailure = error }
+      let retryFailure = null
+      try { child.destroy() } catch (error) { retryFailure = error }
+      results.push({
+        label,
+        error: failure === null,
+        terminal: replacement !== child && parent.subdocs.has(replacement) && attachFailure instanceof Error,
+        event: rootDestroys === 1 && childDestroys === 1 && events === 1,
+        retry: retryFailure === null && docs.get(0) === replacement && rootDestroys === 1 && childDestroys === 1 && events === 1,
+        cleanup: parent._transaction === null && parent._transactionCleanups.length === 0 && child._transactionCleanups.length === 0
+      })
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28ParentTerminationIgnoresHostileItemMirror = () => {
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const docs = parent.get('docs')
+    const child = new Y.Doc({ guid: `c28-hostile-item-terminal-${label}` })
+    docs.insert(0, [child])
+    const listenerError = new Error(`${label} hostile item termination`)
+    let armed = true
+    let parentDestroys = 0
+    let childDestroys = 0
+    parent.on('beforeTransaction', () => {
+      if (!armed) return
+      armed = false
+      const descriptor = /** @type {PropertyDescriptor} */ (Object.getOwnPropertyDescriptor(child, '_item'))
+      Object.defineProperty(child, '_item', { ...descriptor, writable: false })
+      parent.destroy()
+      throw listenerError
+    })
+    parent.on('destroy', () => { parentDestroys++ })
+    child.on('destroy', () => { childDestroys++ })
+    let failure = null
+    try { child.destroy() } catch (error) { failure = error }
+    const fresh = new Y.Doc({ gc: false })
+    let attachFailure = null
+    try { fresh.get('docs').insert(0, [child]) } catch (error) { attachFailure = error }
+    let retryFailure = null
+    try { child.destroy() } catch (error) { retryFailure = error }
+    parent.destroy()
+    t.assert(
+      failure === listenerError && retryFailure === null && parent.isDestroyed && child.isDestroyed &&
+      docs.get(0) === child && parent.subdocs.size === 0 && attachFailure instanceof Error &&
+      parentDestroys === 1 && childDestroys === 1 && parent._transaction === null &&
+      parent._transactionCleanups.length === 0 && child._transactionCleanups.length === 0,
+      `${label} hostile item mirror is advisory`
+    )
+  })
+}
+
+export const testC28SubdocOverrideIsNotRepeatedAfterBaseFailure = () => {
+  ;[false, true].forEach(sparse => {
+    ;['base', 'override'].forEach(failureMode => {
+      const label = `${sparse ? 'sparse' : 'ordinary'}-${failureMode}`
+      const listenerError = new Error(`${label} cleanup`)
+      let overrideCalls = 0
+      class ChildDoc extends Y.Doc {
+        destroy () {
+          overrideCalls++
+          if (failureMode === 'override') throw listenerError
+        }
+      }
+      const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+      const child = new ChildDoc({ guid: `c28-override-base-retry-${label}` })
+      const root = child.get('root')
+      parent.get('docs').insert(0, [child])
+      let armed = true
+      let rootDestroys = 0
+      let parentDestroys = 0
+      let childDestroys = 0
+      root.on('destroy', () => {
+        rootDestroys++
+        if (failureMode === 'base' && armed) {
+          armed = false
+          throw listenerError
+        }
+      })
+      parent.on('destroy', () => { parentDestroys++ })
+      child.on('destroy', () => { childDestroys++ })
+      let failure = null
+      try { parent.destroy() } catch (error) { failure = error }
+      let retryFailure = null
+      try { parent.destroy() } catch (error) { retryFailure = error }
+      parent.destroy()
+      t.assert(
+        failure === listenerError && retryFailure === null && parent.isDestroyed && child.isDestroyed &&
+        overrideCalls === 1 && rootDestroys === (failureMode === 'base' ? 2 : 1) && parentDestroys === 1 && childDestroys === 1 &&
+        parent._transactionCleanups.length === 0 && child._transactionCleanups.length === 0,
+        `${label} override runs once`
+      )
+    })
+  })
+}
+
+export const testC28DestroyListenerTailSurvivesRetry = () => {
+  /** @type {Array<{label:string,error:boolean,first:boolean,retry:boolean,stable:boolean,cleanup:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    ;[false, true].forEach(attached => {
+      const label = `${sparse ? 'sparse' : 'ordinary'}-${attached ? 'attached' : 'root'}`
+      const parent = attached
+        ? new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+        : null
+      const docs = parent?.get('docs') ?? null
+      const doc = new Y.Doc({ guid: `c28-destroy-listener-tail-${label}`, gc: false })
+      if (docs !== null) docs.insert(0, [doc])
+      const listenerError = new Error(`${label} first destroy listener`)
+      let armed = true
+      let firstCalls = 0
+      let secondCalls = 0
+      let subdocEvents = 0
+      doc.on('destroy', () => {
+        firstCalls++
+        if (armed) {
+          armed = false
+          throw listenerError
+        }
+      })
+      doc.on('destroy', () => { secondCalls++ })
+      if (parent !== null) parent.on('subdocs', () => { subdocEvents++ })
+
+      let failure = null
+      try { doc.destroy() } catch (error) { failure = error }
+      const replacement = docs === null ? null : /** @type {Y.Doc} */ (docs.get(0))
+      const committed = parent === null
+        ? doc.isDestroyed
+        : replacement !== null && replacement !== doc && parent.subdocs.size === 1 && parent.subdocs.has(replacement) && subdocEvents === 1
+      const first = firstCalls === 1 && secondCalls === 0
+      let retryFailure = null
+      try { doc.destroy() } catch (error) { retryFailure = error }
+      doc.destroy()
+      let stable = true
+      if (parent !== null && docs !== null) {
+        stable = replacement !== null && docs.get(0) === replacement && parent.subdocs.size === 1 && parent.subdocs.has(replacement) && subdocEvents === 1
+      }
+      results.push({
+        label,
+        error: failure === listenerError,
+        first: committed && first,
+        retry: retryFailure === null && firstCalls === 2 && secondCalls === 1,
+        stable,
+        cleanup: doc._transaction === null && doc._transactionCleanups.length === 0 &&
+          (parent === null || (parent._transaction === null && parent._transactionCleanups.length === 0))
+      })
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28DestroyGetterIsNotDispatchedDuringAdoption = () => {
+  {
+    const parent = new Y.Doc({ gc: false })
+    const docs = parent.get('docs')
+    const child = new Y.Doc({ guid: 'c28-destroy-getter-ordinary' })
+    const before = captureC28State(parent, Y.encodeStateAsUpdateV2)
+    let getterCalls = 0
+    let events = 0
+    Object.defineProperty(child, 'destroy', {
+      configurable: true,
+      get: () => {
+        getterCalls++
+        if (getterCalls === 1) parent.get('reentrant').insert(0, [child])
+        return Y.Doc.prototype.destroy
+      }
+    })
+    parent.on('subdocs', () => { events++ })
+    let failure = null
+    try { docs.insert(0, [child]) } catch (error) { failure = error }
+    t.assert(failure instanceof Error && getterCalls === 0 && !parent.share.has('reentrant') && !child.isDestroyed)
+    assertC28State(parent, Y.encodeStateAsUpdateV2, before, 'ordinary destroy getter')
+    Reflect.deleteProperty(child, 'destroy')
+    docs.insert(0, [child])
+    t.assert(docs.get(0) === child && parent.subdocs.has(child) && events === 1 && parent._transactionCleanups.length === 0)
+  }
+
+  c28Transports.forEach(({ label, apply, encode, event }) => {
+    const guid = `c28-destroy-getter-sparse-${label}`
+    let hostile = true
+    let getterCalls = 0
+    let candidate = /** @type {Y.Doc|null} */ (null)
+    let host = /** @type {Y.Doc|null} */ (null)
+    class TargetDoc extends Y.Doc {
+      /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+      constructor (opts) {
+        super(opts)
+        if (!hostile || opts?.guid !== guid) return
+        candidate = this
+        Object.defineProperty(this, 'destroy', {
+          configurable: true,
+          get: () => {
+            getterCalls++
+            if (getterCalls === 1 && host !== null) host.get('reentrant').insert(0, [this])
+            return Y.Doc.prototype.destroy
+          }
+        })
+      }
+    }
+    const source = new Y.Doc({ gc: false })
+    source.get('docs').insert(0, [new Y.Doc({ guid })])
+    const update = encode(source)
+    host = new TargetDoc({ gc: false, sparseExactResolution: true })
+    const before = captureC28State(host, encode)
+    let updates = 0
+    let subdocs = 0
+    host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+    host.on('subdocs', () => { subdocs++ })
+    let failure = null
+    try { apply(host, update) } catch (error) { failure = error }
+    t.assert(failure instanceof Error && candidate !== null && getterCalls === 0 && !host.share.has('reentrant'), `${label} destroy getter rejection`)
+    assertC28State(host, encode, before, `${label} destroy getter`)
+    hostile = false
+    apply(host, update)
+    const child = /** @type {Y.Doc} */ (host.get('docs').get(0))
+    t.assert(child !== candidate && host.subdocs.has(child) && updates === 1 && subdocs === 1 && host._transactionCleanups.length === 0, `${label} destroy getter retry`)
+  })
+}
+
+export const testC28DestroyPostCommitListenerFailuresResumeCleanup = () => {
+  /** @type {Array<{label:string,error:boolean,replacement:boolean,stages:boolean,cleanup:boolean,retry:boolean,reload:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    ;['afterTransactionCleanup', 'update', 'updateV2', 'subdocs'].forEach(stage => {
+      const label = `${sparse ? 'sparse' : 'ordinary'}-${stage}`
+      const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+      const docs = parent.get('docs')
+      const trigger = parent.get('trigger')
+      const child = new Y.Doc({ guid: `c28-destroy-tail-${label}`, gc: false })
+      const root = child.get('root')
+      docs.insert(0, [child])
+      let triggerArmed = true
+      parent.on('beforeTransaction', () => {
+        if (triggerArmed) {
+          triggerArmed = false
+          trigger.insert(0, ['x'])
+        }
+      })
+      const listenerError = new Error(`${label} listener`)
+      let listenerArmed = true
+      let stageCalls = 0
+      const failStage = () => {
+        stageCalls++
+        if (listenerArmed) {
+          listenerArmed = false
+          throw listenerError
+        }
+      }
+      parent.on(/** @type {'afterTransactionCleanup'|'update'|'updateV2'|'subdocs'} */ (stage), failStage)
+      let updates = 0
+      let updatesV2 = 0
+      /** @type {Array<{added:Set<Y.Doc>,loaded:Set<Y.Doc>,removed:Set<Y.Doc>}>} */
+      const events = []
+      parent.on('update', () => { updates++ })
+      parent.on('updateV2', () => { updatesV2++ })
+      parent.on('subdocs', event => { events.push(event) })
+      const cleanupError = new Error(`${label} cleanup`)
+      let cleanupArmed = true
+      let cleanupCalls = 0
+      root.on('destroy', () => {
+        cleanupCalls++
+        if (cleanupArmed) {
+          cleanupArmed = false
+          throw cleanupError
+        }
+      })
+
+      let failure = null
+      try { child.destroy() } catch (error) { failure = error }
+      const replacement = /** @type {Y.Doc} */ (docs.get(0))
+      const subdocAttempts = events.length + (stage === 'subdocs' ? stageCalls : 0)
+      const updateAttempts = updates + (stage === 'update' ? stageCalls : 0)
+      const updateV2Attempts = updatesV2 + (stage === 'updateV2' ? stageCalls : 0)
+      const firstCleanupCalls = cleanupCalls
+      let retryFailure = null
+      try { child.destroy() } catch (error) { retryFailure = error }
+      const retryCalls = cleanupCalls
+      child.destroy()
+      const reload = new Y.Doc({ gc: false })
+      Y.applyUpdateV2(reload, Y.encodeStateAsUpdateV2(parent))
+      const loaded = /** @type {Y.Doc} */ (reload.get('docs').get(0))
+      results.push({
+        label,
+        error: failure === listenerError,
+        replacement: replacement !== child && docs.get(0) === replacement && child.isDestroyed && !replacement.isDestroyed &&
+          parent.subdocs.size === 1 && parent.subdocs.has(replacement) && !parent.subdocs.has(child),
+        stages: stageCalls === 1 && updateAttempts === 1 && updateV2Attempts === 1 && subdocAttempts === 1 && trigger.get(0) === 'x',
+        cleanup: firstCleanupCalls === 1 && parent._transaction === null && parent._transactionCleanups.length === 0,
+        retry: retryFailure === null && retryCalls === 2 && cleanupCalls === 2 && docs.get(0) === replacement &&
+          stageCalls === 1 && updateAttempts === 1 && updateV2Attempts === 1 && subdocAttempts === 1,
+        reload: loaded.guid === child.guid && reload.subdocs.size === 1 && reload.subdocs.has(loaded)
+      })
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28DestroyCleanupReentrancyDoesNotReplaceTwice = () => {
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const docs = parent.get('docs')
+    const child = new Y.Doc({ guid: `c28-destroy-reentrant-${label}`, gc: false })
+    const root = child.get('root')
+    docs.insert(0, [child])
+    let cleanupCalls = 0
+    let events = 0
+    root.on('destroy', () => {
+      cleanupCalls++
+      child.destroy()
+    })
+    parent.on('subdocs', () => { events++ })
+
+    child.destroy()
+    const replacement = /** @type {Y.Doc} */ (docs.get(0))
+    child.destroy()
+    t.assert(
+      replacement !== child && docs.get(0) === replacement && child.isDestroyed && !replacement.isDestroyed &&
+      parent.subdocs.size === 1 && parent.subdocs.has(replacement) && !parent.subdocs.has(child) &&
+      cleanupCalls === 1 && events === 1 && parent._transaction === null && parent._transactionCleanups.length === 0,
+      `${label} reentrant destroy is idempotent`
+    )
+  })
+}
+
+export const testC28ParentDestroyDoesNotReplaceNestedSubdocs = () => {
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const child = new Y.Doc({ guid: `c28-parent-nested-child-${label}`, gc: false })
+    const grandchild = new Y.Doc({ guid: `c28-parent-nested-grandchild-${label}`, gc: false })
+    const nested = child.get('nested')
+    const docs = parent.get('docs')
+    nested.insert(0, [grandchild])
+    docs.insert(0, [child])
+    let parentEvents = 0
+    let childEvents = 0
+    let parentDestroys = 0
+    let childDestroys = 0
+    let grandchildDestroys = 0
+    parent.on('subdocs', () => { parentEvents++ })
+    child.on('subdocs', () => { childEvents++ })
+    parent.on('destroy', () => { parentDestroys++ })
+    child.on('destroy', () => { childDestroys++ })
+    grandchild.on('destroy', () => { grandchildDestroys++ })
+
+    parent.destroy()
+    parent.destroy()
+    child.destroy()
+    grandchild.destroy()
+    t.assert(
+      parent.isDestroyed && child.isDestroyed && grandchild.isDestroyed && docs.get(0) === child && nested.get(0) === grandchild &&
+      parent.subdocs instanceof Set && parent.subdocs.size === 0 && child.subdocs instanceof Set && child.subdocs.size === 0 &&
+      parentEvents === 0 && childEvents === 0 && parentDestroys === 1 && childDestroys === 1 && grandchildDestroys === 1 &&
+      parent._transaction === null && parent._transactionCleanups.length === 0 &&
+      child._transaction === null && child._transactionCleanups.length === 0 &&
+      grandchild._transaction === null && grandchild._transactionCleanups.length === 0,
+      `${label} parent teardown preserves nested identities`
+    )
+  })
+}
+
+export const testC28OrdinaryClaimRollbackAllowsSameChildRetry = () => {
+  const parent = new Y.Doc({ gc: false })
+  const docs = parent.get('docs')
+  const child = new Y.Doc({ guid: 'c28-ordinary-claim-retry' })
+  const before = captureC28State(parent, Y.encodeStateAsUpdateV2)
+  const listenerError = new Error('between claim and integrate')
+  let armed = true
+  const proxy = new Proxy(docs, {
+    set: (target, property, value, receiver) => {
+      if (armed && property === '_start') {
+        armed = false
+        throw listenerError
+      }
+      return Reflect.set(target, property, value, receiver)
+    }
+  })
+  let updates = 0
+  let subdocs = 0
+  parent.on('update', () => { updates++ })
+  parent.on('subdocs', () => { subdocs++ })
+
+  let failure = null
+  try { proxy.insert(0, [child]) } catch (error) { failure = error }
+  t.assert(failure === listenerError && docs.length === 0 && child._item === null, 'ordinary post-claim failure')
+  assertC28State(parent, Y.encodeStateAsUpdateV2, before, 'ordinary post-claim failure')
+
+  docs.insert(0, [child])
+  t.assert(docs.get(0) === child && parent.subdocs.has(child) && updates === 1 && subdocs === 1 && parent._transactionCleanups.length === 0)
+  const snapshot = Y.encodeStateAsUpdateV2(parent)
+  const reload = new Y.Doc({ gc: false })
+  Y.applyUpdateV2(reload, snapshot)
+  t.assert(/** @type {Y.Doc} */ (reload.get('docs').get(0)).guid === child.guid && reload.subdocs.size === 1)
+}
+
+export const testC28SparseWireMetaUsesCanonicalSameValue = () => {
+  c28Transports.forEach(({ label, apply, encode }) => {
+    const nanSource = new Y.Doc({ gc: false })
+    nanSource.get('docs').insert(0, [new Y.Doc({ guid: `c28-meta-nan-${label}`, meta: NaN })])
+    const nanHost = new Y.Doc({ gc: false, sparseExactResolution: true })
+    apply(nanHost, encode(nanSource))
+    const nanChild = /** @type {Y.Doc} */ (nanHost.get('docs').get(0))
+    t.assert(Number.isNaN(nanChild.meta) && nanHost.subdocs.has(nanChild), `${label} NaN meta`)
+
+    ;['in-place', 'object-is'].forEach(mode => {
+      const guid = `c28-meta-${mode}-${label}`
+      const nativeObjectIs = Object.is
+      let hostile = true
+      class TargetDoc extends Y.Doc {
+        /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+        constructor (opts) {
+          super(opts)
+          if (!hostile || opts?.guid !== guid) return
+          if (mode === 'in-place') this.meta.value = 'forged'
+          else {
+            Reflect.set(Object, 'is', () => true)
+            this.meta = { value: 'forged' }
+          }
+        }
+      }
+      const source = new Y.Doc({ gc: false })
+      source.get('docs').insert(0, [new Y.Doc({ guid, meta: { value: 'wire' } })])
+      const update = encode(source)
+      const host = new TargetDoc({ gc: false, sparseExactResolution: true })
+      const before = captureC28State(host, encode)
+      let failure = null
+      try { apply(host, update) } catch (error) { failure = error } finally {
+        Reflect.set(Object, 'is', nativeObjectIs)
+      }
+      t.assert(Object.is === nativeObjectIs && Object.is(NaN, NaN), `${label} ${mode} restores Object.is`)
+      t.assert(failure instanceof Error, `${label} ${mode} rejects constructor meta mutation`)
+      assertC28State(host, encode, before, `${label} ${mode} canonical meta`)
+
+      hostile = false
+      apply(host, update)
+      const child = /** @type {Y.Doc} */ (host.get('docs').get(0))
+      t.assert(child.meta.value === 'wire' && host.subdocs.has(child) && host._transactionCleanups.length === 0, `${label} ${mode} retry`)
+    })
+  })
+}
+
+export const testC28SubdocsReferenceAndTransactionMirrorsAreRebuilt = () => {
+  c28Transports.forEach(({ label, apply, encode }) => {
+    const guid = `c28-subdocs-reference-${label}`
+    const source = new Y.Doc({ gc: false })
+    source.get('docs').insert(0, [new Y.Doc({ guid, autoLoad: true })])
+    const host = new Y.Doc({ gc: false, sparseExactResolution: true })
+    const forged = new Y.Doc({ guid: `c28-forged-reference-${label}` })
+    let replacement = /** @type {Set<Y.Doc>|null} */ (null)
+    let delivered = /** @type {{event:{added:Set<Y.Doc>,loaded:Set<Y.Doc>,removed:Set<Y.Doc>},transaction:Y.Transaction}|null} */ (null)
+    /** @param {Y.Transaction} transaction */
+    const replaceTransactionSets = transaction => {
+      transaction.subdocsAdded = new Set([forged])
+      transaction.subdocsLoaded = new Set([forged])
+      transaction.subdocsRemoved = new Set([forged])
+    }
+    host.on('beforeObserverCalls', transaction => {
+      replacement = new Set()
+      host.subdocs = replacement
+      replaceTransactionSets(transaction)
+    })
+    host.on('afterTransaction', replaceTransactionSets)
+    host.on('subdocs', (event, _doc, transaction) => { delivered = { event, transaction } })
+
+    apply(host, encode(source))
+    const child = /** @type {Y.Doc} */ (host.get('docs').get(0))
+    const result = /** @type {NonNullable<typeof delivered>} */ (delivered)
+    t.assert(
+      replacement !== null && host.subdocs === replacement && replacement.size === 1 && replacement.has(child) && !replacement.has(forged) &&
+      result.event.added.size === 1 && result.event.added.has(child) && result.event.loaded.has(child) && result.event.removed.size === 0 &&
+      result.transaction.subdocsAdded.size === 1 && result.transaction.subdocsAdded.has(child) &&
+      result.transaction.subdocsLoaded.size === 1 && result.transaction.subdocsLoaded.has(child) &&
+      result.transaction.subdocsRemoved.size === 0 && host._transactionCleanups.length === 0,
+      `${label} public subdoc mirrors`
+    )
+  })
+}
+
+export const testC28SubdocsReplacementRebuildsExistingMembership = () => {
+  const results = /** @type {Array<{label:string,membership:boolean,event:boolean,update:boolean,reload:boolean,cleanup:boolean}>} */ ([])
+  c28Transports.forEach(({ label, apply, encode, event }) => {
+    const existingGuid = `c28-existing-membership-${label}`
+    const incomingGuid = `c28-incoming-membership-${label}`
+    const host = new Y.Doc({ gc: false, sparseExactResolution: true })
+    const existing = new Y.Doc({ guid: existingGuid })
+    host.get('docs').insert(0, [existing])
+    const source = new Y.Doc({ gc: false })
+    apply(source, encode(host))
+    source.get('docs').insert(1, [new Y.Doc({ guid: incomingGuid, autoLoad: true })])
+    const update = encode(source, Y.encodeStateVector(host))
+    const forged = new Y.Doc({ guid: `c28-forged-membership-${label}` })
+    let replacement = /** @type {Set<Y.Doc>|null} */ (null)
+    let delivered = /** @type {{added:Set<Y.Doc>,loaded:Set<Y.Doc>,removed:Set<Y.Doc>}|null} */ (null)
+    let updates = 0
+    host.on('beforeObserverCalls', () => {
+      replacement = new Set([forged])
+      host.subdocs = replacement
+    })
+    host.on('subdocs', event => { delivered = event })
+    host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+
+    apply(host, update)
+    const incoming = /** @type {Y.Doc} */ (host.get('docs').toArray().find(doc => doc.guid === incomingGuid))
+    const exactMembership =
+      replacement !== null && host.subdocs === replacement && replacement.size === 2 &&
+      replacement.has(existing) && replacement.has(incoming) && !replacement.has(forged)
+    const exactEvent = delivered !== null && delivered.added.size === 1 && delivered.added.has(incoming) &&
+      delivered.loaded.size === 1 && delivered.loaded.has(incoming) && delivered.removed.size === 0
+    const reload = new Y.Doc({ gc: false, sparseExactResolution: true })
+    apply(reload, encode(host))
+    const reloadGuids = new Set(Array.from(reload.subdocs, doc => doc.guid))
+    results.push({
+      label,
+      membership: exactMembership,
+      event: exactEvent,
+      update: updates === 1,
+      reload:
+      reload.subdocs.size === 2 && reloadGuids.has(existingGuid) && reloadGuids.has(incomingGuid) &&
+        !reloadGuids.has(forged.guid),
+      cleanup: host._transaction === null && host._transactionCleanups.length === 0 && reload._transactionCleanups.length === 0
+    })
+  })
+  t.assert(results.every(result => result.membership && result.event && result.update && result.reload && result.cleanup), JSON.stringify(results))
+}
+
+export const testC28FrozenTransactionRetainsCapturedSubdocSets = () => {
+  /** @type {Array<{label:string,error:boolean,frozen:boolean,member:boolean,sets:boolean,event:boolean,update:boolean,cleanup:boolean}>} */
+  const results = []
+  c28Transports.forEach(({ label, apply, encode, event }) => {
+    const guid = `c28-frozen-transaction-${label}`
+    const source = new Y.Doc({ gc: false })
+    source.get('docs').insert(0, [new Y.Doc({ guid, autoLoad: true })])
+    const host = new Y.Doc({ gc: false, sparseExactResolution: true })
+    host.get('docs')
+    let captured = /** @type {{transaction:Y.Transaction,added:Set<Y.Doc>,loaded:Set<Y.Doc>,removed:Set<Y.Doc>}|null} */ (null)
+    let delivered = /** @type {{added:Set<Y.Doc>,loaded:Set<Y.Doc>,removed:Set<Y.Doc>}|null} */ (null)
+    let updates = 0
+    host.on('afterTransaction', transaction => {
+      captured = {
+        transaction,
+        added: transaction.subdocsAdded,
+        loaded: transaction.subdocsLoaded,
+        removed: transaction.subdocsRemoved
+      }
+      Object.freeze(transaction)
+    })
+    host.on('subdocs', subdocs => { delivered = subdocs })
+    host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+    let failure = null
+    try { apply(host, encode(source)) } catch (error) { failure = error }
+    const child = /** @type {Y.Doc} */ (host.get('docs').get(0))
+    const exactCaptured = captured !== null &&
+      captured.transaction.subdocsAdded === captured.added && captured.transaction.subdocsLoaded === captured.loaded &&
+      captured.transaction.subdocsRemoved === captured.removed && captured.added.size === 1 && captured.added.has(child) &&
+      captured.loaded.size === 1 && captured.loaded.has(child) && captured.removed.size === 0
+    const exactEvent = delivered !== null && delivered.added.size === 1 && delivered.added.has(child) &&
+      delivered.loaded.size === 1 && delivered.loaded.has(child) && delivered.removed.size === 0
+    results.push({
+      label,
+      error: failure === null,
+      frozen: captured !== null && Object.isFrozen(captured.transaction),
+      member: child !== undefined && host.subdocs.size === 1 && host.subdocs.has(child),
+      sets: exactCaptured,
+      event: exactEvent,
+      update: updates === 1,
+      cleanup: host._transaction === null && host._transactionCleanups.length === 0
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28ReservedParentClientIdIsNotReadAfterHooks = () => {
+  /** @type {Array<{label:string,error:boolean,reads:boolean,writes:boolean,restored:boolean,commit:boolean,event:boolean,cleanup:boolean}>} */
+  const results = []
+  c28Transports.forEach(({ label, apply, encode, event }) => {
+    const guid = `c28-reserved-parent-id-${label}`
+    const source = new Y.Doc({ gc: false })
+    source.get('docs').insert(0, [new Y.Doc({ guid, autoLoad: true })])
+    const host = new Y.Doc({ gc: false, sparseExactResolution: true })
+    host.get('docs')
+    const reserved = host.clientID
+    const descriptor = /** @type {PropertyDescriptor} */ (Object.getOwnPropertyDescriptor(host, 'clientID'))
+    const accessError = new Error(`${label} late parent clientID access`)
+    let poisoned = false
+    let restored = false
+    let reads = 0
+    let writes = 0
+    let updates = 0
+    let subdocs = 0
+    const restore = () => {
+      if (!poisoned || restored) return
+      Object.defineProperty(host, 'clientID', { ...descriptor, value: reserved })
+      restored = true
+    }
+    host.on('beforeObserverCalls', () => {
+      poisoned = true
+      Object.defineProperty(host, 'clientID', {
+        configurable: true,
+        enumerable: descriptor.enumerable,
+        get: () => { reads++; throw accessError },
+        set: () => { writes++; throw accessError }
+      })
+    })
+    host.on('afterTransactionCleanup', restore)
+    host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+    host.on('subdocs', () => { subdocs++ })
+    let failure = null
+    try { apply(host, encode(source)) } catch (error) { failure = error } finally { restore() }
+    const child = /** @type {Y.Doc|undefined} */ (host.get('docs').get(0))
+    results.push({
+      label,
+      error: failure === null,
+      reads: reads === 0,
+      writes: writes === 0,
+      restored,
+      commit: child !== undefined && child.clientID === reserved && host.clientID === reserved && host.subdocs.has(child),
+      event: updates === 1 && subdocs === 1,
+      cleanup: host._transaction === null && host._transactionCleanups.length === 0
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28SparseMetaProofFailureRevokesCandidate = () => {
+  /** @type {Array<{label:string,mode:string,error:boolean,prewrite:boolean,content:boolean,terminal:boolean,destroyed:boolean,retry:boolean,events:boolean,cleanup:boolean}>} */
+  const results = []
+  c28Transports.forEach(({ label, apply, encode, event }) => {
+    ;['throw', 'destroy'].forEach(mode => {
+      const guid = `c28-meta-proof-${label}-${mode}`
+      const proofError = new Error(`${label} ${mode} meta proof`)
+      let hostile = true
+      /** @type {Array<Y.Doc>} */
+      const candidates = []
+      class TargetDoc extends Y.Doc {
+        /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+        constructor (opts) {
+          super(opts)
+          if (opts?.guid !== guid) return
+          candidates.push(this)
+          if (!hostile) return
+          Object.defineProperty(this.meta, 'value', {
+            configurable: true,
+            enumerable: true,
+            get: () => {
+              if (mode === 'destroy') {
+                this.destroy()
+                return 'wire'
+              }
+              throw proofError
+            }
+          })
+        }
+      }
+      const source = new Y.Doc({ gc: false })
+      source.get('docs').insert(0, [new Y.Doc({ guid, meta: { value: 'wire' }, autoLoad: true })])
+      source.get('text').insert(0, ['x'])
+      const update = encode(source)
+      const host = new TargetDoc({ gc: false, sparseExactResolution: true })
+      host.get('existing').insert(0, ['base'])
+      const before = captureC28State(host, encode)
+      let updates = 0
+      let subdocs = 0
+      host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+      host.on('subdocs', () => { subdocs++ })
+      const contents = /** @type {Array<Y.ContentDoc>} */ ([])
+      const contentPrototype = Y.ContentDoc.prototype
+      const previousDocDescriptor = Object.getOwnPropertyDescriptor(contentPrototype, 'doc')
+      Object.defineProperty(contentPrototype, 'doc', {
+        configurable: true,
+        get: function () { return null },
+        /** @this {Y.ContentDoc} @param {Y.Doc|null} value */
+        set: function (value) {
+          Object.defineProperty(this, 'doc', { value, writable: true, enumerable: true, configurable: true })
+          contents.push(this)
+        }
+      })
+      let failure = null
+      try { apply(host, update) } catch (error) { failure = error } finally {
+        if (previousDocDescriptor === undefined) Reflect.deleteProperty(contentPrototype, 'doc')
+        else Object.defineProperty(contentPrototype, 'doc', previousDocDescriptor)
+      }
+      const candidate = candidates[0]
+      if (candidate !== undefined) {
+        Object.defineProperty(candidate.meta, 'value', { value: 'wire', writable: true, enumerable: true, configurable: true })
+      }
+      /** @param {Array<number>} left @param {Array<number>} right */
+      const same = (left, right) => left.length === right.length && left.every((value, index) => value === right[index])
+      const prewrite = same(Array.from(encode(host)), before.bytes) && same(Array.from(Y.encodeStateVector(host)), before.state) &&
+        host.store.clients.size === before.clients.size && [...before.clients].every(([client, structs]) => host.store.clients.get(client) === structs) &&
+        host.store.pendingStructs === before.pendingStructs && host.store.pendingDs === before.pendingDs &&
+        host.share === before.share && host.share.size === before.roots.size && [...before.roots].every(([key, root]) => host.share.get(key) === root) &&
+        host.subdocs.size === before.subdocs.size
+      const contentCleared = contents.length > 0 && contents.every(content => content.doc === null)
+      const probe = new Y.Doc({ gc: false })
+      let attachFailure = null
+      try { probe.get('docs').insert(0, [candidate]) } catch (error) { attachFailure = error }
+      const terminal = attachFailure instanceof Error && probe.get('docs').length === 0 && probe.subdocs.size === 0
+      hostile = false
+      let retryFailure = null
+      try { apply(host, update) } catch (error) { retryFailure = error }
+      const child = /** @type {Y.Doc|undefined} */ (host.get('docs').get(0))
+      results.push({
+        label,
+        mode,
+        error: mode === 'throw' ? failure === proofError : failure instanceof Error,
+        prewrite,
+        content: contentCleared,
+        terminal,
+        destroyed: mode === 'throw' || (candidate !== undefined && candidate.isDestroyed),
+        retry: retryFailure === null && candidates.length === 2 && child === candidates[1] && child !== candidate && host.subdocs.has(child),
+        events: updates === 1 && subdocs === 1,
+        cleanup: host._transaction === null && host._transactionCleanups.length === 0
+      })
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || key === 'mode' || value === true)), JSON.stringify(results))
+}
+
+export const testC28DestroyedParentRejectsLocalSubdocAdmission = () => {
+  /** @type {Array<{label:string,error:boolean,state:boolean,event:boolean,child:boolean,cleanup:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const docs = parent.get('docs')
+    parent.destroy()
+    const beforeState = Array.from(Y.encodeStateVector(parent))
+    const beforeClients = new Map(parent.store.clients)
+    const pendingStructs = parent.store.pendingStructs
+    const pendingDs = parent.store.pendingDs
+    const child = new Y.Doc({ guid: `c28-destroyed-parent-${label}` })
+    let updates = 0
+    let updatesV2 = 0
+    let subdocs = 0
+    parent.on('update', () => { updates++ })
+    parent.on('updateV2', () => { updatesV2++ })
+    parent.on('subdocs', () => { subdocs++ })
+    let failure = null
+    try { docs.insert(0, [child]) } catch (error) { failure = error }
+    const fresh = new Y.Doc({ gc: false })
+    let retryFailure = null
+    try { fresh.get('docs').insert(0, [child]) } catch (error) { retryFailure = error }
+    const afterState = Array.from(Y.encodeStateVector(parent))
+    results.push({
+      label,
+      error: failure instanceof Error,
+      state: beforeState.length === afterState.length && beforeState.every((value, index) => value === afterState[index]) &&
+        parent.store.clients.size === beforeClients.size && [...beforeClients].every(([client, structs]) => parent.store.clients.get(client) === structs) &&
+        parent.store.pendingStructs === pendingStructs && parent.store.pendingDs === pendingDs && docs.length === 0 && parent.subdocs.size === 0,
+      event: updates === 0 && updatesV2 === 0 && subdocs === 0,
+      child: retryFailure === null && !child.isDestroyed && fresh.get('docs').get(0) === child && fresh.subdocs.has(child),
+      cleanup: parent._transaction === null && parent._transactionCleanups.length === 0
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28InvalidParentSubdocsRejectsLocalMutationPrewrite = () => {
+  /** @type {Array<{label:string,error:boolean,state:boolean,silent:boolean,child:boolean,retry:boolean,event:boolean,cleanup:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    ;['insert', 'delete'].forEach(operation => {
+      const label = `${sparse ? 'sparse' : 'ordinary'}-${operation}`
+      const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+      const docs = parent.get('docs')
+      const child = new Y.Doc({ guid: `c28-invalid-parent-membership-${label}`, shouldLoad: false })
+      if (operation === 'delete') docs.insert(0, [child])
+      const parentSubdocs = parent.subdocs
+      const before = captureC28State(parent, Y.encodeStateAsUpdateV2)
+      let updates = 0
+      let updatesV2 = 0
+      let subdocs = 0
+      const delivered = /** @type {Array<{added:Set<Y.Doc>,loaded:Set<Y.Doc>,removed:Set<Y.Doc>}>} */ ([])
+      let armed = true
+      parent.on('beforeTransaction', () => {
+        if (armed) {
+          armed = false
+          parent.subdocs = /** @type {any} */ ({})
+        }
+      })
+      parent.on('update', () => { updates++ })
+      parent.on('updateV2', () => { updatesV2++ })
+      parent.on('subdocs', event => { subdocs++; delivered.push(event) })
+      const mutate = () => operation === 'insert' ? docs.insert(0, [child]) : docs.delete(0, 1)
+      let failure = null
+      try { mutate() } catch (error) { failure = error }
+      parent.subdocs = parentSubdocs
+      /** @param {Array<number>} left @param {Array<number>} right */
+      const same = (left, right) => left.length === right.length && left.every((value, index) => value === right[index])
+      let state = false
+      try {
+        state = same(Array.from(Y.encodeStateAsUpdateV2(parent)), before.bytes) && same(Array.from(Y.encodeStateVector(parent)), before.state) &&
+          parent.store.clients.size === before.clients.size && [...before.clients].every(([client, structs]) => parent.store.clients.get(client) === structs) &&
+          parent.store.pendingStructs === before.pendingStructs && parent.store.pendingDs === before.pendingDs &&
+          parent.share === before.share && parent.share.size === before.roots.size && [...before.roots].every(([key, root]) => parent.share.get(key) === root) &&
+          parent.subdocs.size === before.subdocs.size && [...before.subdocs].every(subdoc => parent.subdocs.has(subdoc))
+      } catch (_error) {}
+      const childIntact = operation === 'insert'
+        ? child._item === null && docs.length === 0 && !parent.subdocs.has(child) && !child.isDestroyed
+        : child._item !== null && !child._item.deleted && docs.length === 1 && docs.get(0) === child && parent.subdocs.has(child) && !child.isDestroyed
+      const silent = updates === 0 && updatesV2 === 0 && subdocs === 0
+      let retryFailure = null
+      try { mutate() } catch (error) { retryFailure = error }
+      const exactEvent = operation === 'insert'
+        ? delivered.length === 1 && delivered[0].added.size === 1 && delivered[0].added.has(child) && delivered[0].loaded.size === 0 && delivered[0].removed.size === 0
+        : delivered.length === 2 && delivered.every(event => event.added.size === 0 && event.loaded.size === 0 && event.removed.size === 1 && event.removed.has(child))
+      const retry = operation === 'insert'
+        ? retryFailure === null && docs.length === 1 && docs.get(0) === child && parent.subdocs.size === 1 && parent.subdocs.has(child)
+        : retryFailure === null && docs.length === 0 && parent.subdocs.size === 0
+      results.push({
+        label,
+        error: failure instanceof Error,
+        state,
+        silent,
+        child: childIntact,
+        retry,
+        event: updates === 1 && updatesV2 === 1 && subdocs === (operation === 'insert' ? 1 : 2) && exactEvent,
+        cleanup: parent._transaction === null && parent._transactionCleanups.length === 0
+      })
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28QueuedSubdocReplacementRebuildsForgedMembership = () => {
+  /** @type {Array<{label:string,root:boolean,member:boolean,event:boolean,update:boolean,reload:boolean,cleanup:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const docs = parent.get('docs')
+    const existing = new Y.Doc({ guid: `c28-queued-existing-${label}`, shouldLoad: false })
+    const incoming = new Y.Doc({ guid: `c28-queued-incoming-${label}`, shouldLoad: false })
+    const forged = new Y.Doc({ guid: `c28-queued-forged-${label}` })
+    docs.insert(0, [existing])
+    const originalSubdocs = parent.subdocs
+    let replacement = /** @type {Set<Y.Doc>|null} */ (null)
+    let armed = true
+    let updates = 0
+    let updatesV2 = 0
+    /** @type {Array<{added:Set<Y.Doc>,loaded:Set<Y.Doc>,removed:Set<Y.Doc>}>} */
+    const events = []
+    parent.on('beforeObserverCalls', () => {
+      if (!armed) return
+      armed = false
+      originalSubdocs.clear()
+      replacement = new Set([forged])
+      parent.subdocs = replacement
+      parent.transact(() => {
+        docs.insert(docs.length, [incoming])
+        docs.delete(docs.toArray().indexOf(existing), 1)
+      })
+    })
+    parent.on('update', () => { updates++ })
+    parent.on('updateV2', () => { updatesV2++ })
+    parent.on('subdocs', event => events.push(event))
+
+    parent.get('trigger').insert(0, ['x'])
+    const exactEvents = events.length === 2 &&
+      events[0].added.size === 1 && events[0].added.has(incoming) && events[0].removed.size === 1 && events[0].removed.has(existing) && events[0].loaded.size === 0 &&
+      events[1].added.size === 0 && events[1].removed.size === 1 && events[1].removed.has(existing) && events[1].loaded.size === 0
+    const snapshot = Y.encodeStateAsUpdateV2(parent)
+    const reload = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    Y.applyUpdateV2(reload, snapshot)
+    const reloaded = /** @type {Y.Doc} */ (reload.get('docs').get(0))
+    results.push({
+      label,
+      root: docs.length === 1 && docs.get(0) === incoming && incoming._item !== null && !incoming._item.deleted && existing.isDestroyed,
+      member: replacement !== null && parent.subdocs === replacement && replacement.size === 1 && replacement.has(incoming) &&
+        !replacement.has(existing) && !replacement.has(forged) && originalSubdocs.size === 0 && forged._item === null,
+      event: exactEvents,
+      update: updates === 2 && updatesV2 === 2,
+      reload: reload.get('docs').length === 1 && reloaded.guid === incoming.guid && reload.subdocs.size === 1 && reload.subdocs.has(reloaded) &&
+        !Array.from(reload.subdocs, doc => doc.guid).includes(existing.guid) && !Array.from(reload.subdocs, doc => doc.guid).includes(forged.guid) &&
+        reload.get('trigger').get(0) === 'x',
+      cleanup: parent._transaction === null && parent._transactionCleanups.length === 0 && reload._transactionCleanups.length === 0
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28NestedQueuedSubdocsShareCanonicalMembership = () => {
+  /** @type {Array<{label:string,root:boolean,member:boolean,event:boolean,update:boolean,reload:boolean,cleanup:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const docs = parent.get('docs')
+    const childA = new Y.Doc({ guid: `c28-queued-a-${label}`, shouldLoad: false })
+    const childB = new Y.Doc({ guid: `c28-queued-b-${label}`, shouldLoad: false })
+    let armed = true
+    let updates = 0
+    let updatesV2 = 0
+    /** @type {Array<{added:Set<Y.Doc>,loaded:Set<Y.Doc>,removed:Set<Y.Doc>}>} */
+    const events = []
+    parent.on('beforeObserverCalls', () => {
+      if (!armed) return
+      armed = false
+      parent.transact(() => docs.insert(docs.length, [childB]))
+    })
+    parent.on('update', () => { updates++ })
+    parent.on('updateV2', () => { updatesV2++ })
+    parent.on('subdocs', event => events.push(event))
+
+    docs.insert(0, [childA])
+    const exactEvents = events.length === 2 &&
+      events[0].added.size === 1 && events[0].added.has(childA) && events[0].loaded.size === 0 && events[0].removed.size === 0 &&
+      events[1].added.size === 1 && events[1].added.has(childB) && events[1].loaded.size === 0 && events[1].removed.size === 0
+    const snapshot = Y.encodeStateAsUpdateV2(parent)
+    const reload = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    Y.applyUpdateV2(reload, snapshot)
+    const reloadGuids = new Set(Array.from(reload.subdocs, doc => doc.guid))
+    results.push({
+      label,
+      root: docs.length === 2 && docs.toArray().includes(childA) && docs.toArray().includes(childB) &&
+        childA._item !== null && !childA._item.deleted && childB._item !== null && !childB._item.deleted,
+      member: parent.subdocs.size === 2 && parent.subdocs.has(childA) && parent.subdocs.has(childB),
+      event: exactEvents,
+      update: updates === 2 && updatesV2 === 2,
+      reload: reload.get('docs').length === 2 && reload.subdocs.size === 2 && reloadGuids.has(childA.guid) && reloadGuids.has(childB.guid),
+      cleanup: parent._transaction === null && parent._transactionCleanups.length === 0 && reload._transactionCleanups.length === 0
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28WritableNonconfigurableSubdocsMirrorIsReconciled = () => {
+  /** @type {Array<{label:string,error:boolean,mirror:boolean,root:boolean,event:boolean,update:boolean,reload:boolean,cleanup:boolean}>} */
+  const results = []
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const parent = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const docs = parent.get('docs')
+    const childA = new Y.Doc({ guid: `c28-mirror-a-${label}`, shouldLoad: false })
+    const childB = new Y.Doc({ guid: `c28-mirror-b-${label}`, shouldLoad: false })
+    let armed = true
+    let updates = 0
+    let updatesV2 = 0
+    /** @type {Array<{added:Set<Y.Doc>,loaded:Set<Y.Doc>,removed:Set<Y.Doc>}>} */
+    const events = []
+    parent.on('afterTransaction', () => {
+      if (!armed) return
+      armed = false
+      Object.defineProperty(parent, 'subdocs', { value: {}, writable: true, enumerable: true, configurable: false })
+    })
+    parent.on('update', () => { updates++ })
+    parent.on('updateV2', () => { updatesV2++ })
+    parent.on('subdocs', event => events.push(event))
+
+    let firstFailure = null
+    try { docs.insert(0, [childA]) } catch (error) { firstFailure = error }
+    const firstDescriptor = Object.getOwnPropertyDescriptor(parent, 'subdocs')
+    const firstMirror = firstDescriptor?.value instanceof Set && firstDescriptor.value.size === 1 && firstDescriptor.value.has(childA)
+    let secondFailure = null
+    try { docs.insert(docs.length, [childB]) } catch (error) { secondFailure = error }
+    const descriptor = Object.getOwnPropertyDescriptor(parent, 'subdocs')
+    const mirror = descriptor?.value instanceof Set && descriptor.writable === true && descriptor.configurable === false &&
+      descriptor.value.size === 2 && descriptor.value.has(childA) && descriptor.value.has(childB)
+    const exactEvents = events.length === 2 &&
+      events[0].added.size === 1 && events[0].added.has(childA) && events[0].loaded.size === 0 && events[0].removed.size === 0 &&
+      events[1].added.size === 1 && events[1].added.has(childB) && events[1].loaded.size === 0 && events[1].removed.size === 0
+    const snapshot = Y.encodeStateAsUpdateV2(parent)
+    const reload = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    Y.applyUpdateV2(reload, snapshot)
+    const reloadGuids = new Set(Array.from(reload.subdocs, doc => doc.guid))
+    results.push({
+      label,
+      error: firstFailure === null && secondFailure === null,
+      mirror: firstMirror && mirror,
+      root: docs.length === 2 && docs.toArray().includes(childA) && docs.toArray().includes(childB) &&
+        childA._item !== null && !childA._item.deleted && childB._item !== null && !childB._item.deleted,
+      event: exactEvents,
+      update: updates === 2 && updatesV2 === 2,
+      reload: reload.get('docs').length === 2 && reload.subdocs.size === 2 && reloadGuids.has(childA.guid) && reloadGuids.has(childB.guid),
+      cleanup: parent._transaction === null && parent._transactionCleanups.length === 0 && reload._transactionCleanups.length === 0
+    })
+  })
+  t.assert(results.every(result => Object.entries(result).every(([key, value]) => key === 'label' || value === true)), JSON.stringify(results))
+}
+
+export const testC28ParentProxyCannotBypassSelfAdmission = () => {
+  ;[false, true].forEach(sparse => {
+    const label = sparse ? 'sparse' : 'ordinary'
+    const raw = new Y.Doc(sparse ? { gc: false, sparseExactResolution: true } : { gc: false })
+    const proxy = new Proxy(raw, {})
+    const docs = proxy.get('docs')
+    const before = captureC28State(raw, Y.encodeStateAsUpdateV2)
+    let updates = 0
+    let subdocs = 0
+    let destroys = 0
+    raw.on('update', () => { updates++ })
+    raw.on('subdocs', () => { subdocs++ })
+    raw.on('destroy', () => { destroys++ })
+    let failure = null
+    try { docs.insert(0, [raw]) } catch (error) { failure = error }
+    t.assert(failure instanceof Error, `${label} proxy parent self admission`)
+    assertC28State(raw, Y.encodeStateAsUpdateV2, before, `${label} proxy parent self admission`)
+    t.assert(docs.length === 0 && raw._item === null && updates === 0 && subdocs === 0)
+    raw.destroy()
+    t.assert(raw.isDestroyed && destroys === 1 && raw.subdocs.size === 0 && raw._transactionCleanups.length === 0, `${label} finite destroy`)
+  })
 }
 
 export const testSparsePreparationMapSetPoisonCannotRedirectRoot = () => {
