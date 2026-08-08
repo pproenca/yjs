@@ -1273,6 +1273,181 @@ export const testSparseStructuralRevisionWeakMapFailureCannotPublishRoot = () =>
   })
 }
 
+export const testSparseShareReplacementRejectsWithoutAuthoritySplit = () => {
+  ;[
+    { apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },
+    { apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, event: 'updateV2' }
+  ].forEach(({ apply, encode, event }) => {
+    const source = new Y.Doc({ gc: false })
+    source.get('authority-root').insert(0, ['remote'])
+    const update = encode(source)
+    const target = new Y.Doc({ gc: false, sparseExactResolution: true })
+    const root = target.get('authority-root')
+    root.insert(0, ['base'])
+    const originalShare = target.share
+    const replacementShare = new Map(originalShare)
+    const before = Array.from(encode(target))
+    const beforeState = Array.from(Y.encodeStateVector(target))
+    const beforeClients = new Map(target.store.clients)
+    const pendingStructs = target.store.pendingStructs
+    const pendingDs = target.store.pendingDs
+    let arm = true
+    let events = 0
+    target.on('beforeTransaction', () => {
+      if (!arm) return
+      arm = false
+      target.share = replacementShare
+    })
+    target.on(/** @type {'update'|'updateV2'} */ (event), () => { events++ })
+
+    let failure = null
+    try {
+      try {
+        apply(target, update)
+      } catch (error) {
+        failure = error
+      }
+      t.assert(failure instanceof Error, `${event} replaced root authority must reject`)
+      t.assert(target.share === replacementShare && originalShare !== replacementShare)
+      t.assert(originalShare.size === 1 && originalShare.get('authority-root') === root)
+      t.assert(replacementShare.size === 1 && replacementShare.get('authority-root') === root)
+      t.assert(root.length === 1 && root.toArray()[0] === 'base')
+      t.compareArrays(Array.from(encode(target)), before)
+      t.compareArrays(Array.from(Y.encodeStateVector(target)), beforeState)
+      t.assert(target.store.clients.size === beforeClients.size && [...beforeClients].every(([client, structs]) => target.store.clients.get(client) === structs))
+      t.assert(target.store.pendingStructs === pendingStructs && target.store.pendingDs === pendingDs && events === 0)
+    } finally {
+      target.share = originalShare
+    }
+
+    apply(target, update)
+    const values = root.toArray()
+    t.assert(target.share === originalShare && target.get('authority-root') === root)
+    t.assert(values.length === 2 && values.includes('base') && values.includes('remote') && events === 1)
+    const reload = new Y.Doc({ gc: false })
+    apply(reload, encode(target))
+    const reloaded = reload.get('authority-root').toArray()
+    t.assert(reloaded.length === 2 && reloaded.includes('base') && reloaded.includes('remote'))
+  })
+}
+
+export const testSparsePreparationMapSetPoisonCannotRedirectRoot = () => {
+  ;[
+    { apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },
+    { apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, event: 'updateV2' }
+  ].forEach(({ apply, encode, event }) => {
+    const source = new Y.Doc({ gc: false })
+    source.get('intended-root').insert(0, ['x'])
+    const update = encode(source)
+    const target = new Y.Doc({ gc: false, sparseExactResolution: true })
+    const intendedRoot = target.get('intended-root')
+    const redirectedRoot = target.get('redirected-root')
+    const before = Array.from(encode(target))
+    const beforeState = Array.from(Y.encodeStateVector(target))
+    const originalGet = target.get
+    const originalSet = Map.prototype.set
+    let arm = true
+    let poisonedWrites = 0
+    let events = 0
+    target.get = /** @param {string} name @param {string|null} [typeName] */ function (name, typeName) {
+      const type = Reflect.apply(originalGet, this, [name, typeName])
+      if (arm && name === 'intended-root') {
+        arm = false
+        Reflect.set(Map.prototype, 'set', /** @this {Map<unknown,unknown>} @param {unknown} key @param {unknown} value */ function (key, value) {
+          if (key instanceof Y.Item && key.parent === 'intended-root') {
+            poisonedWrites++
+            return Reflect.apply(originalSet, this, [key, redirectedRoot])
+          }
+          return Reflect.apply(originalSet, this, [key, value])
+        })
+      }
+      return type
+    }
+    target.on(/** @type {'update'|'updateV2'} */ (event), () => { events++ })
+
+    let failure = null
+    try {
+      apply(target, update)
+    } catch (error) {
+      failure = error
+    } finally {
+      target.get = originalGet
+      Reflect.set(Map.prototype, 'set', originalSet)
+    }
+    t.assert(target.get === originalGet && Map.prototype.set === originalSet && new Map([['clean', true]]).get('clean') === true)
+    if (failure !== null) {
+      t.compareArrays(Array.from(encode(target)), before)
+      t.compareArrays(Array.from(Y.encodeStateVector(target)), beforeState)
+      t.assert(intendedRoot.length === 0 && redirectedRoot.length === 0 && target.store.clients.size === 0 && events === 0)
+      apply(target, update)
+    }
+    t.assert(poisonedWrites === 0 || (intendedRoot.toArray()[0] === 'x' && redirectedRoot.length === 0))
+    t.assert(intendedRoot.toArray()[0] === 'x' && redirectedRoot.length === 0 && events === 1)
+    t.compareArrays(Array.from(Y.encodeStateVector(target)), Array.from(Y.encodeStateVector(source)))
+    const reload = new Y.Doc({ gc: false })
+    apply(reload, encode(target))
+    t.assert(reload.get('intended-root').toArray()[0] === 'x' && reload.get('redirected-root').length === 0)
+  })
+}
+
+export const testSparseLateArrayIteratorCannotSuppressIntegrationSchedule = () => {
+  ;[
+    { apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },
+    { apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, event: 'updateV2' }
+  ].forEach(({ apply, encode, event }) => {
+    const source = new Y.Doc({ gc: false })
+    source.get('scheduled-root').insert(0, ['x'])
+    const update = encode(source)
+    const target = new Y.Doc({ gc: false, sparseExactResolution: true })
+    const before = Array.from(encode(target))
+    const beforeState = Array.from(Y.encodeStateVector(target))
+    const originalIterator = Array.prototype[Symbol.iterator]
+    let arm = true
+    let suppressed = 0
+    let events = 0
+    target.on('beforeTransaction', () => {
+      if (!arm) return
+      arm = false
+      Reflect.set(Array.prototype, Symbol.iterator, /** @this {Array<unknown>} */ function () {
+        const entry = this[0]
+        if (
+          this.length > 0 && entry !== null && typeof entry === 'object' &&
+          Object.prototype.hasOwnProperty.call(entry, 'struct') &&
+          Object.prototype.hasOwnProperty.call(entry, 'clock') &&
+          Object.prototype.hasOwnProperty.call(entry, 'gap')
+        ) {
+          suppressed++
+          return Reflect.apply(originalIterator, [], [])
+        }
+        return Reflect.apply(originalIterator, this, [])
+      })
+    })
+    target.on(/** @type {'update'|'updateV2'} */ (event), () => { events++ })
+
+    let failure = null
+    try {
+      apply(target, update)
+    } catch (error) {
+      failure = error
+    } finally {
+      Reflect.set(Array.prototype, Symbol.iterator, originalIterator)
+    }
+    t.assert(Array.prototype[Symbol.iterator] === originalIterator && Array.from(['clean'])[0] === 'clean')
+    if (failure !== null) {
+      t.compareArrays(Array.from(encode(target)), before)
+      t.compareArrays(Array.from(Y.encodeStateVector(target)), beforeState)
+      t.assert(!target.share.has('scheduled-root') && target.store.clients.size === 0 && events === 0)
+      apply(target, update)
+    }
+    t.assert(suppressed === 0 || target.get('scheduled-root').toArray()[0] === 'x')
+    t.assert(target.get('scheduled-root').toArray()[0] === 'x' && events === 1)
+    t.compareArrays(Array.from(Y.encodeStateVector(target)), Array.from(Y.encodeStateVector(source)))
+    const reload = new Y.Doc({ gc: false })
+    apply(reload, encode(target))
+    t.assert(reload.get('scheduled-root').toArray()[0] === 'x')
+  })
+}
+
 export const testSparsePendingStateSerializesWithDocumentContext = () => {
   ;[
     {

@@ -39,6 +39,7 @@ import { writeStructs } from './encoding-helpers.js'
 const applyIntrinsic = Reflect.apply
 const mapGetIntrinsic = Map.prototype.get
 const mapHasIntrinsic = Map.prototype.has
+const mapSetIntrinsic = Map.prototype.set
 
 /**
  * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
@@ -527,35 +528,47 @@ const prepareContentDocs = (ordered, target, prepared, isStable) => {
  *
  * @param {Array<{struct:GC|Item|CausalHole,clock:number,gap:number}>} ordered
  * @param {Doc} target
+ * @param {Map<string,YType>} share
  * @param {ReturnType<typeof createSparseIntegrationPlan>} sparsePlan
  * @param {Map<string,YType>} stagedRoots
  * @param {Map<string,YType>} existingRoots
  */
-const prepareStringRootParents = (ordered, target, sparsePlan, stagedRoots, existingRoots) => {
+const prepareStringRootParents = (ordered, target, share, sparsePlan, stagedRoots, existingRoots) => {
   /** @type {Map<Item,YType>} */
   const resolved = new Map()
-  for (const entry of ordered) {
+  for (let index = 0; index < ordered.length; index++) {
+    const entry = ordered[index]
     if (entry.struct.constructor !== Item) continue
     const item = /** @type {Item} */ (entry.struct)
     const metadata = typeof item.parent === 'string' ? null : sparsePlan?.getParentMetadata(item) ?? null
     const parent = typeof item.parent === 'string' ? item.parent : metadata?.parent
     if (typeof parent !== 'string') continue
-    const existing = target.share.get(parent)
     let type
-    if (existing === undefined) {
-      type = stagedRoots.get(parent)
-      if (type === undefined) {
+    if (!applyIntrinsic(mapHasIntrinsic, share, [parent])) {
+      if (applyIntrinsic(mapHasIntrinsic, stagedRoots, [parent])) {
+        type = /** @type {YType} */ (applyIntrinsic(mapGetIntrinsic, stagedRoots, [parent]))
+      } else {
         type = stageDocRootType(target)
-        stagedRoots.set(parent, type)
+        applyIntrinsic(mapSetIntrinsic, stagedRoots, [parent, type])
       }
     } else {
       type = target.get(parent)
-      if (target.share.get(parent) !== type) throw new Error(`Root type lookup did not preserve ${parent}`)
-      const prepared = existingRoots.get(parent)
-      if (prepared !== undefined && prepared !== type) throw new Error(`Root type lookup changed ${parent}`)
-      existingRoots.set(parent, type)
+      if (target.share !== share) throw new Error('Document root map changed during preparation')
+      if (
+        !applyIntrinsic(mapHasIntrinsic, share, [parent]) ||
+        applyIntrinsic(mapGetIntrinsic, share, [parent]) !== type
+      ) {
+        throw new Error(`Root type lookup did not preserve ${parent}`)
+      }
+      if (
+        applyIntrinsic(mapHasIntrinsic, existingRoots, [parent]) &&
+        applyIntrinsic(mapGetIntrinsic, existingRoots, [parent]) !== type
+      ) {
+        throw new Error(`Root type lookup changed ${parent}`)
+      }
+      applyIntrinsic(mapSetIntrinsic, existingRoots, [parent, type])
     }
-    resolved.set(item, type)
+    applyIntrinsic(mapSetIntrinsic, resolved, [item, type])
   }
   return resolved
 }
@@ -792,6 +805,8 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
   /** @type {Map<Item,YType>} */
   let preparedStringRootParents = new Map()
   /** @type {Map<string,YType>} */
+  let preparedShare = ydoc.share
+  /** @type {Map<string,YType>} */
   let stagedStringRoots = new Map()
   /** @type {Map<string,YType>} */
   let existingStringRoots = new Map()
@@ -820,11 +835,12 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     stable = prepareContentDocs(schedule.ordered, ydoc, preparedContentDocs, revisionsStable) && revisionsStable()
     if (stable) {
       let attemptStringRootParents
+      const attemptShare = ydoc.share
       const attemptStagedStringRoots = new Map()
       const attemptExistingStringRoots = new Map()
       try {
-        attemptStringRootParents = prepareStringRootParents(schedule.ordered, ydoc, sparsePlan, attemptStagedStringRoots, attemptExistingStringRoots)
-        stable = revisionsStable()
+        attemptStringRootParents = prepareStringRootParents(schedule.ordered, ydoc, attemptShare, sparsePlan, attemptStagedStringRoots, attemptExistingStringRoots)
+        stable = ydoc.share === attemptShare && revisionsStable()
       } catch (failure) {
         disposeUnintegratedContentDocs(preparedContentDocs)
         preparedContentDocs.length = 0
@@ -832,6 +848,7 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
       }
       if (stable) {
         preparedStringRootParents = attemptStringRootParents
+        preparedShare = attemptShare
         stagedStringRoots = attemptStagedStringRoots
         existingStringRoots = attemptExistingStringRoots
         scheduledStructuralRevision = structuralRevision
@@ -857,12 +874,13 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     ) {
       throw new Error('Integration schedule invalidated before commit')
     }
-    installStagedDocRootTypes(ydoc, existingStringRoots, stagedStringRoots)
+    installStagedDocRootTypes(ydoc, preparedShare, existingStringRoots, stagedStringRoots)
     if (consumeSparsePending) {
       commitPendingStructs(store, null)
       commitPendingDs(store, null)
     }
-    for (const entry of schedule.ordered) {
+    for (let index = 0; index < schedule.ordered.length; index++) {
+      const entry = schedule.ordered[index]
       const clock = store.getClock(entry.struct.id.client)
       if (entry.gap > 0) new Skip(createID(entry.struct.id.client, clock), entry.gap).integrate(transaction, 0)
       if (entry.struct.constructor === Item || entry.struct.constructor === CausalHole) {

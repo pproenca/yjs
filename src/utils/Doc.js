@@ -43,11 +43,15 @@ const docRootMapBrandKey = Symbol('doc-root-map-brand')
 
 /**
  * @param {Doc} doc
+ * @param {Map<string,YType>} preparedShare
  * @param {Map<string,YType>} existingRoots
  * @param {Map<string,YType>} stagedRoots
  */
-export const installStagedDocRootTypes = (doc, existingRoots, stagedRoots) => {
-  const share = doc.share
+export const installStagedDocRootTypes = (doc, preparedShare, existingRoots, stagedRoots) => {
+  if (doc.share !== preparedShare) {
+    throw new Error('Prepared sparse root map changed before commit')
+  }
+  const share = preparedShare
   applyIntrinsic(mapHasIntrinsic, share, [docRootMapBrandKey])
   applyIntrinsic(mapForEachIntrinsic, existingRoots, [
     /** @param {YType} type @param {string} key */ (type, key) => {
