@@ -1,9 +1,6 @@
-
-import { AbstractType } from '../internals.js' // eslint-disable-line
-
-import * as decoding from 'lib0/decoding.js'
-import * as encoding from 'lib0/encoding.js'
-import * as error from 'lib0/error.js'
+import * as decoding from 'lib0/decoding'
+import * as encoding from 'lib0/encoding'
+import * as error from 'lib0/error'
 
 export class ID {
   /**
@@ -73,7 +70,7 @@ export const readID = decoder =>
  * `type` does not store any information about the `keyname`.
  * This function finds the correct `keyname` for `type` and throws otherwise.
  *
- * @param {AbstractType<any>} type
+ * @param {YType<any>} type
  * @return {string}
  *
  * @private
@@ -81,7 +78,7 @@ export const readID = decoder =>
  */
 export const findRootTypeKey = type => {
   // @ts-ignore _y must be defined, otherwise unexpected case
-  for (const [key, value] of type.doc.share) {
+  for (const [key, value] of type.doc.share.entries()) {
     if (value === type) {
       return key
     }

@@ -1,56 +1,61 @@
+import * as map from 'lib0/map'
+import * as set from 'lib0/set'
 
-import {
-  isDeleted,
-  Item, AbstractType, Transaction, AbstractStruct // eslint-disable-line
-} from '../internals.js'
-
-import * as set from 'lib0/set.js'
-import * as array from 'lib0/array.js'
+import { diffIdSet, intersectSets, mergeIdSets } from './ids.js'
+import { createAbsolutePositionFromRelativePosition, createRelativePosition } from './RelativePosition.js'
 
 /**
+ * @template {DeltaConf} DConf
  * YEvent describes the changes on a YType.
  */
 export class YEvent {
   /**
-   * @param {AbstractType<any>} target The changed type.
-   * @param {Transaction} transaction
+   * @param {YType<DConf>} target The changed type.
+   * @param {import('./Transaction.js').Transaction} transaction
+   * @param {Set<any>?} subs The keys that changed
    */
-  constructor (target, transaction) {
+  constructor (target, transaction, subs) {
     /**
      * The type on which this event was created on.
-     * @type {AbstractType<any>}
+     * @type {import('../ytype.js').YType<DConf>}
      */
     this.target = target
     /**
      * The current target on which the observe callback is called.
-     * @type {AbstractType<any>}
+     * @type {YType<any>}
      */
     this.currentTarget = target
     /**
      * The transaction that triggered this event.
-     * @type {Transaction}
+     * @type {import('./Transaction.js').Transaction}
      */
     this.transaction = transaction
     /**
-     * @type {Object|null}
+     * @type {Delta<import('../ytype.js').DeltaConfDeltaToYType<DConf>>|null}
      */
-    this._changes = null
-  }
-
-  /**
-   * Computes the path from `y` to the changed type.
-   *
-   * The following property holds:
-   * @example
-   *   let type = y
-   *   event.path.forEach(dir => {
-   *     type = type.get(dir)
-   *   })
-   *   type === event.target // => true
-   */
-  get path () {
-    // @ts-ignore _item is defined because target is integrated
-    return getPathTo(this.currentTarget, this.target)
+    this._delta = null
+    /**
+     * @type {Delta<DConf>|null}
+     */
+    this._deltaDeep = null
+    /**
+     * Whether the children changed.
+     * @type {Boolean}
+     * @private
+     */
+    this.childListChanged = false
+    /**
+     * Set of all changed attributes.
+     * @type {Set<string>}
+     */
+    this.keysChanged = new Set()
+    subs?.forEach((sub) => {
+      if (sub === null) {
+        this.childListChanged = true
+      } else {
+        this.keysChanged.add(sub)
+      }
+    })
   }
 
   /**
@@ -62,7 +67,7 @@ export class YEvent {
    * @return {boolean}
    */
   deletes (struct) {
-    return isDeleted(this.transaction.deleteSet, struct.id)
+    return this.transaction.deleteSet.hasId(struct.id)
   }
 
   /**
@@ -74,114 +79,81 @@ export class YEvent {
    * @return {boolean}
    */
   adds (struct) {
-    return struct.id.clock >= (this.transaction.beforeState.get(struct.id.client) || 0)
+    return this.transaction.insertSet.hasId(struct.id)
   }
 
   /**
-   * @return {{added:Set<Item>,deleted:Set<Item>,delta:Array<{insert:Array<any>}|{delete:number}|{retain:number}>}}
+   * @template {boolean} [Deep=false]
+   * @param {object} [opts]
+   * @param {AbstractRenderer?} [opts.renderer] - renders the content (with attributions); defaults to the target type's active renderer (see {@link YType#useRenderer}), i.e. `null` (render as-is) unless changed
+   * @param {Deep} [opts.deep]
+   * @return {Deep extends true ? Delta<DConf> : Delta<import('../ytype.js').DeltaConfDeltaToYType<DConf>>} The Delta representation of this type.
+   *
+   * @public
    */
-  get changes () {
-    let changes = this._changes
-    if (changes === null) {
-      const target = this.target
-      const added = set.create()
-      const deleted = set.create()
-      /**
-       * @type {Array<{insert:Array<any>}|{delete:number}|{retain:number}>}
-       */
-      const delta = []
-      /**
-       * @type {Map<string,{ action: 'add' | 'update' | 'delete', oldValue: any}>}
-       */
-      const keys = new Map()
-      changes = {
-        added, deleted, delta, keys
-      }
-      const changed = /** @type Set<string|null> */ (this.transaction.changed.get(target))
-      if (changed.has(null)) {
-        /**
-         * @type {any}
-         */
-        let lastOp = null
-        const packOp = () => {
-          if (lastOp) {
-            delta.push(lastOp)
-          }
-        }
-        for (let item = target._start; item !== null; item = item.right) {
-          if (item.deleted) {
-            if (this.deletes(item) && !this.adds(item)) {
-              if (lastOp === null || lastOp.delete === undefined) {
-                packOp()
-                lastOp = { delete: 0 }
-              }
-              lastOp.delete += item.length
-              deleted.add(item)
-            } // else nop
-          } else {
-            if (this.adds(item)) {
-              if (lastOp === null || lastOp.insert === undefined) {
-                packOp()
-                lastOp = { insert: [] }
-              }
-              lastOp.insert = lastOp.insert.concat(item.content.getContent())
-              added.add(item)
-            } else {
-              if (lastOp === null || lastOp.retain === undefined) {
-                packOp()
-                lastOp = { retain: 0 }
-              }
-              lastOp.retain += item.length
-            }
-          }
-        }
-        if (lastOp !== null && lastOp.retain === undefined) {
-          packOp()
-        }
-      }
-      changed.forEach(key => {
-        if (key !== null) {
-          const item = /** @type {Item} */ (target._map.get(key))
-          /**
-           * @type {'delete' | 'add' | 'update'}
-           */
-          let action
-          let oldValue
-          if (this.adds(item)) {
-            let prev = item.left
-            while (prev !== null && this.adds(prev)) {
-              prev = prev.left
-            }
-            if (this.deletes(item)) {
-              if (prev !== null && this.deletes(prev)) {
-                action = 'delete'
-                oldValue = array.last(prev.content.getContent())
-              } else {
-                return
-              }
-            } else {
-              if (prev !== null && this.deletes(prev)) {
-                action = 'update'
-                oldValue = array.last(prev.content.getContent())
-              } else {
-                action = 'add'
-                oldValue = undefined
-              }
-            }
-          } else {
-            if (this.deletes(item)) {
-              action = 'delete'
-              oldValue = array.last(/** @type {Item} */ item.content.getContent())
-            } else {
-              return // nop
-            }
-          }
-          keys.set(key, { action, oldValue })
-        }
+  getDelta ({ renderer = this.target._renderer, deep } = {}) {
+    const insertSet = this.transaction.insertSet
+    const deleteSet = this.transaction.deleteSet
+    // content that was both inserted AND deleted by this transaction is normally invisible — but a
+    // renderer may still render it (e.g. remote content integrated under a suggestion-deleted
+    // parent is auto-deleted yet rendered with a delete attribution). Render
+    // `(I ∪ D) − ((I ∩ D) − renderer.attributed)`: the symmetric difference plus the attributed
+    // part of the intersection.
+    const both = intersectSets(insertSet, deleteSet)
+    const itemsToRender = mergeIdSets(
+      (both.isEmpty() || renderer === null)
+        ? [diffIdSet(insertSet, deleteSet), diffIdSet(deleteSet, insertSet)]
+        : [diffIdSet(insertSet, deleteSet), diffIdSet(deleteSet, insertSet), intersectSets(both, renderer.attributed)]
+    )
+    /**
+     * @todo this should be done only one in the transaction step
+     *
+     * @type {Map<YType,Set<string|null>>|null}
+     */
+    let modified = this.transaction.changed
+    if (deep) {
+      // need to add deep changes to copy of modified
+      const dchanged = new Map()
+      modified.forEach((attrs, type) => {
+        dchanged.set(type, new Set(attrs))
       })
-      this._changes = changes
+      for (let m of modified.keys()) {
+        while (m._item != null) {
+          const item = m._item
+          const ms = map.setIfUndefined(dchanged, item?.parent, set.create)
+          if (item && !ms.has(item.parentSub)) {
+            ms.add(item.parentSub)
+            m = /** @type {any} */ (item.parent)
+          } else {
+            break
+          }
+        }
+      }
+      modified = dchanged
     }
-    return /** @type {any} */ (changes)
+    return /** @type {any} */ (this.target.toDelta({ renderer, itemsToRender, retainDeletes: true, insertedItems: insertSet, deep: !!deep, modified }))
+  }
+
+  /**
+   * Compute the changes in the delta format.
+   * A {@link https://quilljs.com/docs/delta/|Quill Delta}) that represents the changes on the document.
+   *
+   * @type {Delta<import('../ytype.js').DeltaConfDeltaToYType<DConf>>} The Delta representation of this type.
+   * @public
+   */
+  get delta () {
+    return /** @type {any} */ (this._delta ?? (this._delta = this.getDelta().done()))
+  }
+
+  /**
+   * Compute the changes in the delta format.
+   * A {@link https://quilljs.com/docs/delta/|Quill Delta}) that represents the changes on the document.
+   *
+   * @type {Delta<DConf>} The Delta representation of this type.
+   * @public
+   */
+  get deltaDeep () {
+    return /** @type {any} */ (this._deltaDeep ?? (this._deltaDeep = /** @type {any} */ (this.getDelta({ deep: true }))))
   }
 }
 
@@ -195,32 +167,28 @@ export class YEvent {
  *   console.log(path) // might look like => [2, 'key1']
  *   child === type.get(path[0]).get(path[1])
  *
- * @param {AbstractType<any>} parent
- * @param {AbstractType<any>} child target
+ * @param {YType} parent
+ * @param {YType} child target
+ * @param {AbstractRenderer?} renderer
  * @return {Array<string|number>} Path to the target
  *
  * @private
  * @function
  */
-const getPathTo = (parent, child) => {
+export const getPathTo = (parent, child, renderer = null) => {
   const path = []
+  const doc = /** @type {Doc} */ (parent.doc)
   while (child._item !== null && child !== parent) {
     if (child._item.parentSub !== null) {
       // parent is map-ish
       path.unshift(child._item.parentSub)
     } else {
+      const parent = /** @type {import('../ytype.js').YType} */ (child._item.parent)
       // parent is array-ish
-      let i = 0
-      let c = /** @type {AbstractType<any>} */ (child._item.parent)._start
-      while (c !== child._item && c !== null) {
-        if (!c.deleted) {
-          i++
-        }
-        c = c.right
-      }
-      path.unshift(i)
+      const apos = /** @type {import('../utils/RelativePosition.js').AbsolutePosition} */ (createAbsolutePositionFromRelativePosition(createRelativePosition(parent, child._item.id), doc, false, renderer))
+      path.unshift(apos.index)
     }
-    child = /** @type {AbstractType<any>} */ (child._item.parent)
+    child = /** @type {YType} */ (child._item.parent)
   }
   return path
 }

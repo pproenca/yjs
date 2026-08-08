@@ -1,94 +1,15 @@
-import nodeResolve from '@rollup/plugin-node-resolve'
-import commonjs from '@rollup/plugin-commonjs'
-
-const localImports = process.env.LOCALIMPORTS
-
-const customModules = new Set([
-  'y-websocket',
-  'y-codemirror',
-  'y-ace',
-  'y-textarea',
-  'y-quill',
-  'y-dom',
-  'y-prosemirror'
-])
-/**
- * @type {Set<any>}
- */
-const customLibModules = new Set([
-  'lib0',
-  'y-protocols'
-])
-const debugResolve = {
-  resolveId (importee) {
-    if (importee === 'yjs') {
-      return `${process.cwd()}/src/index.js`
-    }
-    if (localImports) {
-      if (customModules.has(importee.split('/')[0])) {
-        return `${process.cwd()}/../${importee}/src/${importee}.js`
-      }
-      if (customLibModules.has(importee.split('/')[0])) {
-        return `${process.cwd()}/../${importee}`
-      }
-    }
-    return null
-  }
-}
+// @todo remove
 
 export default [{
-  input: './src/index.js',
-  output: {
-    name: 'Y',
-    file: 'dist/yjs.cjs',
-    format: 'cjs',
-    sourcemap: true,
-    paths: path => {
-      if (/^lib0\//.test(path)) {
-        return `lib0/dist/${path.slice(5, -3)}.cjs`
-      }
-      return path
-    }
+  input: {
+    yjs: './src/index.js',
+    testHelper: './tests/testHelper.js'
   },
-  external: id => /^lib0\//.test(id)
-}, {
-  input: './src/index.js',
   output: {
-    name: 'Y',
-    file: 'dist/yjs.mjs',
+    dir: 'dist',
     format: 'esm',
+    entryFileNames: '[name].js',
     sourcemap: true
   },
-  external: id => /^lib0\//.test(id)
-}, {
-  input: './tests/index.js',
-  output: {
-    name: 'test',
-    file: 'dist/tests.js',
-    format: 'iife',
-    sourcemap: true
-  },
-  plugins: [
-    debugResolve,
-    nodeResolve({
-      mainFields: ['module', 'browser', 'main']
-    }),
-    commonjs()
-  ]
-}, {
-  input: './tests/index.js',
-  output: {
-    name: 'test',
-    file: 'dist/tests.cjs',
-    format: 'cjs',
-    sourcemap: true
-  },
-  plugins: [
-    debugResolve,
-    nodeResolve({
-      mainFields: ['module', 'main']
-    }),
-    commonjs()
-  ],
-  external: ['isomorphic.js']
+  external: id => /^(lib0|@y)\//.test(id)
 }]

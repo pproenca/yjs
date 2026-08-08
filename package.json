@@ -1,54 +1,62 @@
 {
-  "name": "yjs",
-  "version": "13.2.0",
+  "name": "@pproenca/y",
+  "version": "14.0.0-rc.23-y001.0",
   "description": "Shared Editing Library",
-  "main": "./dist/yjs.cjs",
-  "module": "./dist/yjs.mjs",
-  "types": "./dist/src/index.d.ts",
+  "type": "module",
   "sideEffects": false,
   "funding": {
     "type": "GitHub Sponsors ❤",
     "url": "https://github.com/sponsors/dmonad"
   },
   "scripts": {
-    "test": "npm run dist && node ./dist/tests.cjs --repitition-time 50",
-    "test-extensive": "npm run lint && npm run dist && node ./dist/tests.cjs --production --repitition-time 10000",
-    "dist": "rm -rf dist && rollup -c && tsc",
-    "watch": "rollup -wc",
-    "lint": "markdownlint README.md && standard && tsc",
-    "docs": "rm -rf docs; jsdoc --configure ./.jsdoc.json --verbose --readme ./README.md --package ./package.json || true",
-    "serve-docs": "npm run docs && http-server ./docs/",
-    "preversion": "npm run lint && PRODUCTION=1 npm run dist && npm run docs && node ./dist/tests.cjs --repitition-time 1000",
-    "debug": "concurrently 'http-server -o test.html' 'npm run watch'",
-    "trace-deopt": "clear && rollup -c  && node --trace-deopt dist/test.cjs",
-    "trace-opt": "clear && rollup -c  && node --trace-opt dist/test.cjs"
+    "clean": "rm -rf dist",
+    "test": "NODE_ENV=development node ./tests/index.js --repetition-time 50",
+    "test-extensive": "node ./tests/index.js --production --repetition-time 10000",
+    "dist": "npm run clean && PRODUCTION=1 tsc --noEmit false && test -e dist/src/index.d.ts",
+    "verify:pack": "node ./scripts/verify-pack.mjs",
+    "prepack": "npm run dist && npm run verify:pack",
+    "lint": "markdownlint README.md && standard && tsc && npx dpdm --exit-code circular:1 --warning false --tree false src/index.js",
+    "debug": "npm run gentesthtml && 0serve -o test.html",
+    "debug:node": "node --inspect-brk tests/index.js",
+    "trace-deopt": "clear && node --trace-deopt ./tests/index.js",
+    "trace-opt": "clear && node --trace-opt ./tests/index.js",
+    "gentesthtml": "0gentesthtml --script ./tests/index.js --include-dependencies @y/protocols > test.html"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./meta": {
+      "types": "./dist/src/utils/meta.d.ts",
+      "default": "./src/utils/meta.js"
+    },
+    "./package.json": "./package.json"
   },
   "files": [
-    "dist/*",
-    "src/*",
-    "tests/*",
-    "docs/*"
+    "src",
+    "dist/src",
+    "global.d.ts"
   ],
   "dictionaries": {
-    "doc": "docs",
     "test": "tests"
   },
   "standard": {
     "ignore": [
       "/dist",
-      "/node_modules",
-      "/docs"
+      "/node_modules"
     ]
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/yjs/yjs.git"
+    "url": "https://github.com/pproenca/yjs.git"
   },
   "keywords": [
     "Yjs",
     "CRDT",
     "offline",
-    "shared editing",
+    "offline-first",
+    "shared-editing",
     "concurrency",
     "collaboration"
   ],
@@ -56,24 +64,24 @@
   "email": "kevin.jahns@protonmail.com",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/yjs/yjs/issues"
+    "url": "https://github.com/pproenca/yjs/issues"
   },
-  "homepage": "https://yjs.dev",
+  "homepage": "https://docs.yjs.dev",
   "dependencies": {
-    "lib0": "^0.2.27"
+    "lib0": "^1.0.0-rc.21"
   },
   "devDependencies": {
-    "@rollup/plugin-commonjs": "^11.1.0",
-    "@rollup/plugin-node-resolve": "^7.1.3",
-    "concurrently": "^3.6.1",
-    "http-server": "^0.12.3",
-    "jsdoc": "^3.6.4",
-    "markdownlint-cli": "^0.23.1",
-    "rollup": "^1.32.1",
-    "rollup-cli": "^1.0.9",
-    "standard": "^14.3.4",
-    "tui-jsdoc-template": "^1.2.2",
-    "typescript": "^3.9.3",
-    "y-protocols": "^0.2.3"
+    "@types/node": "^22.14.1",
+    "@y/protocols": "^1.0.6-rc.1",
+    "@y/y": ".",
+    "dpdm": "^4.0.1",
+    "markdownlint": "^0.40.0",
+    "markdownlint-cli": "^0.49.0",
+    "standard": "^17.1.2",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "npm": ">=8.0.0",
+    "node": ">=22.0.0"
   }
 }

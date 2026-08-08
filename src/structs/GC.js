@@ -1,11 +1,5 @@
-
-import {
-  AbstractStruct,
-  addStruct,
-  StructStore, Transaction, ID // eslint-disable-line
-} from '../internals.js'
-
-import * as encoding from 'lib0/encoding.js'
+import { AbstractStruct, addStructToIdSet } from './AbstractStruct.js'
+import { createID } from '../utils/ID.js'
 
 export const structGCRefNumber = 0
 
@@ -20,41 +14,62 @@ export class GC extends AbstractStruct {
   delete () {}
 
   /**
-   * @param {GC} right
+   * @param {GC | Skip | Item} right
    * @return {boolean}
    */
   mergeWith (right) {
+    if (this.constructor !== right.constructor) {
+      return false
+    }
     this.length += right.length
     return true
   }
 
   /**
    * @param {Transaction} transaction
-   * @param {number} offset
+   * @param {number} offset - @todo remove offset parameter
    */
   integrate (transaction, offset) {
     if (offset > 0) {
       this.id.clock += offset
       this.length -= offset
     }
-    addStruct(transaction.doc.store, this)
+    transaction.deleteSet.add(this.id.client, this.id.clock, this.length)
+    addStructToIdSet(transaction.insertSet, this)
+    transaction.doc.store.add(this)
   }
 
   /**
-   * @param {encoding.Encoder} encoder
+   * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
    * @param {number} offset
+   * @param {number} offsetEnd
    */
-  write (encoder, offset) {
-    encoding.writeUint8(encoder, structGCRefNumber)
-    encoding.writeVarUint(encoder, this.length - offset)
+  write (encoder, offset, offsetEnd) {
+    encoder.writeInfo(structGCRefNumber)
+    encoder.writeLen(this.length - offset - offsetEnd)
   }
 
   /**
-   * @param {Transaction} transaction
-   * @param {StructStore} store
-   * @return {null | number}
+   * gc structs can't be spliced.
+   *
+   * If this feature is required in the future, then need to try to merge this struct after
+   * transaction.
+   *
+   * @param {number} diff
    */
-  getMissing (transaction, store) {
-    return null
+  splice (diff) {
+    const other = new GC(createID(this.id.client, this.id.clock + diff), this.length - diff)
+    this.length = diff
+    return other
   }
 }
+
+/**
+ * @type {0}
+ */
+GC.prototype.ref = structGCRefNumber
+
+/**
+ * @type {false}
+ */
+GC.prototype.isItem = false

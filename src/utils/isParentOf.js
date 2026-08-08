@@ -1,10 +1,7 @@
-
-import { AbstractType, Item } from '../internals.js' // eslint-disable-line
-
 /**
  * Check if `parent` is a parent of `child`.
  *
- * @param {AbstractType<any>} parent
+ * @param {YType} parent
  * @param {Item|null} child
  * @return {Boolean} Whether `parent` is a parent of `child`.
  *
@@ -16,7 +13,7 @@ export const isParentOf = (parent, child) => {
     if (child.parent === parent) {
       return true
     }
-    child = /** @type {AbstractType<any>} */ (child.parent)._item
+    child = /** @type {YType} */ (child.parent)._item
   }
   return false
 }

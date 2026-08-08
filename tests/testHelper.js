@@ -1,19 +1,22 @@
 import * as Y from '../src/index.js'
+import * as t from 'lib0/testing'
+import * as prng from 'lib0/prng'
+import * as encoding from 'lib0/encoding'
+import * as decoding from 'lib0/decoding'
+import * as syncProtocol from '@y/protocols/sync'
+import * as object from 'lib0/object'
+import * as map from 'lib0/map'
+import * as math from 'lib0/math'
+import * as list from 'lib0/list'
+import * as delta from 'lib0/delta'
+import { createIdSet, createIdMap, encodeIdMap } from '../src/utils/ids.js'
 
-import {
-  createDeleteSetFromStructStore,
-  getStateVector,
-  Item,
-  DeleteItem, DeleteSet, StructStore, Doc // eslint-disable-line
-} from '../src/internals.js'
+export * from '../src/index.js'
 
-import * as t from 'lib0/testing.js'
-import * as prng from 'lib0/prng.js'
-import * as encoding from 'lib0/encoding.js'
-import * as decoding from 'lib0/decoding.js'
-import * as syncProtocol from 'y-protocols/sync.js'
-import * as object from 'lib0/object.js'
-export * from '../src/internals.js'
+if (typeof window !== 'undefined') {
+  // @ts-ignore
+  window.Y = Y // eslint-disable-line
+}
 
 /**
  * @param {TestYInstance} y // publish message created by `y` to all other online clients
@@ -29,7 +32,43 @@ const broadcastMessage = (y, m) => {
   }
 }
 
-export class TestYInstance extends Doc {
+export let useV2 = false
+
+export const encV1 = {
+  encodeStateAsUpdate: Y.encodeStateAsUpdate,
+  mergeUpdates: Y.mergeUpdates,
+  applyUpdate: Y.applyUpdate,
+  logUpdate: Y.logUpdate,
+  updateEventName: /** @type {'update'} */ ('update'),
+  diffUpdate: Y.diffUpdate
+}
+
+export const encV2 = {
+  encodeStateAsUpdate: Y.encodeStateAsUpdateV2,
+  mergeUpdates: Y.mergeUpdatesV2,
+  applyUpdate: Y.applyUpdateV2,
+  logUpdate: Y.logUpdateV2,
+  updateEventName: /** @type {'updateV2'} */ ('updateV2'),
+  diffUpdate: Y.diffUpdateV2
+}
+
+export let enc = encV1
+
+const useV1Encoding = () => {
+  useV2 = false
+  enc = encV1
+}
+
+const useV2Encoding = () => {
+  console.error('sync protocol doesnt support v2 protocol yet, fallback to v1 encoding') // @Todo
+  useV2 = false
+  enc = encV1
+}
+
+/**
+ * @extends {Y.Doc}
+ */
+export class TestYInstance extends Y.Doc {
   /**
    * @param {TestConnector} testConnector
    * @param {number} clientID
@@ -46,13 +85,20 @@ export class TestYInstance extends Doc {
      */
     this.receiving = new Map()
     testConnector.allConns.add(this)
+    /**
+     * The list of received updates.
+     * We are going to merge them later using Y.mergeUpdates and check if the resulting document is correct.
+     * @type {Array<Uint8Array<ArrayBuffer>>}
+     */
+    this.updates = []
     // set up observe on local model
-    this.on('update', /** @param {Uint8Array} update @param {any} origin */ (update, origin) => {
+    this.on(enc.updateEventName, (update, origin) => {
       if (origin !== testConnector) {
         const encoder = encoding.createEncoder()
         syncProtocol.writeUpdate(encoder, update)
         broadcastMessage(this, encoding.toUint8Array(encoder))
       }
+      this.updates.push(update)
     })
     this.connect()
   }
@@ -73,14 +119,14 @@ export class TestYInstance extends Doc {
     if (!this.tc.onlineConns.has(this)) {
       this.tc.onlineConns.add(this)
       const encoder = encoding.createEncoder()
-      syncProtocol.writeSyncStep1(encoder, this)
+      syncProtocol.writeSyncStep1(encoder, /** @type {any} */ (this))
       // publish SyncStep1
       broadcastMessage(this, encoding.toUint8Array(encoder))
       this.tc.onlineConns.forEach(remoteYInstance => {
         if (remoteYInstance !== this) {
           // remote instance sends instance to this instance
           const encoder = encoding.createEncoder()
-          syncProtocol.writeSyncStep1(encoder, remoteYInstance)
+          syncProtocol.writeSyncStep1(encoder, /** @type {any} */ (remoteYInstance))
           this._receive(encoding.toUint8Array(encoder), remoteYInstance)
         }
       })
@@ -95,12 +141,7 @@ export class TestYInstance extends Doc {
    * @param {TestYInstance} remoteClient
    */
   _receive (message, remoteClient) {
-    let messages = this.receiving.get(remoteClient)
-    if (messages === undefined) {
-      messages = []
-      this.receiving.set(remoteClient, messages)
-    }
-    messages.push(message)
+    map.setIfUndefined(this.receiving, remoteClient, () => /** @type {Array<Uint8Array>} */ ([])).push(message)
   }
 }
 
@@ -159,7 +200,7 @@ export class TestConnector {
       const encoder = encoding.createEncoder()
       // console.log('receive (' + sender.userID + '->' + receiver.userID + '):\n', syncProtocol.stringifySyncMessage(decoding.createDecoder(m), receiver))
       // do not publish data created when this function is executed (could be ss2 or update message)
-      syncProtocol.readSyncMessage(decoding.createDecoder(m), encoder, receiver, receiver.tc)
+      syncProtocol.readSyncMessage(decoding.createDecoder(m), encoder, /** @type {any} */ (receiver), receiver.tc)
       if (encoding.length(encoder) > 0) {
         // send reply message
         sender._receive(encoding.toUint8Array(encoder), receiver)
@@ -194,7 +235,7 @@ export class TestConnector {
   }
 
   /**
-   * @return {boolean} Whether it was possible to disconnect a randon connection.
+   * @return {boolean} Whether it was possible to disconnect a random connection.
    */
   disconnectRandom () {
     if (this.onlineConns.size === 0) {
@@ -230,7 +271,7 @@ export class TestConnector {
  * @param {t.TestCase} tc
  * @param {{users?:number}} conf
  * @param {InitTestObjectCallback<T>} [initTestObject]
- * @return {{testObjects:Array<any>,testConnector:TestConnector,users:Array<TestYInstance>,array0:Y.Array<any>,array1:Y.Array<any>,array2:Y.Array<any>,map0:Y.Map<any>,map1:Y.Map<any>,map2:Y.Map<any>,map3:Y.Map<any>,text0:Y.Text,text1:Y.Text,text2:Y.Text,xml0:Y.XmlElement,xml1:Y.XmlElement,xml2:Y.XmlElement}}
+ * @return {{testObjects:Array<any>,testConnector:TestConnector,users:Array<TestYInstance>,array0:Y.Type<any>,array1:Y.Type<any>,array2:Y.Type<any>,map0:Y.Type<any>,map1:Y.Type<any>,map2:Y.Type<any>,map3:Y.Type<any>,text0:Y.Type,text1:Y.Type,text2:Y.Type,xml0:Y.Type,xml1:Y.Type,xml2:Y.Type}}
  */
 export const init = (tc, { users = 5 } = {}, initTestObject) => {
   /**
@@ -240,20 +281,162 @@ export const init = (tc, { users = 5 } = {}, initTestObject) => {
     users: []
   }
   const gen = tc.prng
+  // choose an encoding approach at random
+  if (prng.bool(gen)) {
+    useV2Encoding()
+  } else {
+    useV1Encoding()
+  }
+
   const testConnector = new TestConnector(gen)
   result.testConnector = testConnector
   for (let i = 0; i < users; i++) {
     const y = testConnector.createY(i)
     y.clientID = i
     result.users.push(y)
-    result['array' + i] = y.get('array', Y.Array)
-    result['map' + i] = y.get('map', Y.Map)
-    result['xml' + i] = y.get('xml', Y.XmlElement)
-    result['text' + i] = y.get('text', Y.Text)
+    result['array' + i] = y.get('array')
+    result['map' + i] = y.get('map')
+    result['xml' + i] = y.get('xml')
+    result['text' + i] = y.get('text')
   }
   testConnector.syncAll()
   result.testObjects = result.users.map(initTestObject || (() => null))
+  useV1Encoding()
   return /** @type {any} */ (result)
+}
+
+/**
+ * @param {Y.IdSet} idSet1
+ * @param {Y.IdSet} idSet2
+ */
+export const compareIdSets = (idSet1, idSet2) => {
+  t.assert(idSet1.clients.size === idSet2.clients.size)
+  for (const [client, _items1] of idSet1.clients.entries()) {
+    const items1 = _items1.getIds()
+    const items2 = idSet2.clients.get(client)?.getIds()
+    t.assert(items2 !== undefined && items1.length === items2.length)
+    for (let i = 0; i < items1.length; i++) {
+      const di1 = items1[i]
+      const di2 = /** @type {Array<import('../src/utils/ids.js').IdRange>} */ (items2)[i]
+      t.assert(di1.clock === di2.clock && di1.len === di2.len)
+    }
+  }
+  return true
+}
+
+/**
+ * only use for testing
+ *
+ * @template T
+ * @param {Array<Y.ContentAttribute<T>>} attrs
+ * @param {Y.ContentAttribute<T>} attr
+ *
+ */
+const _idmapAttrsHas = (attrs, attr) => {
+  const hash = attr.hash()
+  return attrs.find(a => a.hash() === hash)
+}
+
+/**
+ * only use for testing
+ *
+ * @template T
+ * @param {Array<Y.ContentAttribute<T>>} a
+ * @param {Array<Y.ContentAttribute<T>>} b
+ */
+export const _idmapAttrsEqual = (a, b) => a.length === b.length && a.every(v => _idmapAttrsHas(b, v))
+
+/**
+ * Ensure that all attributes exist. Also create a copy and compare it to the original.
+ *
+ * @template T
+ * @param {Y.IdMap<T>} idmap
+ */
+export const validateIdMap = idmap => {
+  const copy = Y.createIdMap()
+  idmap.clients.forEach((ranges, client) => {
+    ranges.getIds().forEach(range => {
+      range.attrs.forEach(attr => {
+        t.assert(idmap.attrs.has(attr))
+        t.assert(idmap.attrsH.get(attr.hash()) === attr)
+        copy.add(client, range.clock, range.len, range.attrs.slice())
+      })
+    })
+    t.assert(copy.clients.get(client)?.getIds().length === ranges.getIds().length)
+  })
+  t.assert(idmap.attrsH.size === idmap.attrs.size)
+}
+
+/**
+ * @template T
+ * @param {Y.IdMap<T>} idmap1
+ * @param {Y.IdMap<T>} idmap2
+ */
+export const compareIdmaps = (idmap1, idmap2) => {
+  t.assert(idmap1.clients.size === idmap2.clients.size)
+  for (const [client, _items1] of idmap1.clients.entries()) {
+    const items1 = _items1.getIds()
+    const items2 = idmap2.clients.get(client)?.getIds()
+    t.assert(items2 !== undefined && items1.length === items2.length)
+    for (let i = 0; i < items1.length; i++) {
+      const di1 = items1[i]
+      const di2 = /** @type {Array<import('../src/utils/ids.js').AttrRange<T>>} */ (items2)[i]
+      t.assert(di1.clock === di2.clock && di1.len === di2.len && _idmapAttrsEqual(di1.attrs, di2.attrs))
+    }
+  }
+  validateIdMap(idmap1)
+  validateIdMap(idmap2)
+}
+
+/**
+ * @param {prng.PRNG} gen
+ * @param {number} clients
+ * @param {number} clockRange (max clock - exclusive - by each client)
+ */
+export const createRandomIdSet = (gen, clients, clockRange) => {
+  const maxOpLen = 5
+  const numOfOps = math.ceil((clients * clockRange) / maxOpLen)
+  const idset = createIdSet()
+  for (let i = 0; i < numOfOps; i++) {
+    const client = prng.uint32(gen, 0, clients - 1)
+    const clockStart = prng.uint32(gen, 0, clockRange)
+    const len = prng.uint32(gen, 0, clockRange - clockStart)
+    idset.add(client, clockStart, len)
+  }
+  if (idset.clients.size === clients && clients > 1 && prng.bool(gen)) {
+    idset.clients.delete(prng.uint32(gen, 0, clients))
+  }
+  return idset
+}
+
+/**
+ * @template T
+ * @param {prng.PRNG} gen
+ * @param {number} clients
+ * @param {number} clockRange (max clock - exclusive - by each client)
+ * @param {Array<T>} attrChoices (max clock - exclusive - by each client)
+ * @return {Y.IdMap<T>}
+ */
+export const createRandomIdMap = (gen, clients, clockRange, attrChoices) => {
+  const maxOpLen = 5
+  const numOfOps = math.ceil((clients * clockRange) / maxOpLen)
+  const idMap = createIdMap()
+  for (let i = 0; i < numOfOps; i++) {
+    const client = prng.uint32(gen, 0, clients - 1)
+    const clockStart = prng.uint32(gen, 0, clockRange)
+    const len = prng.uint32(gen, 0, clockRange - clockStart)
+    const attrs = [prng.oneOf(gen, attrChoices)]
+    // maybe add another attr
+    if (prng.bool(gen)) {
+      const a = prng.oneOf(gen, attrChoices)
+      if (attrs.find(attr => attr === a) == null) {
+        attrs.push(a)
+      }
+    }
+    idMap.add(client, clockStart, len, attrs.map(v => Y.createContentAttribute('', v)))
+  }
+  t.info(`Created IdMap with ${numOfOps} ranges and ${attrChoices.length} different attributes. Encoded size: ${encodeIdMap(idMap).byteLength}`)
+  return idMap
 }
 
 /**
@@ -267,48 +450,58 @@ export const init = (tc, { users = 5 } = {}, initTestObject) => {
  */
 export const compare = users => {
   users.forEach(u => u.connect())
-  while (users[0].tc.flushAllMessages()) {}
-  const userArrayValues = users.map(u => u.getArray('array').toJSON())
-  const userMapValues = users.map(u => u.getMap('map').toJSON())
-  const userXmlValues = users.map(u => u.get('xml', Y.XmlElement).toString())
-  const userTextValues = users.map(u => u.getText('text').toDelta())
+  while (users[0].tc.flushAllMessages()) {} // eslint-disable-line
+  // For each document, merge all received document updates with Y.mergeUpdates and create a new document which will be added to the list of "users"
+  // This ensures that mergeUpdates works correctly
+  const mergedDocs = users.map(user => {
+    const ydoc = new Y.Doc()
+    enc.applyUpdate(ydoc, enc.mergeUpdates(user.updates))
+    return ydoc
+  })
+  users.push(.../** @type {any} */(mergedDocs))
+  const userArrayValues = users.map(u => u.get('array').toJSON().children ?? [])
+  const userMapValues = users.map(u => u.get('map').toJSON().attrs ?? {})
+  // @todo fix type error here
+  // @ts-ignore
+  const userXmlValues = users.map(u => u.get('xml').toString())
+  const userTextValues = users.map(u => u.get('text').toDeltaDeep())
   for (const u of users) {
-    t.assert(u.store.pendingDeleteReaders.length === 0)
-    t.assert(u.store.pendingStack.length === 0)
-    t.assert(u.store.pendingClientsStructRefs.size === 0)
+    t.assert(u.store.pendingDs === null)
+    t.assert(u.store.pendingStructs === null)
   }
-  // Test Array iterator
-  t.compare(users[0].getArray('array').toArray(), Array.from(users[0].getArray('array')))
   // Test Map iterator
-  const ymapkeys = Array.from(users[0].getMap('map').keys())
+  const ymapkeys = Array.from(users[0].get('map').attrKeys())
   t.assert(ymapkeys.length === Object.keys(userMapValues[0]).length)
   ymapkeys.forEach(key => t.assert(object.hasProperty(userMapValues[0], key)))
-  /**
-   * @type {Object<string,any>}
-   */
-  const mapRes = {}
-  for (const [k, v] of users[0].getMap('map')) {
-    mapRes[k] = v instanceof Y.AbstractType ? v.toJSON() : v
-  }
-  t.compare(userMapValues[0], mapRes)
   // Compare all users
   for (let i = 0; i < users.length - 1; i++) {
-    t.compare(userArrayValues[i].length, users[i].getArray('array').length)
+    t.compare(userArrayValues[i].length, users[i].get('array').length)
     t.compare(userArrayValues[i], userArrayValues[i + 1])
     t.compare(userMapValues[i], userMapValues[i + 1])
     t.compare(userXmlValues[i], userXmlValues[i + 1])
-    t.compare(userTextValues[i].map(/** @param {any} a */ a => typeof a.insert === 'string' ? a.insert : ' ').join('').length, users[i].getText('text').length)
-    t.compare(userTextValues[i], userTextValues[i + 1])
-    t.compare(getStateVector(users[i].store), getStateVector(users[i + 1].store))
-    compareDS(createDeleteSetFromStructStore(users[i].store), createDeleteSetFromStructStore(users[i + 1].store))
+    t.compare(list.toArray(userTextValues[i].children).map(a => (delta.$textOp.check(a) || delta.$insertOp.check(a)) ? a.insert.length : 0).reduce((a, b) => a + b, 0), users[i].get('text').length)
+    t.compare(userTextValues[i], userTextValues[i + 1], '', (_constructor, a, b) => {
+      if (a instanceof Y.Type) {
+        t.compare(a.toJSON(), b.toJSON())
+      } else if (a !== b) {
+        t.fail('Deltas dont match')
+      }
+      return true
+    })
+    t.compare(Y.encodeStateVector(users[i]), Y.encodeStateVector(users[i + 1]))
+    Y.equalIdSets(Y.createDeleteSetFromStructStore(users[i].store), Y.createDeleteSetFromStructStore(users[i + 1].store))
     compareStructStores(users[i].store, users[i + 1].store)
+    t.compare(Y.encodeSnapshot(Y.snapshot(users[i])), Y.encodeSnapshot(Y.snapshot(users[i + 1])))
   }
+  users.forEach(user => {
+    compareIdSets(user.store.ds, Y.createDeleteSetFromStructStore(user.store))
+  })
   users.map(u => u.destroy())
 }
 
 /**
- * @param {Item?} a
- * @param {Item?} b
+ * @param {Y.Item?} a
+ * @param {Y.Item?} b
  * @return {boolean}
  */
 export const compareItemIDs = (a, b) => a === b || (a !== null && b != null && Y.compareIDs(a.id, b.id))
@@ -335,9 +528,9 @@ export const compareStructStores = (ss1, ss2) => {
       ) {
         t.fail('Structs dont match')
       }
-      if (s1 instanceof Item) {
+      if (s1 instanceof Y.Item) {
         if (
-          !(s2 instanceof Item) ||
+          !(s2 instanceof Y.Item) ||
           !((s1.left === null && s2.left === null) || (s1.left !== null && s2.left !== null && Y.compareIDs(s1.left.lastId, s2.left.lastId))) ||
           !compareItemIDs(s1.right, s2.right) ||
           !Y.compareIDs(s1.origin, s2.origin) ||
@@ -351,25 +544,6 @@ export const compareStructStores = (ss1, ss2) => {
         t.assert(s1.right === null || s1.right.left === s1)
         t.assert(s2.left === null || s2.left.right === s2)
         t.assert(s2.right === null || s2.right.left === s2)
-      }
-    }
-  }
-}
-
-/**
- * @param {DeleteSet} ds1
- * @param {DeleteSet} ds2
- */
-export const compareDS = (ds1, ds2) => {
-  t.assert(ds1.clients.size === ds2.clients.size)
-  for (const [client, deleteItems1] of ds1.clients) {
-    const deleteItems2 = /** @type {Array<DeleteItem>} */ (ds2.clients.get(client))
-    t.assert(deleteItems2 !== undefined && deleteItems1.length === deleteItems2.length)
-    for (let i = 0; i < deleteItems1.length; i++) {
-      const di1 = deleteItems1[i]
-      const di2 = deleteItems2[i]
-      if (di1.clock !== di2.clock || di1.len !== di2.len) {
-        t.fail('DeleteSets dont match')
       }
     }
   }
@@ -394,24 +568,28 @@ export const applyRandomTests = (tc, mods, iterations, initTestObject) => {
   const result = init(tc, { users: 5 }, initTestObject)
   const { testConnector, users } = result
   for (let i = 0; i < iterations; i++) {
-    if (prng.int31(gen, 0, 100) <= 2) {
+    if (prng.int32(gen, 0, 100) <= 2) {
       // 2% chance to disconnect/reconnect a random user
       if (prng.bool(gen)) {
         testConnector.disconnectRandom()
       } else {
         testConnector.reconnectRandom()
       }
-    } else if (prng.int31(gen, 0, 100) <= 1) {
+    } else if (prng.int32(gen, 0, 100) <= 1) {
       // 1% chance to flush all
       testConnector.flushAllMessages()
-    } else if (prng.int31(gen, 0, 100) <= 50) {
+    } else if (prng.int32(gen, 0, 100) <= 50) {
       // 50% chance to flush a random message
       testConnector.flushRandomMessage()
     }
-    const user = prng.int31(gen, 0, users.length - 1)
+    const user = prng.int32(gen, 0, users.length - 1)
     const test = prng.oneOf(gen, mods)
     test(users[user], gen, result.testObjects[user])
   }
   compare(users)
   return result
 }
+
+/**
+ * @typedef {ReturnType<typeof applyRandomTests>} ApplyRandomTestsResult
+ */

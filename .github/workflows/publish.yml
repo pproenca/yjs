@@ -1,0 +1,210 @@
+name: Publish reviewed prerelease
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Exact reviewed 40-character commit SHA
+        required: true
+        type: string
+      version:
+        description: Exact package version
+        required: true
+        type: string
+      publish:
+        description: Publish after verification
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    name: Verify Node ${{ matrix.node-version }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22.22.0, 24.18.1]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: ${{ matrix.node-version }}
+          registry-url: https://registry.npmjs.org
+      - name: Verify immutable input
+        env:
+          EXPECTED_SHA: ${{ inputs.commit_sha }}
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: |
+          test "$GITHUB_SHA" = "$EXPECTED_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(node -p "require('./package.json').version")" = "$EXPECTED_VERSION"
+          test "$(node -p "require('./package.json').name")" = "@pproenca/y"
+          node -e "if (!/^[0-9]+\\.[0-9]+\\.[0-9]+-[0-9A-Za-z][0-9A-Za-z.-]*$/.test(process.env.EXPECTED_VERSION)) process.exit(1)"
+      - run: npm ci --ignore-scripts
+      - run: npm run lint
+      - run: npm run test
+        env:
+          CI: true
+      - run: npm run dist
+      - run: npm run verify:pack
+      - name: Pack verified artifact
+        if: matrix.node-version == '24.18.1'
+        run: |
+          git diff --exit-code
+          git diff --cached --exit-code
+          mkdir -p release
+          npm pack --json --ignore-scripts --pack-destination release > release/pack.json
+      - name: Upload verified artifact
+        if: matrix.node-version == '24.18.1'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-package-${{ github.sha }}
+          path: release
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  publish:
+    needs: verify
+    if: >-
+      inputs.publish &&
+      github.ref == 'refs/heads/main' &&
+      vars.NPM_RELEASE_ENABLED == 'true'
+    environment: npm-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24.18.1
+          registry-url: https://registry.npmjs.org
+      - name: Checkout reviewed source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          path: reviewed-source
+      - name: Download verified artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm-package-${{ github.sha }}
+          path: release
+      - name: Reverify immutable artifact
+        env:
+          EXPECTED_SHA: ${{ inputs.commit_sha }}
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_SHA" = "$EXPECTED_SHA"
+          test "$(node --version)" = "v24.18.1"
+          test "$(npm --version)" = "11.16.0"
+          TARBALL_COUNT=$(find release -maxdepth 1 -type f -name '*.tgz' | wc -l | tr -d ' ')
+          test "$TARBALL_COUNT" = "1"
+          PACKAGE_TARBALL=$(find release -maxdepth 1 -type f -name '*.tgz')
+          mkdir -p release/unpacked
+          tar -tzf "$PACKAGE_TARBALL" > release/tar-files.txt
+          tar -xzf "$PACKAGE_TARBALL" -C release/unpacked
+          cmp reviewed-source/LICENSE release/unpacked/package/LICENSE
+          cmp reviewed-source/README.md release/unpacked/package/README.md
+          cmp reviewed-source/global.d.ts release/unpacked/package/global.d.ts
+          cmp reviewed-source/package.json release/unpacked/package/package.json
+          diff -qr reviewed-source/src release/unpacked/package/src
+          node --input-type=module - \
+            release/pack.json \
+            release/unpacked/package/package.json \
+            release/tar-files.txt \
+            "$PACKAGE_TARBALL" \
+            "$EXPECTED_VERSION" <<'NODE'
+          import { createHash } from 'node:crypto'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          import { basename } from 'node:path'
+
+          const [, , packPath, manifestPath, tarFilesPath, tarballPath, expectedVersion] = process.argv
+          const packed = JSON.parse(readFileSync(packPath, 'utf8'))
+          const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+
+          if (!Array.isArray(packed) || packed.length !== 1) {
+            throw new Error('artifact pack metadata is invalid')
+          }
+
+          const entry = packed[0]
+          const metadataFiles = entry.files.map(file => file.path).sort()
+          const archiveFiles = readFileSync(tarFilesPath, 'utf8')
+            .trim()
+            .split('\n')
+            .map(file => file.replace(/^package\//, ''))
+            .sort()
+          const fixedFiles = new Set([
+            'LICENSE',
+            'README.md',
+            'global.d.ts',
+            'package.json',
+          ])
+          const hasUnexpectedFile = archiveFiles.some(file =>
+            !fixedFiles.has(file) &&
+            !file.startsWith('src/') &&
+            !/^dist\/src\/.+\.d\.ts(?:\.map)?$/.test(file)
+          )
+          const integrity = `sha512-${createHash('sha512')
+            .update(readFileSync(tarballPath))
+            .digest('base64')}`
+
+          if (
+            entry.name !== '@pproenca/y' ||
+            entry.version !== expectedVersion ||
+            entry.filename !== basename(tarballPath) ||
+            entry.integrity !== integrity ||
+            JSON.stringify(metadataFiles) !== JSON.stringify(archiveFiles) ||
+            hasUnexpectedFile ||
+            manifest.name !== entry.name ||
+            manifest.version !== entry.version ||
+            manifest.publishConfig !== undefined ||
+            !/^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z][0-9A-Za-z.-]*$/.test(entry.version)
+          ) {
+            throw new Error('artifact identity or integrity is invalid')
+          }
+
+          appendFileSync(
+            process.env.GITHUB_ENV,
+            `PACKAGE_TARBALL=${tarballPath}\nPACKAGE_INTEGRITY=${integrity}\n`,
+          )
+          NODE
+      - name: Publish exact prerelease
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          REGISTRY_ERROR=$(mktemp)
+          RELEASE_TAG="y001-$GITHUB_SHA"
+
+          if REGISTRY_INTEGRITY=$(npm view "@pproenca/y@$EXPECTED_VERSION" dist.integrity --json --registry=https://registry.npmjs.org 2>"$REGISTRY_ERROR"); then
+            REGISTRY_INTEGRITY="$REGISTRY_INTEGRITY" node -e \
+              "if (JSON.parse(process.env.REGISTRY_INTEGRITY) !== process.env.PACKAGE_INTEGRITY) process.exit(1)"
+            REGISTRY_TAGS=$(npm view '@pproenca/y' dist-tags --json --registry=https://registry.npmjs.org)
+            REGISTRY_TAGS="$REGISTRY_TAGS" RELEASE_TAG="$RELEASE_TAG" node -e \
+              "if (JSON.parse(process.env.REGISTRY_TAGS)[process.env.RELEASE_TAG] !== process.env.EXPECTED_VERSION) process.exit(1)"
+            echo "Exact artifact already published."
+            exit 0
+          fi
+
+          if ! grep -q 'E404' "$REGISTRY_ERROR"; then
+            cat "$REGISTRY_ERROR" >&2
+            exit 1
+          fi
+
+          npm publish "$PACKAGE_TARBALL" \
+            --ignore-scripts \
+            --provenance \
+            --access public \
+            --registry=https://registry.npmjs.org \
+            --tag "$RELEASE_TAG"

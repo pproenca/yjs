@@ -1,37 +1,57 @@
+import * as error from 'lib0/error'
+import * as binary from 'lib0/binary'
+import * as env from 'lib0/environment'
+import * as object from 'lib0/object'
+
+import { AbstractStruct, addStructToIdSet } from '../structs/AbstractStruct.js'
+
+import { ID, createID, compareIDs, findRootTypeKey } from '../utils/ID.js'
+import { GC } from '../structs/GC.js'
 
 import {
-  readID,
-  writeID,
-  GC,
-  getState,
-  AbstractStruct,
   replaceStruct,
-  addStruct,
-  addToDeleteSet,
-  findRootTypeKey,
-  compareIDs,
-  getItem,
   getItemCleanEnd,
-  getItemCleanStart,
-  readContentDeleted,
-  readContentBinary,
-  readContentJSON,
-  readContentAny,
-  readContentString,
-  readContentEmbed,
-  createID,
-  readContentFormat,
-  readContentType,
-  addChangedTypeToTransaction,
-  Doc, ContentType, ContentDeleted, StructStore, ID, AbstractType, Transaction // eslint-disable-line
-} from '../internals.js'
+  addChangedTypeToTransaction
+} from '../utils/transaction-helpers.js'
+import { claimSubdocItem, deleteTransactionSubdoc, integrateSubdocContent, prepareSubdocDeletion } from '../utils/doc-lifecycle.js'
 
-import * as error from 'lib0/error.js'
-import * as encoding from 'lib0/encoding.js'
-import * as decoding from 'lib0/decoding.js'
-import * as maplib from 'lib0/map.js'
-import * as set from 'lib0/set.js'
-import * as binary from 'lib0/binary.js'
+const isDevMode = env.getVariable('node_env') === 'development'
+
+/**
+ * Find the canonical left insertion neighbor for an unlinked item-like struct.
+ *
+ * @template {{id:ID,origin:ID|null,rightOrigin:ID|null,left:T|null,right:T|null}} T
+ * @param {T} item
+ * @param {T|null} scan
+ * @param {{getItem:(id:ID)=>T}} store
+ * @return {T|null}
+ */
+export const findItemInsertionLeft = (item, scan, store) => {
+  let left = item.left
+  const conflictingItems = new Set()
+  const itemsBeforeOrigin = new Set()
+  while (scan !== null && scan !== item.right) {
+    itemsBeforeOrigin.add(scan)
+    conflictingItems.add(scan)
+    if (compareIDs(item.origin, scan.origin)) {
+      if (scan.id.client < item.id.client) {
+        left = scan
+        conflictingItems.clear()
+      } else if (compareIDs(item.rightOrigin, scan.rightOrigin)) {
+        break
+      }
+    } else if (scan.origin !== null && itemsBeforeOrigin.has(store.getItem(scan.origin))) {
+      if (!conflictingItems.has(store.getItem(scan.origin))) {
+        left = scan
+        conflictingItems.clear()
+      }
+    } else {
+      break
+    }
+    scan = scan.right
+  }
+  return left
+}
 
 /**
  * @todo This should return several items
@@ -51,184 +71,13 @@ export const followRedone = (store, id) => {
     if (diff > 0) {
       nextID = createID(nextID.client, nextID.clock + diff)
     }
-    item = getItem(store, nextID)
+    item = store.getItem(nextID)
     diff = nextID.clock - item.id.clock
     nextID = item.redone
-  } while (nextID !== null && item instanceof Item)
+  } while (nextID !== null && item.isItem)
   return {
     item, diff
   }
-}
-
-/**
- * Make sure that neither item nor any of its parents is ever deleted.
- *
- * This property does not persist when storing it into a database or when
- * sending it to other peers
- *
- * @param {Item|null} item
- * @param {boolean} keep
- */
-export const keepItem = (item, keep) => {
-  while (item !== null && item.keep !== keep) {
-    item.keep = keep
-    item = /** @type {AbstractType<any>} */ (item.parent)._item
-  }
-}
-
-/**
- * Split leftItem into two items
- * @param {Transaction} transaction
- * @param {Item} leftItem
- * @param {number} diff
- * @return {Item}
- *
- * @function
- * @private
- */
-export const splitItem = (transaction, leftItem, diff) => {
-  // create rightItem
-  const { client, clock } = leftItem.id
-  const rightItem = new Item(
-    createID(client, clock + diff),
-    leftItem,
-    createID(client, clock + diff - 1),
-    leftItem.right,
-    leftItem.rightOrigin,
-    leftItem.parent,
-    leftItem.parentSub,
-    leftItem.content.splice(diff)
-  )
-  if (leftItem.deleted) {
-    rightItem.markDeleted()
-  }
-  if (leftItem.keep) {
-    rightItem.keep = true
-  }
-  if (leftItem.redone !== null) {
-    rightItem.redone = createID(leftItem.redone.client, leftItem.redone.clock + diff)
-  }
-  // update left (do not set leftItem.rightOrigin as it will lead to problems when syncing)
-  leftItem.right = rightItem
-  // update right
-  if (rightItem.right !== null) {
-    rightItem.right.left = rightItem
-  }
-  // right is more specific.
-  transaction._mergeStructs.push(rightItem)
-  // update parent._map
-  if (rightItem.parentSub !== null && rightItem.right === null) {
-    /** @type {AbstractType<any>} */ (rightItem.parent)._map.set(rightItem.parentSub, rightItem)
-  }
-  leftItem.length = diff
-  return rightItem
-}
-
-/**
- * Redoes the effect of this operation.
- *
- * @param {Transaction} transaction The Yjs instance.
- * @param {Item} item
- * @param {Set<Item>} redoitems
- *
- * @return {Item|null}
- *
- * @private
- */
-export const redoItem = (transaction, item, redoitems) => {
-  const doc = transaction.doc
-  const store = doc.store
-  const ownClientID = doc.clientID
-  const redone = item.redone
-  if (redone !== null) {
-    return getItemCleanStart(transaction, redone)
-  }
-  let parentItem = /** @type {AbstractType<any>} */ (item.parent)._item
-  /**
-   * @type {Item|null}
-   */
-  let left
-  /**
-   * @type {Item|null}
-   */
-  let right
-  if (item.parentSub === null) {
-    // Is an array item. Insert at the old position
-    left = item.left
-    right = item
-  } else {
-    // Is a map item. Insert as current value
-    left = item
-    while (left.right !== null) {
-      left = left.right
-      if (left.id.client !== ownClientID) {
-        // It is not possible to redo this item because it conflicts with a
-        // change from another client
-        return null
-      }
-    }
-    if (left.right !== null) {
-      left = /** @type {Item} */ (/** @type {AbstractType<any>} */ (item.parent)._map.get(item.parentSub))
-    }
-    right = null
-  }
-  // make sure that parent is redone
-  if (parentItem !== null && parentItem.deleted === true && parentItem.redone === null) {
-    // try to undo parent if it will be undone anyway
-    if (!redoitems.has(parentItem) || redoItem(transaction, parentItem, redoitems) === null) {
-      return null
-    }
-  }
-  if (parentItem !== null && parentItem.redone !== null) {
-    while (parentItem.redone !== null) {
-      parentItem = getItemCleanStart(transaction, parentItem.redone)
-    }
-    // find next cloned_redo items
-    while (left !== null) {
-      /**
-       * @type {Item|null}
-       */
-      let leftTrace = left
-      // trace redone until parent matches
-      while (leftTrace !== null && /** @type {AbstractType<any>} */ (leftTrace.parent)._item !== parentItem) {
-        leftTrace = leftTrace.redone === null ? null : getItemCleanStart(transaction, leftTrace.redone)
-      }
-      if (leftTrace !== null && /** @type {AbstractType<any>} */ (leftTrace.parent)._item === parentItem) {
-        left = leftTrace
-        break
-      }
-      left = left.left
-    }
-    while (right !== null) {
-      /**
-       * @type {Item|null}
-       */
-      let rightTrace = right
-      // trace redone until parent matches
-      while (rightTrace !== null && /** @type {AbstractType<any>} */ (rightTrace.parent)._item !== parentItem) {
-        rightTrace = rightTrace.redone === null ? null : getItemCleanStart(transaction, rightTrace.redone)
-      }
-      if (rightTrace !== null && /** @type {AbstractType<any>} */ (rightTrace.parent)._item === parentItem) {
-        right = rightTrace
-        break
-      }
-      right = right.right
-    }
-  }
-  const nextClock = getState(store, ownClientID)
-  const nextId = createID(ownClientID, nextClock)
-  const redoneItem = new Item(
-    nextId,
-    left, left && left.lastId,
-    right, right && right.id,
-    parentItem === null ? item.parent : /** @type {ContentType} */ (parentItem.content).type,
-    item.parentSub,
-    item.content.copy()
-  )
-  item.redone = nextId
-  keepItem(redoneItem, true)
-  redoneItem.integrate(transaction, 0)
-  return redoneItem
 }
 
 /**
@@ -241,7 +90,7 @@ export class Item extends AbstractStruct {
    * @param {ID | null} origin
    * @param {Item | null} right
    * @param {ID | null} rightOrigin
-   * @param {AbstractType<any>|ID|null} parent Is a type if integrated, is null if it is possible to copy parent from left or right, is ID before integration to search for it.
+   * @param {YType|ID|string|null} parent Is a type if integrated, is null if it is possible to copy parent from left or right, is ID before integration to search for it, is string if child of top-level-parent
    * @param {string | null} parentSub
    * @param {AbstractContent} content
    */
@@ -268,7 +117,7 @@ export class Item extends AbstractStruct {
      */
     this.rightOrigin = rightOrigin
     /**
-     * @type {AbstractType<any>|ID|null}
+     * @type {YType|ID|string|null}
      */
     this.parent = parent
     /**
@@ -280,7 +129,7 @@ export class Item extends AbstractStruct {
      */
     this.parentSub = parentSub
     /**
-     * If this type's effect is reundone this type refers to the type that undid
+     * If this type's effect is redone this type refers to the type that undid
      * this operation.
      * @type {ID | null}
      */
@@ -289,7 +138,29 @@ export class Item extends AbstractStruct {
      * @type {AbstractContent}
      */
     this.content = content
+    /**
+     * bit1: keep
+     * bit2: countable
+     * bit3: deleted
+     * bit4: mark - mark node as fast-search-marker
+     * @type {number} byte
+     */
     this.info = this.content.isCountable() ? binary.BIT2 : 0
+  }
+
+  /**
+   * This is used to mark the item as an indexed fast-search marker
+   *
+   * @type {boolean}
+   */
+  set marker (isMarked) {
+    if (((this.info & binary.BIT4) > 0) !== isMarked) {
+      this.info ^= binary.BIT4
+    }
+  }
+
+  get marker () {
+    return (this.info & binary.BIT4) > 0
   }
 
   /**
@@ -328,55 +199,6 @@ export class Item extends AbstractStruct {
   }
 
   /**
-   * Return the creator clientID of the missing op or define missing items and return null.
-   *
-   * @param {Transaction} transaction
-   * @param {StructStore} store
-   * @return {null | number}
-   */
-  getMissing (transaction, store) {
-    if (this.origin && this.origin.client !== this.id.client && this.origin.clock >= getState(store, this.origin.client)) {
-      return this.origin.client
-    }
-    if (this.rightOrigin && this.rightOrigin.client !== this.id.client && this.rightOrigin.clock >= getState(store, this.rightOrigin.client)) {
-      return this.rightOrigin.client
-    }
-    if (this.parent && this.parent.constructor === ID && this.id.client !== this.parent.client && this.parent.clock >= getState(store, this.parent.client)) {
-      return this.parent.client
-    }
-
-    // We have all missing ids, now find the items
-
-    if (this.origin) {
-      this.left = getItemCleanEnd(transaction, store, this.origin)
-      this.origin = this.left.lastId
-    }
-    if (this.rightOrigin) {
-      this.right = getItemCleanStart(transaction, this.rightOrigin)
-      this.rightOrigin = this.right.id
-    }
-    // only set parent if this shouldn't be garbage collected
-    if (!this.parent) {
-      if (this.left && this.left.constructor === Item) {
-        this.parent = this.left.parent
-        this.parentSub = this.left.parentSub
-      }
-      if (this.right && this.right.constructor === Item) {
-        this.parent = this.right.parent
-        this.parentSub = this.right.parentSub
-      }
-    } else if (this.parent.constructor === ID) {
-      const parentItem = getItem(store, this.parent)
-      if (parentItem.constructor === GC) {
-        this.parent = null
-      } else {
-        this.parent = /** @type {ContentType} */ (parentItem.content).type
-      }
-    }
-    return null
-  }
-
-  /**
    * @param {Transaction} transaction
    * @param {number} offset
    */
@@ -390,61 +212,24 @@ export class Item extends AbstractStruct {
     }
 
     if (this.parent) {
+      if (this.content instanceof ContentDoc) this.content.prepare(transaction, this)
       if ((!this.left && (!this.right || this.right.left !== null)) || (this.left && this.left.right !== this.right)) {
-        /**
-         * @type {Item|null}
-         */
-        let left = this.left
-
         /**
          * @type {Item|null}
          */
         let o
         // set o to the first conflicting item
-        if (left !== null) {
-          o = left.right
+        if (this.left !== null) {
+          o = this.left.right
         } else if (this.parentSub !== null) {
-          o = /** @type {AbstractType<any>} */ (this.parent)._map.get(this.parentSub) || null
+          o = /** @type {YType} */ (this.parent)._map.get(this.parentSub) || null
           while (o !== null && o.left !== null) {
             o = o.left
           }
         } else {
-          o = /** @type {AbstractType<any>} */ (this.parent)._start
+          o = /** @type {YType} */ (this.parent)._start
         }
-        // TODO: use something like DeleteSet here (a tree implementation would be best)
-        // @todo use global set definitions
-        /**
-         * @type {Set<Item>}
-         */
-        const conflictingItems = new Set()
-        /**
-         * @type {Set<Item>}
-         */
-        const itemsBeforeOrigin = new Set()
-        // Let c in conflictingItems, b in itemsBeforeOrigin
-        // ***{origin}bbbb{this}{c,b}{c,b}{o}***
-        // Note that conflictingItems is a subset of itemsBeforeOrigin
-        while (o !== null && o !== this.right) {
-          itemsBeforeOrigin.add(o)
-          conflictingItems.add(o)
-          if (compareIDs(this.origin, o.origin)) {
-            // case 1
-            if (o.id.client < this.id.client) {
-              left = o
-              conflictingItems.clear()
-            }
-          } else if (o.origin !== null && itemsBeforeOrigin.has(getItem(transaction.doc.store, o.origin))) {
-            // case 2
-            if (o.origin === null || !conflictingItems.has(getItem(transaction.doc.store, o.origin))) {
-              left = o
-              conflictingItems.clear()
-            }
-          } else {
-            break
-          }
-          o = o.right
-        }
-        this.left = left
+        this.left = findItemInsertionLeft(this, o, transaction.doc.store)
       }
       // reconnect left/right + update parent map/start if necessary
       if (this.left !== null) {
@@ -454,13 +239,13 @@ export class Item extends AbstractStruct {
       } else {
         let r
         if (this.parentSub !== null) {
-          r = /** @type {AbstractType<any>} */ (this.parent)._map.get(this.parentSub) || null
+          r = /** @type {YType} */ (this.parent)._map.get(this.parentSub) || null
           while (r !== null && r.left !== null) {
             r = r.left
           }
         } else {
-          r = /** @type {AbstractType<any>} */ (this.parent)._start
-          ;/** @type {AbstractType<any>} */ (this.parent)._start = this
+          r = /** @type {YType} */ (this.parent)._start
+          ;/** @type {YType} */ (this.parent)._start = this
         }
         this.right = r
       }
@@ -468,21 +253,22 @@ export class Item extends AbstractStruct {
         this.right.left = this
       } else if (this.parentSub !== null) {
         // set as current parent value if right === null and this is parentSub
-        /** @type {AbstractType<any>} */ (this.parent)._map.set(this.parentSub, this)
+        /** @type {YType} */ (this.parent)._map.set(this.parentSub, this)
         if (this.left !== null) {
-          // this is the current attribute value of parent. delete right
+          // this is the current attribute value of parent. delete the previous value
           this.left.delete(transaction)
         }
       }
       // adjust length of parent
       if (this.parentSub === null && this.countable && !this.deleted) {
-        /** @type {AbstractType<any>} */ (this.parent)._length += this.length
+        /** @type {YType} */ (this.parent)._length += this.length
       }
-      addStruct(transaction.doc.store, this)
+      addStructToIdSet(transaction.insertSet, this)
+      transaction.doc.store.add(this)
       this.content.integrate(transaction, this)
       // add parent to transaction.changed
-      addChangedTypeToTransaction(transaction, /** @type {AbstractType<any>} */ (this.parent), this.parentSub)
-      if ((/** @type {AbstractType<any>} */ (this.parent)._item !== null && /** @type {AbstractType<any>} */ (this.parent)._item.deleted) || (this.right !== null && this.parentSub !== null)) {
+      addChangedTypeToTransaction(transaction, /** @type {YType} */ (this.parent), this.parentSub)
+      if ((/** @type {YType} */ (this.parent)._item !== null && /** @type {YType} */ (this.parent)._item.deleted) || (this.parentSub !== null && this.right !== null)) {
         // delete if parent is deleted or if this is not the current attribute value of parent
         this.delete(transaction)
       }
@@ -530,6 +316,7 @@ export class Item extends AbstractStruct {
    */
   mergeWith (right) {
     if (
+      this.constructor === right.constructor &&
       compareIDs(right.origin, this.lastId) &&
       this.right === right &&
       compareIDs(this.rightOrigin, right.rightOrigin) &&
@@ -541,6 +328,19 @@ export class Item extends AbstractStruct {
       this.content.constructor === right.content.constructor &&
       this.content.mergeWith(right.content)
     ) {
+      const searchMarker = /** @type {YType} */ (this.parent)._searchMarker
+      if (searchMarker) {
+        searchMarker.forEach(marker => {
+          if (marker.p === right) {
+            // right is going to be "forgotten" so we need to update the marker
+            marker.p = this
+            // adjust marker index
+            if (!this.deleted && this.countable) {
+              marker.index -= this.length
+            }
+          }
+        })
+      }
       if (right.keep) {
         this.keep = true
       }
@@ -561,32 +361,82 @@ export class Item extends AbstractStruct {
    */
   delete (transaction) {
     if (!this.deleted) {
-      const parent = /** @type {AbstractType<any>} */ (this.parent)
+      if (this.content instanceof ContentDoc) this.content.prepareDelete(transaction)
+      const parent = /** @type {YType} */ (this.parent)
       // adjust the length of parent
       if (this.countable && this.parentSub === null) {
         parent._length -= this.length
       }
       this.markDeleted()
-      addToDeleteSet(transaction.deleteSet, this.id, this.length)
-      maplib.setIfUndefined(transaction.changed, parent, set.create).add(this.parentSub)
+      transaction.deleteSet.add(this.id.client, this.id.clock, this.length)
+      addChangedTypeToTransaction(transaction, parent, this.parentSub)
       this.content.delete(transaction)
     }
   }
 
   /**
-   * @param {StructStore} store
+   * @param {Transaction} tr
    * @param {boolean} parentGCd
    */
-  gc (store, parentGCd) {
+  gc (tr, parentGCd) {
     if (!this.deleted) {
       throw error.unexpectedCase()
     }
-    this.content.gc(store)
+    this.content.gc(tr)
     if (parentGCd) {
-      replaceStruct(store, this, new GC(this.id, this.length))
+      replaceStruct(tr, this, new GC(this.id, this.length))
     } else {
       this.content = new ContentDeleted(this.length)
     }
+  }
+
+  /**
+   * Split this into two items
+   * @param {Transaction?} transaction
+   * @param {number} diff
+   * @return {Item}
+   */
+  split (transaction, diff) {
+    // create rightItem
+    const { client, clock } = this.id
+    const rightItem = new Item(
+      createID(client, clock + diff),
+      this,
+      createID(client, clock + diff - 1),
+      this.right,
+      this.rightOrigin,
+      this.parent,
+      this.parentSub,
+      this.content.splice(diff)
+    )
+    if (this.deleted) {
+      rightItem.markDeleted()
+    }
+    if (this.keep) {
+      rightItem.keep = true
+    }
+    if (this.redone !== null) {
+      rightItem.redone = createID(this.redone.client, this.redone.clock + diff)
+    }
+    if (transaction != null) {
+      // update left (do not set leftItem.rightOrigin as it will lead to problems when syncing)
+      this.right = rightItem
+      // update right
+      if (rightItem.right !== null) {
+        rightItem.right.left = rightItem
+      }
+      // right is more specific.
+      transaction._mergeStructs.push(rightItem)
+      // update parent._map
+      if (rightItem.parentSub !== null && rightItem.right === null) {
+        /** @type {YType} */ (rightItem.parent)._map.set(rightItem.parentSub, rightItem)
+      }
+    } else {
+      rightItem.left = null
+      rightItem.right = null
+    }
+    this.length = diff
+    return rightItem
   }
 
   /**
@@ -595,10 +445,11 @@ export class Item extends AbstractStruct {
    *
    * This is called when this Item is sent to a remote peer.
    *
-   * @param {encoding.Encoder} encoder The encoder to write data to.
+   * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder The encoder to write data to.
    * @param {number} offset
+   * @param {number} offsetEnd
    */
-  write (encoder, offset) {
+  write (encoder, offset, offsetEnd) {
     const origin = offset > 0 ? createID(this.id.client, this.id.clock + offset - 1) : this.origin
     const rightOrigin = this.rightOrigin
     const parentSub = this.parentSub
@@ -606,56 +457,52 @@ export class Item extends AbstractStruct {
       (origin === null ? 0 : binary.BIT8) | // origin is defined
       (rightOrigin === null ? 0 : binary.BIT7) | // right origin is defined
       (parentSub === null ? 0 : binary.BIT6) // parentSub is non-null
-    encoding.writeUint8(encoder, info)
+    encoder.writeInfo(info)
     if (origin !== null) {
-      writeID(encoder, origin)
+      encoder.writeLeftID(origin)
     }
     if (rightOrigin !== null) {
-      writeID(encoder, rightOrigin)
+      encoder.writeRightID(rightOrigin)
     }
     if (origin === null && rightOrigin === null) {
-      const parent = /** @type {AbstractType<any>} */ (this.parent)
-      const parentItem = parent._item
-      if (parentItem === null) {
-        // parent type on y._map
-        // find the correct key
-        const ykey = findRootTypeKey(parent)
-        encoding.writeVarUint(encoder, 1) // write parentYKey
-        encoding.writeVarString(encoder, ykey)
+      const parent = /** @type {YType} */ (this.parent)
+      if (parent._item !== undefined) {
+        const parentItem = parent._item
+        if (parentItem === null) {
+          // parent type on y._map
+          // find the correct key
+          const ykey = findRootTypeKey(parent)
+          encoder.writeParentInfo(true) // write parentYKey
+          encoder.writeString(ykey)
+        } else {
+          encoder.writeParentInfo(false) // write parent id
+          encoder.writeLeftID(parentItem.id)
+        }
+      } else if (parent.constructor === String) { // this edge case was added by differential updates
+        encoder.writeParentInfo(true) // write parentYKey
+        encoder.writeString(parent)
+      } else if (parent.constructor === ID) {
+        encoder.writeParentInfo(false) // write parent id
+        encoder.writeLeftID(parent)
       } else {
-        encoding.writeVarUint(encoder, 0) // write parent id
-        writeID(encoder, parentItem.id)
+        error.unexpectedCase()
       }
       if (parentSub !== null) {
-        encoding.writeVarString(encoder, parentSub)
+        encoder.writeString(parentSub)
       }
     }
-    this.content.write(encoder, offset)
+    this.content.write(encoder, offset, offsetEnd)
+  }
+
+  get ref () {
+    return this.content.getRef()
   }
 }
 
 /**
- * @param {decoding.Decoder} decoder
- * @param {number} info
+ * @type {true}
  */
-const readItemContent = (decoder, info) => contentRefs[info & binary.BITS5](decoder)
-
-/**
- * A lookup map for reading Item content.
- *
- * @type {Array<function(decoding.Decoder):AbstractContent>}
- */
-export const contentRefs = [
-  () => { throw error.unexpectedCase() }, // GC is not ItemContent
-  readContentDeleted,
-  readContentJSON,
-  readContentBinary,
-  readContentString,
-  readContentEmbed,
-  readContentFormat,
-  readContentType,
-  readContentAny
-]
+Item.prototype.isItem = true
 
 /**
  * Do not implement this class!
@@ -696,19 +543,289 @@ export class AbstractContent {
   }
 
   /**
-   * @param {number} offset
+   * @param {number} _offset
    * @return {AbstractContent}
    */
-  splice (offset) {
+  splice (_offset) {
     throw error.methodUnimplemented()
   }
 
   /**
-   * @param {AbstractContent} right
+   * @param {AbstractContent} _right
+   * @return {boolean}
+   */
+  mergeWith (_right) {
+    throw error.methodUnimplemented()
+  }
+
+  /**
+   * @param {Transaction} _transaction
+   * @param {Item} _item
+   */
+  integrate (_transaction, _item) {
+    throw error.methodUnimplemented()
+  }
+
+  /**
+   * @param {Transaction} _transaction
+   */
+  delete (_transaction) {
+    throw error.methodUnimplemented()
+  }
+
+  /**
+   * @param {Transaction} _transaction
+   */
+  gc (_transaction) {
+    throw error.methodUnimplemented()
+  }
+
+  /**
+   * @param {UpdateEncoderV1 | UpdateEncoderV2} _encoder
+   * @param {number} _offset
+   * @param {number} _offsetEnd
+   */
+  write (_encoder, _offset, _offsetEnd) {
+    throw error.methodUnimplemented()
+  }
+
+  /**
+   * @return {1|2|3|4|5|6|7|8|9}
+   */
+  getRef () {
+    throw error.methodUnimplemented()
+  }
+}
+
+export class ContentAny {
+  /**
+   * @param {Array<any>} arr
+   */
+  constructor (arr) {
+    /**
+     * @type {Array<any>}
+     */
+    this.arr = arr
+    isDevMode && object.deepFreeze(arr)
+  }
+
+  /**
+   * @return {number}
+   */
+  getLength () {
+    return this.arr.length
+  }
+
+  /**
+   * @return {Array<any>}
+   */
+  getContent () {
+    return this.arr
+  }
+
+  /**
+   * @return {boolean}
+   */
+  isCountable () {
+    return true
+  }
+
+  /**
+   * @return {ContentAny}
+   */
+  copy () {
+    return new ContentAny(this.arr)
+  }
+
+  /**
+   * @param {number} offset
+   * @return {ContentAny}
+   */
+  splice (offset) {
+    const right = new ContentAny(this.arr.slice(offset))
+    this.arr = this.arr.slice(0, offset)
+    return right
+  }
+
+  /**
+   * @param {ContentAny} right
    * @return {boolean}
    */
   mergeWith (right) {
+    this.arr = this.arr.concat(right.arr)
+    return true
+  }
+
+  /**
+   * @param {Transaction} _transaction
+   * @param {Item} _item
+   */
+  integrate (_transaction, _item) {}
+  /**
+   * @param {Transaction} _transaction
+   */
+  delete (_transaction) {}
+  /**
+   * @param {Transaction} _tr
+   */
+  gc (_tr) {}
+  /**
+   * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
+   * @param {number} offset
+   * @param {number} offsetEnd
+   */
+  write (encoder, offset, offsetEnd) {
+    const end = this.arr.length - offsetEnd
+    encoder.writeLen(end - offset)
+    for (let i = offset; i < end; i++) {
+      const c = this.arr[i]
+      encoder.writeAny(c)
+    }
+  }
+
+  /**
+   * @return {8}
+   */
+  getRef () {
+    return 8
+  }
+}
+
+export class ContentBinary {
+  /**
+   * @param {Uint8Array} content
+   */
+  constructor (content) {
+    this.content = content
+  }
+
+  /**
+   * @return {number}
+   */
+  getLength () {
+    return 1
+  }
+
+  /**
+   * @return {Array<any>}
+   */
+  getContent () {
+    return [this.content]
+  }
+
+  /**
+   * @return {boolean}
+   */
+  isCountable () {
+    return true
+  }
+
+  /**
+   * @return {ContentBinary}
+   */
+  copy () {
+    return new ContentBinary(this.content)
+  }
+
+  /**
+   * @param {number} _offset
+   * @return {ContentBinary}
+   */
+  splice (_offset) {
     throw error.methodUnimplemented()
+  }
+
+  /**
+   * @param {ContentBinary} _right
+   * @return {boolean}
+   */
+  mergeWith (_right) {
+    return false
+  }
+
+  /**
+   * @param {Transaction} _transaction
+   * @param {Item} _item
+   */
+  integrate (_transaction, _item) {}
+  /**
+   * @param {Transaction} _transaction
+   */
+  delete (_transaction) {}
+  /**
+   * @param {Transaction} _tr
+   */
+  gc (_tr) {}
+  /**
+   * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
+   * @param {number} _offset
+   * @param {number} _offsetEnd
+   */
+  write (encoder, _offset, _offsetEnd) {
+    encoder.writeBuf(this.content)
+  }
+
+  /**
+   * @return {3}
+   */
+  getRef () {
+    return 3
+  }
+}
+
+export class ContentDeleted {
+  /**
+   * @param {number} len
+   */
+  constructor (len) {
+    this.len = len
+  }
+
+  /**
+   * @return {number}
+   */
+  getLength () {
+    return this.len
+  }
+
+  /**
+   * @return {Array<any>}
+   */
+  getContent () {
+    return []
+  }
+
+  /**
+   * @return {boolean}
+   */
+  isCountable () {
+    return false
+  }
+
+  /**
+   * @return {ContentDeleted}
+   */
+  copy () {
+    return new ContentDeleted(this.len)
+  }
+
+  /**
+   * @param {number} offset
+   * @return {ContentDeleted}
+   */
+  splice (offset) {
+    const right = new ContentDeleted(this.len - offset)
+    this.len = offset
+    return right
+  }
+
+  /**
+   * @param {ContentDeleted} right
+   * @return {boolean}
+   */
+  mergeWith (right) {
+    this.len += right.len
+    return true
   }
 
   /**
@@ -716,70 +833,688 @@ export class AbstractContent {
    * @param {Item} item
    */
   integrate (transaction, item) {
+    transaction.deleteSet.add(item.id.client, item.id.clock, this.len)
+    item.markDeleted()
+  }
+
+  /**
+   * @param {Transaction} _transaction
+   */
+  delete (_transaction) {}
+  /**
+   * @param {Transaction} _tr
+   */
+  gc (_tr) {}
+  /**
+   * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
+   * @param {number} offset
+   * @param {number} offsetEnd
+   */
+  write (encoder, offset, offsetEnd) {
+    encoder.writeLen(this.len - offset - offsetEnd)
+  }
+
+  /**
+   * @return {1}
+   */
+  getRef () {
+    return 1
+  }
+}
+
+/**
+ * @private
+ */
+export class ContentDoc {
+  /**
+   * @param {string} guid
+   * @param {Object<string,any>} opts
+   */
+  constructor (guid, opts) {
+    /**
+     * @type {Doc?}
+     */
+    this.doc = null
+    this.guid = guid
+    this.opts = opts
+  }
+
+  /**
+   * @return {number}
+   */
+  getLength () {
+    return 1
+  }
+
+  /**
+   * @return {Array<any>}
+   */
+  getContent () {
+    return [this.doc]
+  }
+
+  /**
+   * @return {boolean}
+   */
+  isCountable () {
+    return true
+  }
+
+  /**
+   * @return {ContentDoc}
+   */
+  copy () {
+    return new ContentDoc(this.guid, this.opts)
+  }
+
+  /**
+   * @param {number} _offset
+   * @return {ContentDoc}
+   */
+  splice (_offset) {
     throw error.methodUnimplemented()
+  }
+
+  /**
+   * @param {ContentDoc} _right
+   * @return {boolean}
+   */
+  mergeWith (_right) {
+    return false
+  }
+
+  /**
+   * @param {Transaction} transaction
+   * @param {Item} item
+   */
+  prepare (transaction, item) {
+    const opts = this.opts
+    if (this.doc == null) {
+      this.doc = /** @type {Doc} */ (new /** @type {any} */ (transaction.doc.constructor)({ guid: this.guid, ...opts, shouldLoad: opts.shouldLoad || opts.autoLoad || false }))
+    }
+    claimSubdocItem(transaction, item, this)
+  }
+
+  /**
+   * @param {Transaction} transaction
+   * @param {Item} item
+   */
+  integrate (transaction, item) {
+    integrateSubdocContent(transaction, item, this)
+  }
+
+  /** @param {Transaction} transaction */
+  prepareDelete (transaction) {
+    prepareSubdocDeletion(transaction)
   }
 
   /**
    * @param {Transaction} transaction
    */
   delete (transaction) {
-    throw error.methodUnimplemented()
+    if (this.doc) {
+      deleteTransactionSubdoc(transaction, this.doc)
+    }
   }
 
   /**
-   * @param {StructStore} store
+   * @param {Transaction} _tr
    */
-  gc (store) {
-    throw error.methodUnimplemented()
+  gc (_tr) {}
+
+  /**
+   * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
+   * @param {number} _offset
+   * @param {number} _offsetEnd
+   */
+  write (encoder, _offset, _offsetEnd) {
+    encoder.writeString(this.guid)
+    encoder.writeAny(this.opts)
   }
 
   /**
-   * @param {encoding.Encoder} encoder
-   * @param {number} offset
+   * @return {9}
    */
-  write (encoder, offset) {
-    throw error.methodUnimplemented()
+  getRef () {
+    return 9
+  }
+}
+
+/**
+ * @param {Doc} ydoc
+ */
+export const createContentDocFromDoc = ydoc => {
+  /**
+   * @type {any}
+   */
+  const opts = {}
+  if (!ydoc.gc) {
+    opts.gc = false
+  }
+  if (ydoc.sparseExactResolution) {
+    opts.sparseExactResolution = true
+  }
+  if (ydoc.autoLoad) {
+    opts.autoLoad = true
+  }
+  if (ydoc.meta !== null) {
+    opts.meta = ydoc.meta
+  }
+  const c = new ContentDoc(ydoc.guid, opts)
+  c.doc = ydoc
+  return c
+}
+
+/**
+ * @private
+ */
+export class ContentEmbed {
+  /**
+   * @param {Object} embed
+   */
+  constructor (embed) {
+    this.embed = embed
   }
 
   /**
    * @return {number}
    */
-  getRef () {
+  getLength () {
+    return 1
+  }
+
+  /**
+   * @return {Array<any>}
+   */
+  getContent () {
+    return [this.embed]
+  }
+
+  /**
+   * @return {boolean}
+   */
+  isCountable () {
+    return true
+  }
+
+  /**
+   * @return {ContentEmbed}
+   */
+  copy () {
+    return new ContentEmbed(this.embed)
+  }
+
+  /**
+   * @param {number} _offset
+   * @return {ContentEmbed}
+   */
+  splice (_offset) {
     throw error.methodUnimplemented()
+  }
+
+  /**
+   * @param {ContentEmbed} _right
+   * @return {boolean}
+   */
+  mergeWith (_right) {
+    return false
+  }
+
+  /**
+   * @param {Transaction} _transaction
+   * @param {Item} _item
+   */
+  integrate (_transaction, _item) {}
+  /**
+   * @param {Transaction} _transaction
+   */
+  delete (_transaction) {}
+  /**
+   * @param {Transaction} _tr
+   */
+  gc (_tr) {}
+  /**
+   * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
+   * @param {number} _offset
+   * @param {number} _offsetEnd
+   */
+  write (encoder, _offset, _offsetEnd) {
+    encoder.writeJSON(this.embed)
+  }
+
+  /**
+   * @return {5}
+   */
+  getRef () {
+    return 5
   }
 }
 
 /**
- * @param {decoding.Decoder} decoder
- * @param {ID} id
- * @param {number} info
- * @param {Doc} doc
+ * @private
  */
-export const readItem = (decoder, id, info, doc) => {
+export class ContentFormat {
   /**
-   * The item that was originally to the left of this item.
-   * @type {ID | null}
+   * @param {string} key
+   * @param {Object} value
    */
-  const origin = (info & binary.BIT8) === binary.BIT8 ? readID(decoder) : null
-  /**
-   * The item that was originally to the right of this item.
-   * @type {ID | null}
-   */
-  const rightOrigin = (info & binary.BIT7) === binary.BIT7 ? readID(decoder) : null
-  const canCopyParentInfo = (info & (binary.BIT7 | binary.BIT8)) === 0
-  const hasParentYKey = canCopyParentInfo ? decoding.readVarUint(decoder) === 1 : false
-  /**
-   * If parent = null and neither left nor right are defined, then we know that `parent` is child of `y`
-   * and we read the next string as parentYKey.
-   * It indicates how we store/retrieve parent from `y.share`
-   * @type {string|null}
-   */
-  const parentYKey = canCopyParentInfo && hasParentYKey ? decoding.readVarString(decoder) : null
+  constructor (key, value) {
+    this.key = key
+    this.value = value
+  }
 
-  return new Item(
-    id, null, origin, null, rightOrigin,
-    canCopyParentInfo && !hasParentYKey ? readID(decoder) : (parentYKey ? doc.get(parentYKey) : null), // parent
-    canCopyParentInfo && (info & binary.BIT6) === binary.BIT6 ? decoding.readVarString(decoder) : null, // parentSub
-    /** @type {AbstractContent} */ (readItemContent(decoder, info)) // item content
-  )
+  /**
+   * @return {number}
+   */
+  getLength () {
+    return 1
+  }
+
+  /**
+   * @return {Array<any>}
+   */
+  getContent () {
+    return []
+  }
+
+  /**
+   * @return {boolean}
+   */
+  isCountable () {
+    return false
+  }
+
+  /**
+   * @return {ContentFormat}
+   */
+  copy () {
+    return new ContentFormat(this.key, this.value)
+  }
+
+  /**
+   * @param {number} _offset
+   * @return {ContentFormat}
+   */
+  splice (_offset) {
+    throw error.methodUnimplemented()
+  }
+
+  /**
+   * @param {ContentFormat} _right
+   * @return {boolean}
+   */
+  mergeWith (_right) {
+    return false
+  }
+
+  /**
+   * @param {Transaction} _transaction
+   * @param {Item} item
+   */
+  integrate (_transaction, item) {
+    // @todo searchmarker are currently unsupported for rich text documents
+    const p = /** @type {import('../ytype.js').YType<any>} */ (item.parent)
+    p._searchMarker = null
+    p._hasFormatting = true
+  }
+
+  /**
+   * @param {Transaction} _transaction
+   */
+  delete (_transaction) {}
+  /**
+   * @param {Transaction} _tr
+   */
+  gc (_tr) {}
+  /**
+   * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
+   * @param {number} _offset
+   * @param {number} _offsetEnd
+   */
+  write (encoder, _offset, _offsetEnd) {
+    encoder.writeKey(this.key)
+    encoder.writeJSON(this.value)
+  }
+
+  /**
+   * @return {6}
+   */
+  getRef () {
+    return 6
+  }
+}
+
+/**
+ * @private
+ */
+export class ContentJSON {
+  /**
+   * @param {Array<any>} arr
+   */
+  constructor (arr) {
+    /**
+     * @type {Array<any>}
+     */
+    this.arr = arr
+  }
+
+  /**
+   * @return {number}
+   */
+  getLength () {
+    return this.arr.length
+  }
+
+  /**
+   * @return {Array<any>}
+   */
+  getContent () {
+    return this.arr
+  }
+
+  /**
+   * @return {boolean}
+   */
+  isCountable () {
+    return true
+  }
+
+  /**
+   * @return {ContentJSON}
+   */
+  copy () {
+    return new ContentJSON(this.arr)
+  }
+
+  /**
+   * @param {number} offset
+   * @return {ContentJSON}
+   */
+  splice (offset) {
+    const right = new ContentJSON(this.arr.slice(offset))
+    this.arr = this.arr.slice(0, offset)
+    return right
+  }
+
+  /**
+   * @param {ContentJSON} right
+   * @return {boolean}
+   */
+  mergeWith (right) {
+    this.arr = this.arr.concat(right.arr)
+    return true
+  }
+
+  /**
+   * @param {Transaction} _transaction
+   * @param {Item} _item
+   */
+  integrate (_transaction, _item) {}
+  /**
+   * @param {Transaction} _transaction
+   */
+  delete (_transaction) {}
+  /**
+   * @param {Transaction} _tr
+   */
+  gc (_tr) {}
+  /**
+   * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
+   * @param {number} offset
+   * @param {number} offsetEnd
+   */
+  write (encoder, offset, offsetEnd) {
+    const end = this.arr.length - offsetEnd
+    encoder.writeLen(end - offset)
+    for (let i = offset; i < end; i++) {
+      const c = this.arr[i]
+      encoder.writeString(c === undefined ? 'undefined' : JSON.stringify(c))
+    }
+  }
+
+  /**
+   * @return {2}
+   */
+  getRef () {
+    return 2
+  }
+}
+
+/**
+ * @private
+ */
+export class ContentString {
+  /**
+   * @param {string} str
+   */
+  constructor (str) {
+    /**
+     * @type {string}
+     */
+    this.str = str
+  }
+
+  /**
+   * @return {number}
+   */
+  getLength () {
+    return this.str.length
+  }
+
+  /**
+   * @return {Array<any>}
+   */
+  getContent () {
+    return this.str.split('')
+  }
+
+  /**
+   * @return {boolean}
+   */
+  isCountable () {
+    return true
+  }
+
+  /**
+   * @return {ContentString}
+   */
+  copy () {
+    return new ContentString(this.str)
+  }
+
+  /**
+   * @param {number} offset
+   * @return {ContentString}
+   */
+  splice (offset) {
+    const right = new ContentString(this.str.slice(offset))
+    this.str = this.str.slice(0, offset)
+
+    // Prevent encoding invalid documents because of splitting of surrogate pairs: https://github.com/yjs/yjs/issues/248
+    const firstCharCode = this.str.charCodeAt(offset - 1)
+    if (firstCharCode >= 0xD800 && firstCharCode <= 0xDBFF) {
+      // Last character of the left split is the start of a surrogate utf16/ucs2 pair.
+      // We don't support splitting of surrogate pairs because this may lead to invalid documents.
+      // Replace the invalid character with a unicode replacement character (� / U+FFFD)
+      this.str = this.str.slice(0, offset - 1) + '�'
+      // replace right as well
+      right.str = '�' + right.str.slice(1)
+    }
+    return right
+  }
+
+  /**
+   * @param {ContentString} right
+   * @return {boolean}
+   */
+  mergeWith (right) {
+    this.str += right.str
+    return true
+  }
+
+  /**
+   * @param {Transaction} _transaction
+   * @param {Item} _item
+   */
+  integrate (_transaction, _item) {}
+  /**
+   * @param {Transaction} _transaction
+   */
+  delete (_transaction) {}
+  /**
+   * @param {Transaction} _tr
+   */
+  gc (_tr) {}
+  /**
+   * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
+   * @param {number} offset
+   * @param {number} offsetEnd
+   */
+  write (encoder, offset, offsetEnd) {
+    encoder.writeString((offset === 0 && offsetEnd === 0) ? this.str : this.str.slice(offset, this.str.length - offsetEnd))
+  }
+
+  /**
+   * @return {4}
+   */
+  getRef () {
+    return 4
+  }
+}
+
+export const YArrayRefID = 0
+export const YMapRefID = 1
+export const YTextRefID = 2
+export const YXmlElementRefID = 3
+export const YXmlFragmentRefID = 4
+export const YXmlHookRefID = 5
+export const YXmlTextRefID = 6
+
+/**
+ * @private
+ */
+export class ContentType {
+  /**
+   * @param {import('../ytype.js').YType} type
+   */
+  constructor (type) {
+    /**
+     * @type {import('../ytype.js').YType}
+     */
+    this.type = type
+  }
+
+  /**
+   * @return {number}
+   */
+  getLength () {
+    return 1
+  }
+
+  /**
+   * @return {Array<any>}
+   */
+  getContent () {
+    return [this.type]
+  }
+
+  /**
+   * @return {boolean}
+   */
+  isCountable () {
+    return true
+  }
+
+  /**
+   * @return {ContentType}
+   */
+  copy () {
+    return new ContentType(this.type._copy())
+  }
+
+  /**
+   * @param {number} _offset
+   * @return {ContentType}
+   */
+  splice (_offset) {
+    throw error.methodUnimplemented()
+  }
+
+  /**
+   * @param {ContentType} _right
+   * @return {boolean}
+   */
+  mergeWith (_right) {
+    return false
+  }
+
+  /**
+   * @param {Transaction} transaction
+   * @param {Item} item
+   */
+  integrate (transaction, item) {
+    this.type._integrate(transaction.doc, item)
+  }
+
+  /**
+   * @param {Transaction} transaction
+   */
+  delete (transaction) {
+    let item = this.type._start
+    while (item !== null) {
+      if (!item.deleted) {
+        item.delete(transaction)
+      } else if (!transaction.insertSet.hasId(item.id)) {
+        // This will be gc'd later and we want to merge it if possible
+        // We try to merge all deleted items after each transaction,
+        // but we have no knowledge about that this needs to be merged
+        // since it is not in transaction.ds. Hence we add it to transaction._mergeStructs
+        transaction._mergeStructs.push(item)
+      }
+      item = item.right
+    }
+    this.type._map.forEach(item => {
+      if (!item.deleted) {
+        item.delete(transaction)
+      } else if (!transaction.insertSet.hasId(item.id)) {
+        // same as above
+        transaction._mergeStructs.push(item)
+      }
+    })
+  }
+
+  /**
+   * @param {Transaction} tr
+   */
+  gc (tr) {
+    let item = this.type._start
+    while (item !== null) {
+      item.gc(tr, true)
+      item = item.right
+    }
+    this.type._start = null
+    this.type._map.forEach(/** @param {Item | null} item */ (item) => {
+      while (item !== null) {
+        item.gc(tr, true)
+        item = item.left
+      }
+    })
+    this.type._map = new Map()
+  }
+
+  /**
+   * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
+   * @param {number} _offset
+   * @param {number} _offsetEnd
+   */
+  write (encoder, _offset, _offsetEnd) {
+    this.type._write(encoder)
+  }
+
+  /**
+   * @return {7}
+   */
+  getRef () {
+    return 7
+  }
 }

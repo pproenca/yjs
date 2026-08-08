@@ -1,20 +1,10 @@
+import * as encoding from 'lib0/encoding'
+import * as decoding from 'lib0/decoding'
+import * as error from 'lib0/error'
 
-import {
-  writeID,
-  readID,
-  compareIDs,
-  getState,
-  findRootTypeKey,
-  Item,
-  createID,
-  ContentType,
-  followRedone,
-  ID, Doc, AbstractType // eslint-disable-line
-} from '../internals.js'
-
-import * as encoding from 'lib0/encoding.js'
-import * as decoding from 'lib0/decoding.js'
-import * as error from 'lib0/error.js'
+import { Item, followRedone, ContentType } from '../structs/Item.js'
+import { writeID, readID, compareIDs, findRootTypeKey, createID } from './ID.js'
+import { rendererContentLength } from './renderer-helpers.js'
 
 /**
  * A relative position is based on the Yjs model and is not affected by document changes.
@@ -45,8 +35,9 @@ export class RelativePosition {
    * @param {ID|null} type
    * @param {string|null} tname
    * @param {ID|null} item
+   * @param {number} assoc
    */
-  constructor (type, tname, item) {
+  constructor (type, tname, item, assoc = 0) {
     /**
      * @type {ID|null}
      */
@@ -59,7 +50,40 @@ export class RelativePosition {
      * @type {ID | null}
      */
     this.item = item
+    /**
+     * A relative position is associated to a specific character. By default
+     * assoc >= 0, the relative position is associated to the character
+     * after the meant position.
+     * I.e. position 1 in 'ab' is associated to character 'b'.
+     *
+     * If assoc < 0, then the relative position is associated to the character
+     * before the meant position.
+     *
+     * @type {number}
+     */
+    this.assoc = assoc
   }
+}
+
+/**
+ * @param {RelativePosition} rpos
+ * @return {any}
+ */
+export const relativePositionToJSON = rpos => {
+  const json = {}
+  if (rpos.type) {
+    json.type = rpos.type
+  }
+  if (rpos.tname) {
+    json.tname = rpos.tname
+  }
+  if (rpos.item) {
+    json.item = rpos.item
+  }
+  if (rpos.assoc != null) {
+    json.assoc = rpos.assoc
+  }
+  return json
 }
 
 /**
@@ -68,40 +92,44 @@ export class RelativePosition {
  *
  * @function
  */
-export const createRelativePositionFromJSON = json => new RelativePosition(json.type == null ? null : createID(json.type.client, json.type.clock), json.tname || null, json.item == null ? null : createID(json.item.client, json.item.clock))
+export const createRelativePositionFromJSON = json => new RelativePosition(json.type == null ? null : createID(json.type.client, json.type.clock), json.tname ?? null, json.item == null ? null : createID(json.item.client, json.item.clock), json.assoc == null ? 0 : json.assoc)
 
 export class AbsolutePosition {
   /**
-   * @param {AbstractType<any>} type
+   * @param {YType<any>} type
    * @param {number} index
+   * @param {number} [assoc]
    */
-  constructor (type, index) {
+  constructor (type, index, assoc = 0) {
     /**
-     * @type {AbstractType<any>}
+     * @type {YType<any>}
      */
     this.type = type
     /**
      * @type {number}
      */
     this.index = index
+    this.assoc = assoc
   }
 }
 
 /**
- * @param {AbstractType<any>} type
+ * @param {YType<any>} type
  * @param {number} index
+ * @param {number} [assoc]
  *
  * @function
  */
-export const createAbsolutePosition = (type, index) => new AbsolutePosition(type, index)
+export const createAbsolutePosition = (type, index, assoc = 0) => new AbsolutePosition(type, index, assoc)
 
 /**
- * @param {AbstractType<any>} type
+ * @param {YType<any>} type
  * @param {ID|null} item
+ * @param {number} [assoc]
  *
  * @function
  */
-export const createRelativePosition = (type, item) => {
+export const createRelativePosition = (type, item, assoc) => {
   let typeid = null
   let tname = null
   if (type._item === null) {
@@ -109,31 +137,43 @@ export const createRelativePosition = (type, item) => {
   } else {
     typeid = createID(type._item.id.client, type._item.id.clock)
   }
-  return new RelativePosition(typeid, tname, item)
+  return new RelativePosition(typeid, tname, item, assoc)
 }
 
 /**
  * Create a relativePosition based on a absolute position.
  *
- * @param {AbstractType<any>} type The base type (e.g. YText or YArray).
+ * @param {YType} type The base type (e.g. YText or YArray).
  * @param {number} index The absolute position.
+ * @param {number} [assoc]
+ * @param {import('../utils/Renderer.js').AbstractRenderer?} renderer
  * @return {RelativePosition}
  *
  * @function
  */
-export const createRelativePositionFromTypeIndex = (type, index) => {
+export const createRelativePositionFromTypeIndex = (type, index, assoc = 0, renderer = null) => {
   let t = type._start
+  if (assoc < 0) {
+    // associated to the left character or the beginning of a type, increment index if possible.
+    if (index === 0) {
+      return createRelativePosition(type, null, assoc)
+    }
+    index--
+  }
   while (t !== null) {
-    if (!t.deleted && t.countable) {
-      if (t.length > index) {
-        // case 1: found position somewhere in the linked list
-        return createRelativePosition(type, createID(t.id.client, t.id.clock + index))
-      }
-      index -= t.length
+    const len = rendererContentLength(renderer, t)
+    if (len > index) {
+      // case 1: found position somewhere in the linked list
+      return createRelativePosition(type, createID(t.id.client, t.id.clock + index), assoc)
+    }
+    index -= len
+    if (t.right === null && assoc < 0) {
+      // left-associated position, return last available id
+      return createRelativePosition(type, t.lastId, assoc)
     }
     t = t.right
   }
-  return createRelativePosition(type, null)
+  return createRelativePosition(type, null, assoc)
 }
 
 /**
@@ -143,7 +183,7 @@ export const createRelativePositionFromTypeIndex = (type, index) => {
  * @function
  */
 export const writeRelativePosition = (encoder, rpos) => {
-  const { type, tname, item } = rpos
+  const { type, tname, item, assoc } = rpos
   if (item !== null) {
     encoding.writeVarUint(encoder, 0)
     writeID(encoder, item)
@@ -158,6 +198,7 @@ export const writeRelativePosition = (encoder, rpos) => {
   } else {
     throw error.unexpectedCase()
   }
+  encoding.writeVarInt(encoder, assoc)
   return encoder
 }
 
@@ -173,7 +214,7 @@ export const encodeRelativePosition = rpos => {
 
 /**
  * @param {decoding.Decoder} decoder
- * @return {RelativePosition|null}
+ * @return {RelativePosition}
  *
  * @function
  */
@@ -195,46 +236,70 @@ export const readRelativePosition = decoder => {
       type = readID(decoder)
     }
   }
-  return new RelativePosition(type, tname, itemID)
+  const assoc = decoding.hasContent(decoder) ? decoding.readVarInt(decoder) : 0
+  return new RelativePosition(type, tname, itemID, assoc)
 }
 
 /**
  * @param {Uint8Array} uint8Array
- * @return {RelativePosition|null}
+ * @return {RelativePosition}
  */
 export const decodeRelativePosition = uint8Array => readRelativePosition(decoding.createDecoder(uint8Array))
 
 /**
+ * @param {StructStore} store
+ * @param {ID} id
+ */
+const getItemWithOffset = (store, id) => {
+  const item = store.getItem(id)
+  const diff = id.clock - item.id.clock
+  return {
+    item, diff
+  }
+}
+
+/**
+ * Transform a relative position to an absolute position.
+ *
+ * If you want to share the relative position with other users, you should set
+ * `followUndoneDeletions` to false to get consistent results across all clients.
+ *
+ * When calculating the absolute position, we try to follow the "undone deletions". This yields
+ * better results for the user who performed undo. However, only the user who performed the undo
+ * will get the better results, the other users don't know which operations recreated a deleted
+ * range of content. There is more information in this ticket: https://github.com/yjs/yjs/issues/638
+ *
  * @param {RelativePosition} rpos
  * @param {Doc} doc
+ * @param {boolean} followUndoneDeletions - whether to follow undone deletions - see https://github.com/yjs/yjs/issues/638
+ * @param {import('../utils/Renderer.js').AbstractRenderer?} renderer
  * @return {AbsolutePosition|null}
  *
  * @function
  */
-export const createAbsolutePositionFromRelativePosition = (rpos, doc) => {
+export const createAbsolutePositionFromRelativePosition = (rpos, doc, followUndoneDeletions = true, renderer = null) => {
   const store = doc.store
   const rightID = rpos.item
   const typeID = rpos.type
   const tname = rpos.tname
+  const assoc = rpos.assoc
   let type = null
   let index = 0
   if (rightID !== null) {
-    if (getState(store, rightID.client) <= rightID.clock) {
+    if (store.getClock(rightID.client) <= rightID.clock) {
       return null
     }
-    const res = followRedone(store, rightID)
+    const res = followUndoneDeletions ? followRedone(store, rightID) : getItemWithOffset(store, rightID)
     const right = res.item
     if (!(right instanceof Item)) {
       return null
     }
-    type = /** @type {AbstractType<any>} */ (right.parent)
+    type = /** @type {YType<any>} */ (right.parent)
     if (type._item === null || !type._item.deleted) {
-      index = right.deleted || !right.countable ? 0 : res.diff
+      index = rendererContentLength(renderer, right) === 0 ? 0 : (res.diff + (assoc >= 0 ? 0 : 1)) // adjust position based on left association if necessary
       let n = right.left
       while (n !== null) {
-        if (!n.deleted && n.countable) {
-          index += n.length
-        }
+        index += rendererContentLength(renderer, n)
         n = n.left
       }
     }
@@ -242,11 +307,11 @@ export const createAbsolutePositionFromRelativePosition = (rpos, doc) => {
     if (tname !== null) {
       type = doc.get(tname)
     } else if (typeID !== null) {
-      if (getState(store, typeID.client) <= typeID.clock) {
+      if (store.getClock(typeID.client) <= typeID.clock) {
         // type does not exist yet
         return null
       }
-      const { item } = followRedone(store, typeID)
+      const { item } = followUndoneDeletions ? followRedone(store, typeID) : { item: store.getItem(typeID) }
       if (item instanceof Item && item.content instanceof ContentType) {
         type = item.content.type
       } else {
@@ -256,17 +321,22 @@ export const createAbsolutePositionFromRelativePosition = (rpos, doc) => {
     } else {
       throw error.unexpectedCase()
     }
-    index = type._length
+    if (assoc >= 0) {
+      index = type._length
+    } else {
+      index = 0
+    }
   }
-  return createAbsolutePosition(type, index)
+  return createAbsolutePosition(type, index, rpos.assoc)
 }
 
 /**
  * @param {RelativePosition|null} a
  * @param {RelativePosition|null} b
+ * @return {boolean}
  *
  * @function
  */
 export const compareRelativePositions = (a, b) => a === b || (
-  a !== null && b !== null && a.tname === b.tname && compareIDs(a.item, b.item) && compareIDs(a.type, b.type)
+  a !== null && b !== null && a.tname === b.tname && compareIDs(a.item, b.item) && compareIDs(a.type, b.type) && a.assoc === b.assoc
 )
