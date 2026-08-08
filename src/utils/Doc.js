@@ -15,6 +15,12 @@ import { hasSparseTransport } from './sparse-transport.js'
 import { YType } from '../ytype.js'
 import { $ydoc } from './schemas.js'
 
+const applyIntrinsic = Reflect.apply
+const mapForEachIntrinsic = Map.prototype.forEach
+const mapGetIntrinsic = Map.prototype.get
+const mapHasIntrinsic = Map.prototype.has
+const mapSetIntrinsic = Map.prototype.set
+
 /** @type {WeakMap<Doc,{generation:number,pendingTransactions:number,destroyed:boolean,pendingBefore:WeakMap<object,number>}>} */
 const transactionGenerations = new WeakMap()
 
@@ -42,23 +48,27 @@ const docRootMapBrandKey = Symbol('doc-root-map-brand')
  */
 export const installStagedDocRootTypes = (doc, existingRoots, stagedRoots) => {
   const share = doc.share
-  Map.prototype.has.call(share, docRootMapBrandKey)
-  Map.prototype.forEach.call(existingRoots, (type, key) => {
-    if (!Map.prototype.has.call(share, key) || Map.prototype.get.call(share, key) !== type) {
-      throw new Error(`Prepared sparse root changed before commit: ${key}`)
+  applyIntrinsic(mapHasIntrinsic, share, [docRootMapBrandKey])
+  applyIntrinsic(mapForEachIntrinsic, existingRoots, [
+    /** @param {YType} type @param {string} key */ (type, key) => {
+      if (!applyIntrinsic(mapHasIntrinsic, share, [key]) || applyIntrinsic(mapGetIntrinsic, share, [key]) !== type) {
+        throw new Error(`Prepared sparse root changed before commit: ${key}`)
+      }
     }
-  })
+  ])
   /** @type {Array<[string,YType]>} */
   const installs = []
-  Map.prototype.forEach.call(stagedRoots, (type, key) => {
-    if (Map.prototype.has.call(share, key)) {
-      throw new Error(`Staged sparse root was installed before commit: ${key}`)
+  applyIntrinsic(mapForEachIntrinsic, stagedRoots, [
+    /** @param {YType} type @param {string} key */ (type, key) => {
+      if (applyIntrinsic(mapHasIntrinsic, share, [key])) {
+        throw new Error(`Staged sparse root was installed before commit: ${key}`)
+      }
+      installs.push([key, type])
     }
-    installs.push([key, type])
-  })
+  ])
   for (let index = 0; index < installs.length; index++) {
     const [key, type] = installs[index]
-    Map.prototype.set.call(share, key, type)
+    applyIntrinsic(mapSetIntrinsic, share, [key, type])
   }
   if (installs.length > 0) markStructuralChange(doc.store)
 }

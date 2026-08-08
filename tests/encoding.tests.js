@@ -935,6 +935,117 @@ export const testSparseAbsentRootInstallationIsAtomicUnderHostileMap = () => {
   })
 }
 
+export const testSparseRootIdentityUsesCapturedMapIntrinsics = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, apply }) => {
+    const target = new Y.Doc({ gc: false, sparseExactResolution: true })
+    const preparedRoot = target.get('text')
+    const replacementRoot = new Y.Type()
+    const update = encodeStructs([
+      new CausalHole(Y.createID(41, 0), 1, null, null, 'text', null),
+      new Y.Item(Y.createID(41, 1), null, Y.createID(41, 0), null, null, null, null, new Y.ContentString('x'))
+    ], Encoder)
+    const nativeHas = Map.prototype.has
+    const nativeGet = Map.prototype.get
+    const nativeSet = Map.prototype.set
+    let inject = true
+    let updates = 0
+    target.on('beforeTransaction', () => {
+      if (!inject) return
+      inject = false
+      Reflect.apply(nativeSet, target.share, ['text', replacementRoot])
+      Reflect.set(Map.prototype, 'has', /**
+       * @this {Map<unknown,unknown>}
+       * @param {unknown} key
+       */ function (key) {
+          return this === target.share && key === 'text' ? true : Reflect.apply(nativeHas, this, [key])
+        })
+      Reflect.set(Map.prototype, 'get', /**
+       * @this {Map<unknown,unknown>}
+       * @param {unknown} key
+       */ function (key) {
+          return this === target.share && key === 'text' ? preparedRoot : Reflect.apply(nativeGet, this, [key])
+        })
+    })
+    target.on('update', () => { updates++ })
+    target.on('updateV2', () => { updates++ })
+
+    let failure = null
+    try {
+      apply(target, update)
+    } catch (error) {
+      failure = error
+    } finally {
+      Reflect.set(Map.prototype, 'has', nativeHas)
+      Reflect.set(Map.prototype, 'get', nativeGet)
+    }
+    t.assert(failure instanceof Error, `${Encoder.name} spoofed root identity is rejected`)
+    t.assert(target.share.get('text') === replacementRoot)
+    t.assert(target.store.clients.size === 0 && target.store.causalHoles.isEmpty())
+    t.assert(target.store.pendingStructs === null && target.store.pendingDs === null)
+    t.assert(preparedRoot.toString() === '' && replacementRoot.toString() === '' && updates === 0)
+
+    Reflect.apply(nativeSet, target.share, ['text', preparedRoot])
+    apply(target, update)
+    t.assert(target.get('text') === preparedRoot && preparedRoot.toString() === 'x')
+    t.assert(target.store.getStruct(Y.createID(41, 0))?.constructor === CausalHole)
+    t.assert(target.store.getStruct(Y.createID(41, 1))?.constructor === Y.Item)
+  })
+}
+
+export const testSparseRootBatchUsesCapturedMapSet = () => {
+  ;[
+    { Encoder: Y.UpdateEncoderV1, apply: Y.applyUpdate },
+    { Encoder: Y.UpdateEncoderV2, apply: Y.applyUpdateV2 }
+  ].forEach(({ Encoder, apply }) => {
+    const target = new Y.Doc({ gc: false, sparseExactResolution: true })
+    const update = encodeStructGroups([
+      [
+        new CausalHole(Y.createID(50, 0), 1, null, null, 'root-a', null),
+        new Y.Item(Y.createID(50, 1), null, Y.createID(50, 0), null, null, null, null, new Y.ContentString('a'))
+      ],
+      [
+        new CausalHole(Y.createID(40, 0), 1, null, null, 'root-b', null),
+        new Y.Item(Y.createID(40, 1), null, Y.createID(40, 0), null, null, null, null, new Y.ContentString('b'))
+      ]
+    ], Encoder)
+    const nativeSet = Map.prototype.set
+    let inject = true
+    let calls = 0
+    target.on('beforeTransaction', () => {
+      if (!inject) return
+      inject = false
+      Reflect.set(Map.prototype, 'set', /**
+       * @this {Map<unknown,unknown>}
+       * @param {unknown} key
+       * @param {unknown} value
+       */ function (key, value) {
+          if (this === target.share && ++calls === 2) throw new Error('hostile second root')
+          return Reflect.apply(nativeSet, this, [key, value])
+        })
+    })
+
+    let failure = null
+    try {
+      apply(target, update)
+    } catch (error) {
+      failure = error
+    } finally {
+      Reflect.set(Map.prototype, 'set', nativeSet)
+    }
+    t.assert(failure === null && calls === 0, `${Encoder.name} commit uses the captured Map setter`)
+    t.assert(target.get('root-a').toString() === 'a' && target.get('root-b').toString() === 'b')
+    t.assert(target.store.getStruct(Y.createID(50, 1))?.constructor === Y.Item)
+    t.assert(target.store.getStruct(Y.createID(40, 1))?.constructor === Y.Item)
+
+    apply(target, update)
+    t.assert(target.get('root-a').toString() === 'a' && target.get('root-b').toString() === 'b')
+    t.assert(target.store.pendingStructs === null && target.store.pendingDs === null)
+  })
+}
+
 export const testSparsePendingStateSerializesWithDocumentContext = () => {
   ;[
     {
