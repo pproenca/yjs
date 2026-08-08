@@ -1,18 +1,22 @@
 /** @typedef {import('./StructStore.js').StructStore} StructStore */
 
+const applyIntrinsic = Reflect.apply
+const weakMapGetIntrinsic = WeakMap.prototype.get
+const weakMapSetIntrinsic = WeakMap.prototype.set
+
 /** @type {WeakMap<StructStore,number>} */
 const revisions = new WeakMap()
 
 /** @param {StructStore} store */
 export const initializeStructuralRevision = store => {
-  revisions.set(store, 0)
+  applyIntrinsic(weakMapSetIntrinsic, revisions, [store, 0])
 }
 
 /** @param {StructStore} store */
-export const getStructuralRevision = store => revisions.get(store) ?? 0
+export const getStructuralRevision = store => applyIntrinsic(weakMapGetIntrinsic, revisions, [store]) ?? 0
 
 /** @param {StructStore} store */
 export const markStructuralChange = store => {
-  const revision = revisions.get(store)
-  if (revision !== undefined) revisions.set(store, revision + 1)
+  const revision = applyIntrinsic(weakMapGetIntrinsic, revisions, [store])
+  if (revision !== undefined) applyIntrinsic(weakMapSetIntrinsic, revisions, [store, revision + 1])
 }

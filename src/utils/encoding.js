@@ -36,6 +36,10 @@ import { CausalHole, CausalHoleIndex, createCausalHoleFromItem, normalizeCausalH
 import { Doc, getDocTransactionGeneration, installStagedDocRootTypes, normalizeDocOptions, stageDocRootType } from './Doc.js'
 import { writeStructs } from './encoding-helpers.js'
 
+const applyIntrinsic = Reflect.apply
+const mapGetIntrinsic = Map.prototype.get
+const mapHasIntrinsic = Map.prototype.has
+
 /**
  * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
  * @param {StructStore} store
@@ -530,15 +534,12 @@ const prepareContentDocs = (ordered, target, prepared, isStable) => {
 const prepareStringRootParents = (ordered, target, sparsePlan, stagedRoots, existingRoots) => {
   /** @type {Map<Item,YType>} */
   const resolved = new Map()
-  /** @type {Set<Item>} */
-  const required = new Set()
   for (const entry of ordered) {
     if (entry.struct.constructor !== Item) continue
     const item = /** @type {Item} */ (entry.struct)
     const metadata = typeof item.parent === 'string' ? null : sparsePlan?.getParentMetadata(item) ?? null
     const parent = typeof item.parent === 'string' ? item.parent : metadata?.parent
     if (typeof parent !== 'string') continue
-    required.add(item)
     const existing = target.share.get(parent)
     let type
     if (existing === undefined) {
@@ -556,7 +557,15 @@ const prepareStringRootParents = (ordered, target, sparsePlan, stagedRoots, exis
     }
     resolved.set(item, type)
   }
-  return { required, resolved }
+  return resolved
+}
+
+/** @param {Map<Item,YType>} prepared @param {Item} item */
+const readPreparedStringRootParent = (prepared, item) => {
+  if (!applyIntrinsic(mapHasIntrinsic, prepared, [item])) {
+    throw new Error('Sparse root parent preparation is incomplete')
+  }
+  return /** @type {YType} */ (applyIntrinsic(mapGetIntrinsic, prepared, [item]))
 }
 
 /** @param {Array<ContentDoc>} contents */
@@ -782,8 +791,6 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
   let schedule = { ordered: [], rest: null }
   /** @type {Map<Item,YType>} */
   let preparedStringRootParents = new Map()
-  /** @type {Set<Item>} */
-  let requiredStringRootParents = new Set()
   /** @type {Map<string,YType>} */
   let stagedStringRoots = new Map()
   /** @type {Map<string,YType>} */
@@ -824,8 +831,7 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
         throw failure
       }
       if (stable) {
-        preparedStringRootParents = attemptStringRootParents.resolved
-        requiredStringRootParents = attemptStringRootParents.required
+        preparedStringRootParents = attemptStringRootParents
         stagedStringRoots = attemptStagedStringRoots
         existingStringRoots = attemptExistingStringRoots
         scheduledStructuralRevision = structuralRevision
@@ -850,11 +856,6 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
       !equalIdSets(transaction.deleteSet, transactionBaseline.deletes)
     ) {
       throw new Error('Integration schedule invalidated before commit')
-    }
-    for (const item of requiredStringRootParents) {
-      if (!preparedStringRootParents.has(item)) {
-        throw new Error('Sparse root parent preparation is incomplete')
-      }
     }
     installStagedDocRootTypes(ydoc, existingStringRoots, stagedStringRoots)
     if (consumeSparsePending) {
@@ -2299,7 +2300,7 @@ const getMissing = (struct, transaction, store, sparsePlan, preparedStringRootPa
       if (preparedStringRootParents === null) {
         item.parent = transaction.doc.get(hole.parent)
       } else {
-        item.parent = /** @type {YType} */ (preparedStringRootParents.get(item))
+        item.parent = readPreparedStringRootParent(preparedStringRootParents, item)
       }
     } else {
       item.parent = resolveCausalHoleParent(transaction, store, hole)
@@ -2328,7 +2329,7 @@ const getMissing = (struct, transaction, store, sparsePlan, preparedStringRootPa
     if (preparedStringRootParents === null) {
       item.parent = transaction.doc.get(parent)
     } else {
-      item.parent = /** @type {YType} */ (preparedStringRootParents.get(item))
+      item.parent = readPreparedStringRootParent(preparedStringRootParents, item)
     }
   }
   const bounds = sparsePlan?.getBounds(item, transaction) ?? null

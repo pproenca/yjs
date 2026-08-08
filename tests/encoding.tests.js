@@ -1046,6 +1046,233 @@ export const testSparseRootBatchUsesCapturedMapSet = () => {
   })
 }
 
+export const testSparseLateArrayPushCannotSuppressRootPublication = () => {
+  ;[
+    { apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate },
+    { apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2 }
+  ].forEach(({ apply, encode }) => {
+    const source = new Y.Doc({ gc: false })
+    source.get('late-push-root').insert(0, ['x'])
+    const update = encode(source)
+    const target = new Y.Doc({ gc: false, sparseExactResolution: true })
+    const before = Array.from(encode(target))
+    const originalPush = Array.prototype.push
+    let arm = true
+    let suppressed = 0
+    let updates = 0
+    target.on('beforeTransaction', () => {
+      if (!arm) return
+      arm = false
+      Reflect.set(Array.prototype, 'push', /**
+       * @this {Array<unknown>}
+       * @param {...unknown} values
+       */ function (...values) {
+          const value = values[0]
+          if (values.length === 1 && Array.isArray(value) && value[0] === 'late-push-root') {
+            suppressed++
+            return this.length
+          }
+          return Reflect.apply(originalPush, this, values)
+        })
+    })
+    target.on('update', () => { updates++ })
+    target.on('updateV2', () => { updates++ })
+
+    let failure = null
+    try {
+      apply(target, update)
+    } catch (error) {
+      failure = error
+    } finally {
+      Reflect.set(Array.prototype, 'push', originalPush)
+    }
+    t.assert(Array.prototype.push === originalPush && ['clean'].length === 1)
+    if (failure !== null) {
+      t.compareArrays(Array.from(encode(target)), before)
+      t.assert(!target.share.has('late-push-root') && target.store.clients.size === 0 && updates === 0)
+      apply(target, update)
+    } else {
+      t.assert(suppressed === 0 || target.share.has('late-push-root'), 'successful apply must publish its prepared root')
+    }
+    t.assert(target.get('late-push-root').toArray()[0] === 'x')
+    const snapshot = encode(target)
+    const reload = new Y.Doc({ gc: false })
+    apply(reload, snapshot)
+    t.assert(reload.get('late-push-root').toArray()[0] === 'x')
+  })
+}
+
+export const testSparseLateArrayIteratorCannotPartiallyPublishOrRedirectRoots = () => {
+  ;[
+    { apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate },
+    { apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2 }
+  ].forEach(({ apply, encode }) => {
+    /** @type {Array<string>} */
+    const outcomes = []
+    ;['throw', 'substitute'].forEach(mode => {
+      const source = new Y.Doc({ gc: false })
+      source.get('iterator-root-a').insert(0, ['a'])
+      source.get('iterator-root-b').insert(0, ['b'])
+      const update = encode(source)
+      const target = new Y.Doc({ gc: false, sparseExactResolution: true })
+      const before = Array.from(encode(target))
+      const originalIterator = Array.prototype[Symbol.iterator]
+      let arm = true
+      let pairs = 0
+      target.on('beforeTransaction', () => {
+        if (!arm) return
+        arm = false
+        Reflect.set(Array.prototype, Symbol.iterator, /** @this {Array<unknown>} */ function () {
+          const key = this[0]
+          if (this.length === 2 && (key === 'iterator-root-a' || key === 'iterator-root-b') && this[1] instanceof Y.Type) {
+            pairs++
+            if (mode === 'throw' && pairs === 2) throw new Error('late install iterator failure')
+            if (mode === 'substitute' && pairs === 1) {
+              return Reflect.apply(originalIterator, ['redirected-root', this[1]], [])
+            }
+          }
+          return Reflect.apply(originalIterator, this, [])
+        })
+      })
+
+      let failure = null
+      try {
+        apply(target, update)
+      } catch (error) {
+        failure = error
+      } finally {
+        Reflect.set(Array.prototype, Symbol.iterator, originalIterator)
+      }
+      t.assert(Array.prototype[Symbol.iterator] === originalIterator && Array.from(['clean'])[0] === 'clean')
+      const roots = Number(target.share.has('iterator-root-a')) + Number(target.share.has('iterator-root-b'))
+      let safe = failure !== null
+        ? roots === 0 && !target.share.has('redirected-root') && target.store.clients.size === 0 && Array.from(encode(target)).join(',') === before.join(',')
+        : roots === 2 && !target.share.has('redirected-root') && target.get('iterator-root-a').toArray()[0] === 'a' && target.get('iterator-root-b').toArray()[0] === 'b'
+      if (safe && failure !== null) {
+        apply(target, update)
+        safe = target.get('iterator-root-a').toArray()[0] === 'a' && target.get('iterator-root-b').toArray()[0] === 'b'
+      }
+      if (safe) {
+        const reload = new Y.Doc({ gc: false })
+        apply(reload, encode(target))
+        safe = reload.get('iterator-root-a').toArray()[0] === 'a' && reload.get('iterator-root-b').toArray()[0] === 'b' && !reload.share.has('redirected-root')
+      }
+      outcomes.push(`${mode}:${safe}`)
+    })
+    t.assert(outcomes.every(outcome => outcome.endsWith(':true')), outcomes.join(', '))
+  })
+}
+
+export const testSparsePreparedItemRootAssociationResistsLateMapPoison = () => {
+  ;[
+    { apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate },
+    { apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2 }
+  ].forEach(({ apply, encode }) => {
+    /** @type {Array<string>} */
+    const outcomes = []
+    ;['get', 'has'].forEach(mode => {
+      const source = new Y.Doc({ gc: false })
+      source.get('intended-root').insert(0, ['x'])
+      const update = encode(source)
+      const target = new Y.Doc({ gc: false, sparseExactResolution: true })
+      const intendedRoot = target.get('intended-root')
+      const redirectedRoot = target.get('redirected-root')
+      const before = Array.from(encode(target))
+      const originalGet = Map.prototype.get
+      const originalHas = Map.prototype.has
+      const originalSet = Map.prototype.set
+      let arm = true
+      target.on('beforeTransaction', () => {
+        if (!arm) return
+        arm = false
+        Reflect.set(Map.prototype, 'get', /** @this {Map<unknown,unknown>} @param {unknown} key */ function (key) {
+          if (mode === 'get' && key instanceof Y.Item && key.parent === 'intended-root') return redirectedRoot
+          return Reflect.apply(originalGet, this, [key])
+        })
+        Reflect.set(Map.prototype, 'has', /** @this {Map<unknown,unknown>} @param {unknown} key */ function (key) {
+          if (mode === 'has' && key instanceof Y.Item && key.parent === 'intended-root') {
+            Reflect.apply(originalSet, this, [key, redirectedRoot])
+            return true
+          }
+          return Reflect.apply(originalHas, this, [key])
+        })
+      })
+
+      let failure = null
+      try {
+        apply(target, update)
+      } catch (error) {
+        failure = error
+      } finally {
+        Reflect.set(Map.prototype, 'get', originalGet)
+        Reflect.set(Map.prototype, 'has', originalHas)
+      }
+      t.assert(Map.prototype.get === originalGet && Map.prototype.has === originalHas && new Map([['clean', true]]).get('clean') === true)
+      let safe = failure !== null
+        ? target.store.clients.size === 0 && intendedRoot.length === 0 && redirectedRoot.length === 0 && Array.from(encode(target)).join(',') === before.join(',')
+        : intendedRoot.toArray()[0] === 'x' && redirectedRoot.length === 0
+      if (safe && failure !== null) {
+        apply(target, update)
+        safe = intendedRoot.toArray()[0] === 'x' && redirectedRoot.length === 0
+      }
+      if (safe) {
+        const reload = new Y.Doc({ gc: false })
+        apply(reload, encode(target))
+        safe = reload.get('intended-root').toArray()[0] === 'x' && reload.get('redirected-root').length === 0
+      }
+      outcomes.push(`${mode}:${safe}`)
+    })
+    t.assert(outcomes.every(outcome => outcome.endsWith(':true')), outcomes.join(', '))
+  })
+}
+
+export const testSparseStructuralRevisionWeakMapFailureCannotPublishRoot = () => {
+  ;[
+    { apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate },
+    { apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2 }
+  ].forEach(({ apply, encode }) => {
+    const source = new Y.Doc({ gc: false })
+    source.get('revision-root').insert(0, ['x'])
+    const update = encode(source)
+    const target = new Y.Doc({ gc: false, sparseExactResolution: true })
+    const before = Array.from(encode(target))
+    const originalSet = WeakMap.prototype.set
+    let arm = true
+    let updates = 0
+    target.on('beforeTransaction', () => {
+      if (!arm) return
+      arm = false
+      Reflect.set(WeakMap.prototype, 'set', /** @this {WeakMap<object,unknown>} @param {object} key @param {unknown} value */ function (key, value) {
+        if (key === target.store) throw new Error('late structural revision failure')
+        return Reflect.apply(originalSet, this, [key, value])
+      })
+    })
+    target.on('update', () => { updates++ })
+    target.on('updateV2', () => { updates++ })
+
+    let failure = null
+    try {
+      apply(target, update)
+    } catch (error) {
+      failure = error
+    } finally {
+      Reflect.set(WeakMap.prototype, 'set', originalSet)
+    }
+    const weakKey = {}
+    t.assert(WeakMap.prototype.set === originalSet && new WeakMap().set(weakKey, true).get(weakKey) === true)
+    if (failure !== null) {
+      t.assert(!target.share.has('revision-root'), 'failed structural revision must not publish its staged root')
+      t.compareArrays(Array.from(encode(target)), before)
+      t.assert(target.store.clients.size === 0 && updates === 0)
+      apply(target, update)
+    }
+    t.assert(target.get('revision-root').toArray()[0] === 'x')
+    const reload = new Y.Doc({ gc: false })
+    apply(reload, encode(target))
+    t.assert(reload.get('revision-root').toArray()[0] === 'x')
+  })
+}
+
 export const testSparsePendingStateSerializesWithDocumentContext = () => {
   ;[
     {

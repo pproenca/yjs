@@ -56,21 +56,21 @@ export const installStagedDocRootTypes = (doc, existingRoots, stagedRoots) => {
       }
     }
   ])
-  /** @type {Array<[string,YType]>} */
-  const installs = []
+  let hasInstalls = false
   applyIntrinsic(mapForEachIntrinsic, stagedRoots, [
     /** @param {YType} type @param {string} key */ (type, key) => {
       if (applyIntrinsic(mapHasIntrinsic, share, [key])) {
         throw new Error(`Staged sparse root was installed before commit: ${key}`)
       }
-      installs.push([key, type])
+      hasInstalls = true
     }
   ])
-  for (let index = 0; index < installs.length; index++) {
-    const [key, type] = installs[index]
-    applyIntrinsic(mapSetIntrinsic, share, [key, type])
-  }
-  if (installs.length > 0) markStructuralChange(doc.store)
+  if (hasInstalls) markStructuralChange(doc.store)
+  applyIntrinsic(mapForEachIntrinsic, stagedRoots, [
+    /** @param {YType} type @param {string} key */ (type, key) => {
+      applyIntrinsic(mapSetIntrinsic, share, [key, type])
+    }
+  ])
 }
 
 /**
