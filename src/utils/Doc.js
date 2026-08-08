@@ -20,6 +20,26 @@ const mapForEachIntrinsic = Map.prototype.forEach
 const mapGetIntrinsic = Map.prototype.get
 const mapHasIntrinsic = Map.prototype.has
 const mapSetIntrinsic = Map.prototype.set
+const weakMapGetIntrinsic = WeakMap.prototype.get
+const weakMapSetIntrinsic = WeakMap.prototype.set
+
+/** @type {WeakMap<Doc,{revision:number,destroyed:boolean}>} */
+const docConstructionStates = new WeakMap()
+let docConstructionRevision = 0
+
+export const captureDocConstructionRevision = () => docConstructionRevision
+
+/** @param {Doc} doc @param {number} revision */
+export const isFreshDocConstruction = (doc, revision) => {
+  const state = applyIntrinsic(weakMapGetIntrinsic, docConstructionStates, [doc])
+  return state !== undefined && state.revision > revision && !state.destroyed
+}
+
+/** @param {Doc} doc @param {number} revision */
+export const revokeFreshDocConstruction = (doc, revision) => {
+  const state = applyIntrinsic(weakMapGetIntrinsic, docConstructionStates, [doc])
+  if (state !== undefined && state.revision > revision && !state.destroyed) state.destroyed = true
+}
 
 /** @type {WeakMap<Doc,{generation:number,pendingTransactions:number,destroyed:boolean,pendingBefore:WeakMap<object,number>}>} */
 const transactionGenerations = new WeakMap()
@@ -284,6 +304,8 @@ export class Doc extends ObservableV2 {
      * Note the documentation about the `isSynced` property.
      */
     this.whenSynced = provideSyncedPromise()
+    docConstructionRevision++
+    applyIntrinsic(weakMapSetIntrinsic, docConstructionStates, [this, { revision: docConstructionRevision, destroyed: false }])
   }
 
   /**
@@ -376,6 +398,8 @@ export class Doc extends ObservableV2 {
    * Emit `destroy` event and unregister all event handlers.
    */
   destroy () {
+    const constructionState = applyIntrinsic(weakMapGetIntrinsic, docConstructionStates, [this])
+    if (constructionState !== undefined) constructionState.destroyed = true
     const transactionGeneration = transactionGenerations.get(this)
     if (transactionGeneration !== undefined) transactionGeneration.destroyed = true
     this.isDestroyed = true

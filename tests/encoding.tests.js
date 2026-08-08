@@ -1395,6 +1395,410 @@ export const testSparseSubdocConstructorCannotReplaceHostShare = () => {
   })
 }
 
+export const testSparsePreparedSubdocAdmissionRejectsHostileResults = () => {
+  /** @type {Array<string>} */
+  const outcomes = []
+  ;[
+    { apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },
+    { apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, event: 'updateV2' }
+  ].forEach(({ apply, encode, event }) => {
+    ;['proxy', 'reused', 'accessors'].forEach(mode => {
+      let hostile = false
+      let reusedDoc = /** @type {Y.Doc|null} */ (null)
+      class TargetDoc extends Y.Doc {
+        /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+        constructor (opts) {
+          super(opts)
+          if (!hostile || opts?.guid !== `hostile-${mode}`) return
+          if (mode === 'proxy') {
+            return new Proxy(this, {
+              get: (target, key, receiver) => key === '_item' ? null : Reflect.get(target, key, receiver)
+            })
+          }
+          if (mode === 'reused' && reusedDoc !== null) return /** @type {any} */ (reusedDoc)
+          Object.defineProperty(this, '_item', {
+            get: () => null,
+            set: (/** @type {unknown} */ _value) => {},
+            configurable: true
+          })
+          Object.defineProperty(this, 'shouldLoad', {
+            get: () => { throw new Error('hostile shouldLoad') },
+            set: (/** @type {unknown} */ _value) => {},
+            configurable: true
+          })
+        }
+      }
+      if (mode === 'reused') reusedDoc = new TargetDoc({ guid: `hostile-${mode}`, autoLoad: true })
+      hostile = true
+
+      const source = new Y.Doc({ gc: false })
+      source.get('docs').insert(0, [new Y.Doc({ guid: `hostile-${mode}`, autoLoad: true })])
+      source.get('text').insert(0, ['x'])
+      const update = encode(source)
+      const host = new TargetDoc({ gc: false, sparseExactResolution: true })
+      const authority = host.share
+      const existing = host.get('existing-root')
+      existing.insert(0, ['base'])
+      const before = Array.from(encode(host))
+      const beforeState = Array.from(Y.encodeStateVector(host))
+      const beforeClients = new Map(host.store.clients)
+      const pendingStructs = host.store.pendingStructs
+      const pendingDs = host.store.pendingDs
+      const revision = getStructuralRevision(host.store)
+      const failedRuns = _testOnlyGetSparseFailedPlanRuns(host)
+      const proofRuns = _testOnlyGetSparsePendingProofRuns(host)
+      let updates = 0
+      let transactions = 0
+      let subdocs = 0
+      host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+      host.on('afterTransaction', () => { transactions++ })
+      host.on('subdocs', () => { subdocs++ })
+
+      let failure = null
+      try {
+        apply(host, update)
+      } catch (error) {
+        failure = error
+      }
+      let unchanged = false
+      try {
+        unchanged =
+          failure instanceof Error && host.share === authority && authority.size === 1 &&
+          authority.get('existing-root') === existing && existing.toArray()[0] === 'base' &&
+          Array.from(encode(host)).join(',') === before.join(',') &&
+          Array.from(Y.encodeStateVector(host)).join(',') === beforeState.join(',') &&
+          host.store.clients.size === beforeClients.size &&
+          [...beforeClients].every(([client, structs]) => host.store.clients.get(client) === structs) &&
+          host.store.pendingStructs === pendingStructs && host.store.pendingDs === pendingDs &&
+          host.subdocs.size === 0 && getStructuralRevision(host.store) === revision &&
+          _testOnlyGetSparseFailedPlanRuns(host) === failedRuns && _testOnlyGetSparsePendingProofRuns(host) === proofRuns &&
+          (reusedDoc === null || reusedDoc.isDestroyed === false) &&
+          updates === 0 && transactions === 0 && subdocs === 0
+      } catch (_) {}
+
+      let retry = false
+      if (unchanged) {
+        hostile = false
+        apply(host, update)
+        const visible = host.get('docs').get(0)
+        const reload = new Y.Doc({ gc: false })
+        apply(reload, encode(host))
+        const reloaded = reload.get('docs').get(0)
+        retry =
+          visible instanceof Y.Doc && visible.guid === `hostile-${mode}` && visible.isDestroyed === false && visible.shouldLoad === true &&
+          host.subdocs.size === 1 && host.subdocs.has(visible) && host.get('text').toArray()[0] === 'x' &&
+          existing.toArray()[0] === 'base' && updates === 1 && transactions === 1 && subdocs === 1 &&
+          reloaded instanceof Y.Doc && reloaded.guid === `hostile-${mode}` && reloaded.isDestroyed === false &&
+          reload.subdocs.size === 1 && reload.get('text').toArray()[0] === 'x' && reload.get('existing-root').toArray()[0] === 'base'
+      }
+      outcomes.push(`${event}-${mode}:${unchanged && retry}`)
+    })
+  })
+  t.assert(outcomes.every(outcome => outcome.endsWith(':true')), outcomes.join(', '))
+}
+
+export const testSparsePreparedSubdocCommitTaintRejectsWithoutCleanupDestroy = () => {
+  /** @type {Array<string>} */
+  const outcomes = []
+  ;[
+    { apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },
+    { apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, event: 'updateV2' }
+  ].forEach(({ apply, encode, event }) => {
+    ;['_item', 'shouldLoad'].forEach(property => {
+      let taint = true
+      let candidateDestroys = 0
+      /** @type {Array<Y.Doc>} */
+      const candidates = []
+      class TargetDoc extends Y.Doc {
+        /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+        constructor (opts) {
+          super(opts)
+          if (opts?.guid === `late-${property}`) {
+            candidates.push(this)
+            this.on('destroy', () => { candidateDestroys++ })
+          }
+        }
+      }
+
+      const source = new Y.Doc({ gc: false })
+      source.get('docs').insert(0, [new Y.Doc({ guid: `late-${property}`, autoLoad: true })])
+      source.get('text').insert(0, ['x'])
+      const update = encode(source)
+      const host = new TargetDoc({ gc: false, sparseExactResolution: true })
+      const authority = host.share
+      const existing = host.get('existing-root')
+      existing.insert(0, ['base'])
+      const before = Array.from(encode(host))
+      const beforeState = Array.from(Y.encodeStateVector(host))
+      const beforeClients = new Map(host.store.clients)
+      const pendingStructs = host.store.pendingStructs
+      const pendingDs = host.store.pendingDs
+      const revision = getStructuralRevision(host.store)
+      const failedRuns = _testOnlyGetSparseFailedPlanRuns(host)
+      const proofRuns = _testOnlyGetSparsePendingProofRuns(host)
+      let hooks = 0
+      let updates = 0
+      let transactions = 0
+      let subdocs = 0
+      host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+      host.on('afterTransaction', () => { transactions++ })
+      host.on('subdocs', () => { subdocs++ })
+      host.on('beforeTransaction', () => {
+        hooks++
+        if (!taint) return
+        const candidate = candidates[candidates.length - 1]
+        Object.defineProperty(candidate, property, {
+          get: () => { throw new Error(`late ${property} access`) },
+          set: (/** @type {unknown} */ _value) => {},
+          configurable: true
+        })
+      })
+
+      let failure = null
+      try { apply(host, update) } catch (error) { failure = error }
+      const rejected =
+        failure instanceof Error && candidates.length === 1 && candidates[0].isDestroyed === false && candidateDestroys === 0 &&
+        hooks === 1 && host.share === authority && authority.size === 1 && authority.get('existing-root') === existing &&
+        existing.toArray()[0] === 'base' && Array.from(encode(host)).join(',') === before.join(',') &&
+        Array.from(Y.encodeStateVector(host)).join(',') === beforeState.join(',') && host.store.clients.size === beforeClients.size &&
+        [...beforeClients].every(([client, structs]) => host.store.clients.get(client) === structs) &&
+        host.store.pendingStructs === pendingStructs && host.store.pendingDs === pendingDs && host.subdocs.size === 0 &&
+        getStructuralRevision(host.store) === revision && _testOnlyGetSparseFailedPlanRuns(host) === failedRuns &&
+        _testOnlyGetSparsePendingProofRuns(host) === proofRuns && updates === 0 && transactions === 1 && subdocs === 0
+
+      let retry = false
+      if (rejected) {
+        taint = false
+        apply(host, update)
+        const visible = host.get('docs').get(0)
+        const reload = new Y.Doc({ gc: false })
+        apply(reload, encode(host))
+        const reloaded = reload.get('docs').get(0)
+        retry =
+          candidates.length === 2 && candidates[0] !== candidates[1] && candidateDestroys === 0 &&
+          candidates.every(candidate => candidate.isDestroyed === false) && visible === candidates[1] &&
+          visible instanceof Y.Doc && visible.guid === `late-${property}` && visible.shouldLoad === true &&
+          host.subdocs.size === 1 && host.subdocs.has(visible) && host.get('text').toArray()[0] === 'x' &&
+          existing.toArray()[0] === 'base' && hooks === 2 && updates === 1 && transactions === 2 && subdocs === 1 &&
+          reloaded instanceof Y.Doc && reloaded.guid === `late-${property}` && reloaded.shouldLoad === true &&
+          reload.subdocs.size === 1 && reload.get('text').toArray()[0] === 'x' && reload.get('existing-root').toArray()[0] === 'base'
+      }
+      outcomes.push(`${event}-${property}:${rejected && retry}`)
+    })
+  })
+  t.assert(outcomes.every(outcome => outcome.endsWith(':true')), outcomes.join(', '))
+}
+
+export const testSparsePreparedSubdocCleanupCannotAliasForeignItem = () => {
+  /** @type {Array<string>} */
+  const outcomes = []
+  ;[
+    { apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },
+    { apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, event: 'updateV2' }
+  ].forEach(({ apply, encode, event }) => {
+    const foreignParent = new Y.Doc({ gc: false })
+    const foreign = new Y.Doc({ guid: 'foreign', gc: false })
+    foreignParent.get('docs').insert(0, [foreign])
+    const foreignItem = /** @type {Y.Item} */ (foreign._item)
+    const foreignContent = /** @type {Y.ContentDoc} */ (foreignItem.content)
+    const foreignBefore = Array.from(encode(foreignParent))
+    const foreignState = Array.from(Y.encodeStateVector(foreignParent))
+    let foreignUpdates = 0
+    let foreignSubdocs = 0
+    foreignParent.on('update', () => { foreignUpdates++ })
+    foreignParent.on('updateV2', () => { foreignUpdates++ })
+    foreignParent.on('subdocs', () => { foreignSubdocs++ })
+
+    /** @type {Array<Y.Doc>} */
+    const candidates = []
+    let cleanupTraps = 0
+    class TargetDoc extends Y.Doc {
+      /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+      constructor (opts) {
+        super(opts)
+        if (opts?.guid === 'cleanup-candidate') {
+          candidates.push(this)
+          this.get('cleanup-trap').on('destroy', () => {
+            cleanupTraps++
+            this._item = foreignItem
+          })
+        }
+      }
+    }
+
+    const source = new Y.Doc({ gc: false })
+    source.get('docs').insert(0, [new Y.Doc({ guid: 'cleanup-candidate' })])
+    source.get('text').insert(0, ['x'])
+    const update = encode(source)
+    const host = new TargetDoc({ gc: false, sparseExactResolution: true })
+    const authority = host.share
+    const existing = host.get('existing-root')
+    existing.insert(0, ['base'])
+    const before = Array.from(encode(host))
+    const beforeState = Array.from(Y.encodeStateVector(host))
+    const beforeClients = new Map(host.store.clients)
+    const pendingStructs = host.store.pendingStructs
+    const pendingDs = host.store.pendingDs
+    const revision = getStructuralRevision(host.store)
+    const failedRuns = _testOnlyGetSparseFailedPlanRuns(host)
+    const proofRuns = _testOnlyGetSparsePendingProofRuns(host)
+    let hookRoot = /** @type {Y.Type|null} */ (null)
+    let hookRevision = revision
+    let updates = 0
+    let subdocs = 0
+    host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+    host.on('subdocs', () => { subdocs++ })
+    const invalidatePlan = () => {
+      hookRoot = host.get('hook-root')
+      hookRevision = getStructuralRevision(host.store)
+    }
+    host.on('beforeTransaction', invalidatePlan)
+
+    let failure = null
+    try { apply(host, update) } catch (error) { failure = error } finally { host.off('beforeTransaction', invalidatePlan) }
+    const rejected =
+      failure instanceof Error && candidates.length === 1 &&
+      candidates[0].isDestroyed === false && cleanupTraps === 0 &&
+      foreignContent.doc === foreign && foreignParent.get('docs').get(0) === foreign && foreign.isDestroyed === false &&
+      foreignParent.subdocs.size === 1 && foreignParent.subdocs.has(foreign) && foreignUpdates === 0 && foreignSubdocs === 0 &&
+      Array.from(encode(foreignParent)).join(',') === foreignBefore.join(',') &&
+      Array.from(Y.encodeStateVector(foreignParent)).join(',') === foreignState.join(',') &&
+      host.share === authority && authority.size === 2 && authority.get('existing-root') === existing &&
+      hookRoot !== null && authority.get('hook-root') === hookRoot && hookRevision > revision &&
+      existing.toArray()[0] === 'base' && Array.from(encode(host)).join(',') === before.join(',') &&
+      Array.from(Y.encodeStateVector(host)).join(',') === beforeState.join(',') && host.store.clients.size === beforeClients.size &&
+      [...beforeClients].every(([client, structs]) => host.store.clients.get(client) === structs) &&
+      host.store.pendingStructs === pendingStructs && host.store.pendingDs === pendingDs && host.subdocs.size === 0 &&
+      getStructuralRevision(host.store) === hookRevision && _testOnlyGetSparseFailedPlanRuns(host) === failedRuns &&
+      _testOnlyGetSparsePendingProofRuns(host) === proofRuns && updates === 0 && subdocs === 0
+
+    let retry = false
+    if (rejected) {
+      apply(host, update)
+      const visible = host.get('docs').get(0)
+      const reload = new Y.Doc({ gc: false })
+      apply(reload, encode(host))
+      const reloaded = reload.get('docs').get(0)
+      retry =
+        candidates.length === 2 && candidates[0] !== candidates[1] && candidates[1].isDestroyed === false &&
+        visible === candidates[1] && visible instanceof Y.Doc && visible.guid === 'cleanup-candidate' &&
+        host.subdocs.size === 1 && host.subdocs.has(visible) && host.get('text').toArray()[0] === 'x' &&
+        existing.toArray()[0] === 'base' && updates === 1 && subdocs === 1 &&
+        reloaded instanceof Y.Doc && reloaded.guid === 'cleanup-candidate' && reload.subdocs.size === 1 &&
+        reload.get('text').toArray()[0] === 'x' && reload.get('existing-root').toArray()[0] === 'base' &&
+        foreignContent.doc === foreign && foreignParent.get('docs').get(0) === foreign && foreignParent.subdocs.size === 1 &&
+        foreignParent.subdocs.has(foreign) && foreignUpdates === 0 && foreignSubdocs === 0 &&
+        Array.from(encode(foreignParent)).join(',') === foreignBefore.join(',')
+    }
+    outcomes.push(`${event}:${rejected && retry}`)
+  })
+  t.assert(outcomes.every(outcome => outcome.endsWith(':true')), outcomes.join(', '))
+}
+
+export const testSparseSubdocConstructorDestroyRejectsWithoutMutation = () => {
+  /** @type {Array<string>} */
+  const outcomes = []
+  ;[
+    { apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },
+    { apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, event: 'updateV2' }
+  ].forEach(({ apply, encode, event }) => {
+    let host = /** @type {Y.Doc|null} */ (null)
+    class TargetDoc extends Y.Doc {
+      /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+      constructor (opts) {
+        super(opts)
+        if (opts?.guid === 'destroy-host-during-plan') host?.destroy()
+      }
+    }
+    const source = new Y.Doc({ gc: false })
+    source.get('docs').insert(0, [new Y.Doc({ guid: 'destroy-host-during-plan' })])
+    source.get('text').insert(0, ['x'])
+    const update = encode(source)
+    host = new TargetDoc({ gc: false, sparseExactResolution: true })
+    const beforeState = Array.from(Y.encodeStateVector(host))
+    const revision = getStructuralRevision(host.store)
+    const failedRuns = _testOnlyGetSparseFailedPlanRuns(host)
+    const proofRuns = _testOnlyGetSparsePendingProofRuns(host)
+    const pendingStructs = host.store.pendingStructs
+    const pendingDs = host.store.pendingDs
+    let destroys = 0
+    let updates = 0
+    let transactions = 0
+    let subdocs = 0
+    host.on('destroy', () => { destroys++ })
+    host.on('update', () => { updates++ })
+    host.on('updateV2', () => { updates++ })
+    host.on('afterTransaction', () => { transactions++ })
+    host.on('subdocs', () => { subdocs++ })
+
+    let failure = null
+    try { apply(host, update) } catch (error) { failure = error }
+    let retryFailure = null
+    try { apply(host, update) } catch (error) { retryFailure = error }
+    let serializationFailure = null
+    try { encode(host) } catch (error) { serializationFailure = error }
+    outcomes.push(`${event}:${
+      failure instanceof Error && retryFailure instanceof Error && serializationFailure instanceof Error &&
+      host.isDestroyed && destroys === 1 && updates === 0 && transactions === 0 && subdocs === 0 &&
+      host.share.size === 0 && host.subdocs.size === 0 && host.store.clients.size === 0 &&
+      Array.from(Y.encodeStateVector(host)).join(',') === beforeState.join(',') &&
+      host.store.pendingStructs === pendingStructs && host.store.pendingDs === pendingDs &&
+      getStructuralRevision(host.store) === revision && _testOnlyGetSparseFailedPlanRuns(host) === failedRuns &&
+      _testOnlyGetSparsePendingProofRuns(host) === proofRuns
+    }`)
+  })
+  t.assert(outcomes.every(outcome => outcome.endsWith(':true')), outcomes.join(', '))
+}
+
+export const testSparseBeforeTransactionDestroyRejectsWithoutMutation = () => {
+  /** @type {Array<string>} */
+  const outcomes = []
+  ;[
+    { apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },
+    { apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, event: 'updateV2' }
+  ].forEach(({ apply, encode, event }) => {
+    const source = new Y.Doc({ gc: false })
+    source.get('docs').insert(0, [new Y.Doc({ guid: 'destroy-host-before-commit' })])
+    source.get('text').insert(0, ['x'])
+    const update = encode(source)
+    const host = new Y.Doc({ gc: false, sparseExactResolution: true })
+    const beforeState = Array.from(Y.encodeStateVector(host))
+    const revision = getStructuralRevision(host.store)
+    const failedRuns = _testOnlyGetSparseFailedPlanRuns(host)
+    const proofRuns = _testOnlyGetSparsePendingProofRuns(host)
+    const pendingStructs = host.store.pendingStructs
+    const pendingDs = host.store.pendingDs
+    let hooks = 0
+    let destroys = 0
+    let updates = 0
+    let transactions = 0
+    let subdocs = 0
+    host.on('destroy', () => { destroys++ })
+    host.on('update', () => { updates++ })
+    host.on('updateV2', () => { updates++ })
+    host.on('afterTransaction', () => { transactions++ })
+    host.on('subdocs', () => { subdocs++ })
+    host.on('beforeTransaction', () => { hooks++; host.destroy() })
+
+    let failure = null
+    try { apply(host, update) } catch (error) { failure = error }
+    let retryFailure = null
+    try { apply(host, update) } catch (error) { retryFailure = error }
+    let serializationFailure = null
+    try { encode(host) } catch (error) { serializationFailure = error }
+    outcomes.push(`${event}:${
+      failure instanceof Error && retryFailure instanceof Error && serializationFailure instanceof Error &&
+      host.isDestroyed && hooks === 1 && destroys === 1 && updates === 0 && transactions === 0 && subdocs === 0 &&
+      host.share.size === 0 && host.subdocs.size === 0 && host.store.clients.size === 0 &&
+      Array.from(Y.encodeStateVector(host)).join(',') === beforeState.join(',') &&
+      host.store.pendingStructs === pendingStructs && host.store.pendingDs === pendingDs &&
+      getStructuralRevision(host.store) === revision && _testOnlyGetSparseFailedPlanRuns(host) === failedRuns &&
+      _testOnlyGetSparsePendingProofRuns(host) === proofRuns
+    }`)
+  })
+  t.assert(outcomes.every(outcome => outcome.endsWith(':true')), outcomes.join(', '))
+}
+
 export const testSparsePreparationMapSetPoisonCannotRedirectRoot = () => {
   ;[
     { apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },

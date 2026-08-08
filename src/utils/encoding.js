@@ -34,6 +34,7 @@ import { ContentDoc, ContentType, Item, findItemInsertionLeft } from '../structs
 import { GC } from '../structs/GC.js'
 import { CausalHole, CausalHoleIndex, createCausalHoleFromItem, normalizeCausalHoleParent, sameCausalHoleMetadata, sameCausalHoleParent } from '../structs/CausalHole.js'
 import { Doc, getDocTransactionGeneration, installStagedDocRootTypes, normalizeDocOptions, stageDocRootType } from './Doc.js'
+import { createPreparedContentDocState, disposePreparedContentDocs, getPreparedContentDoc, markPreparedContentDocIntegrated, prepareContentDocs, preparedContentDocScheduleIsStable } from './content-doc-preparation.js'
 import { writeStructs } from './encoding-helpers.js'
 
 const applyIntrinsic = Reflect.apply
@@ -484,45 +485,6 @@ const cacheSparsePlanFailure = (doc, canonical, failure) => {
 }
 
 /**
- * Construct only subdocuments in the frozen integration schedule. ContentDoc.integrate reuses `doc`.
- *
- * @param {Array<{struct:GC|Item|CausalHole,clock:number,gap:number}>} ordered
- * @param {Doc} target
- * @param {Array<ContentDoc>} prepared
- * @param {()=>boolean} isStable
- */
-const prepareContentDocs = (ordered, target, prepared, isStable) => {
-  const scheduled = new Set(ordered
-    .map(entry => entry.struct)
-    .filter(struct => struct.constructor === Item && /** @type {Item} */ (struct).content instanceof ContentDoc)
-    .map(struct => /** @type {ContentDoc} */ (/** @type {Item} */ (struct).content)))
-  const stale = prepared.filter(content => !scheduled.has(content))
-  disposeUnintegratedContentDocs(stale)
-  for (let index = prepared.length - 1; index >= 0; index--) {
-    if (!scheduled.has(prepared[index])) prepared.splice(index, 1)
-  }
-  try {
-    for (const content of scheduled) {
-      normalizeDocOptions(content.opts)
-      if (content.doc !== null) continue
-      const opts = content.opts
-      content.doc = /** @type {Doc} */ (new /** @type {any} */ (target.constructor)({
-        guid: content.guid,
-        ...opts,
-        shouldLoad: opts.shouldLoad || opts.autoLoad || false
-      }))
-      prepared.push(content)
-      if (!isStable()) return false
-    }
-  } catch (failure) {
-    disposeUnintegratedContentDocs(prepared)
-    prepared.length = 0
-    throw failure
-  }
-  return true
-}
-
-/**
  * Resolve user-dispatched root lookup while the sparse schedule is still restartable. The commit
  * path consumes these exact type references and never calls an overridable Doc method.
  *
@@ -579,18 +541,6 @@ const readPreparedStringRootParent = (prepared, item) => {
     throw new Error('Sparse root parent preparation is incomplete')
   }
   return /** @type {YType} */ (applyIntrinsic(mapGetIntrinsic, prepared, [item]))
-}
-
-/** @param {Array<ContentDoc>} contents */
-const disposeUnintegratedContentDocs = contents => {
-  const disposable = contents.filter(content => content.doc?._item === null)
-  const docs = disposable.map(content => content.doc)
-  disposable.forEach(content => { content.doc = null })
-  docs.forEach(doc => {
-    try {
-      doc?.destroy()
-    } catch (_) {}
-  })
 }
 
 /** @param {GC|Item|Skip|CausalHole} struct */
@@ -734,6 +684,9 @@ const applyOrdinaryUpdate = (structDecoder, structs, doc, origin) => {
  * @function
  */
 export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = new UpdateDecoderV2(decoder)) => {
+  if (ydoc.sparseExactResolution && getDocTransactionGeneration(ydoc).destroyed) {
+    throw new Error('Cannot apply an update to a destroyed sparse exact-resolution document')
+  }
   let ss = readBlockSet(structDecoder)
   const ranges = array.from(ss.clients.values())
   const hasIncomingHoles = ranges.some(range => range.refs.some(struct => struct.constructor === CausalHole))
@@ -791,8 +744,7 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
   } else {
     if (hasIncomingHoles) normalizeIncomingCausalHoles(ss, store)
   }
-  /** @type {Array<ContentDoc>} */
-  const preparedContentDocs = []
+  const preparedContentDocs = createPreparedContentDocState()
   const planningTransaction = ydoc._transaction
   const transactionBaseline = planningTransaction === null
     ? { inserts: createIdSet(), deletes: createIdSet() }
@@ -818,6 +770,9 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     const structuralRevision = getStructuralRevision(store)
     const pendingRevision = getPendingRevision(store)
     const revisionsStable = () => {
+      if (getDocTransactionGeneration(ydoc).destroyed) {
+        throw new Error('Sparse document was destroyed during integration planning')
+      }
       if (!matchesPendingSnapshot(store, pendingSnapshot)) {
         throw new Error('Pending state changed during sparse integration planning')
       }
@@ -842,8 +797,7 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
         attemptStringRootParents = prepareStringRootParents(schedule.ordered, ydoc, attemptShare, sparsePlan, attemptStagedStringRoots, attemptExistingStringRoots)
         stable = revisionsStable()
       } catch (failure) {
-        disposeUnintegratedContentDocs(preparedContentDocs)
-        preparedContentDocs.length = 0
+        disposePreparedContentDocs(preparedContentDocs)
         throw failure
       }
       if (stable) {
@@ -857,7 +811,7 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     }
   }
   if (!stable) {
-    disposeUnintegratedContentDocs(preparedContentDocs)
+    disposePreparedContentDocs(preparedContentDocs)
     throw new Error('Subdocument preparation did not reach a stable document revision')
   }
 
@@ -865,12 +819,14 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     // force that transaction.local is set to non-local
     transaction.local = false
     if (
+      getDocTransactionGeneration(ydoc).destroyed ||
       !matchesPendingSnapshot(store, pendingSnapshot) ||
       scheduledStructuralRevision !== getStructuralRevision(store) ||
       scheduledPendingRevision !== getPendingRevision(store) ||
       (planningTransaction !== null && transaction !== planningTransaction) ||
       !equalIdSets(transaction.insertSet, transactionBaseline.inserts) ||
-      !equalIdSets(transaction.deleteSet, transactionBaseline.deletes)
+      !equalIdSets(transaction.deleteSet, transactionBaseline.deletes) ||
+      !preparedContentDocScheduleIsStable(schedule.ordered, preparedContentDocs)
     ) {
       throw new Error('Integration schedule invalidated before commit')
     }
@@ -881,12 +837,19 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     }
     for (let index = 0; index < schedule.ordered.length; index++) {
       const entry = schedule.ordered[index]
+      const contentDoc = entry.struct.constructor === Item && /** @type {Item} */ (entry.struct).content instanceof ContentDoc
+        ? /** @type {ContentDoc} */ (/** @type {Item} */ (entry.struct).content)
+        : null
+      const preparedContentDoc = contentDoc === null
+        ? null
+        : getPreparedContentDoc(preparedContentDocs, contentDoc)
       const clock = store.getClock(entry.struct.id.client)
       if (entry.gap > 0) new Skip(createID(entry.struct.id.client, clock), entry.gap).integrate(transaction, 0)
       if (entry.struct.constructor === Item || entry.struct.constructor === CausalHole) {
         getMissing(/** @type {Item|CausalHole} */ (entry.struct), transaction, store, sparsePlan, preparedStringRootParents)
       }
       entry.struct.integrate(transaction, 0)
+      if (preparedContentDoc !== null) markPreparedContentDocIntegrated(preparedContentDoc)
     }
     const restStructs = schedule.rest
     const pending = readPendingStructs(store)
@@ -949,7 +912,7 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
   try {
     return apply()
   } finally {
-    disposeUnintegratedContentDocs(preparedContentDocs)
+    disposePreparedContentDocs(preparedContentDocs)
   }
 }
 
