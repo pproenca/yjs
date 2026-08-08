@@ -814,33 +814,33 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
   let scheduledStructuralRevision = getStructuralRevision(store)
   let scheduledPendingRevision = ydoc.sparseExactResolution ? getPendingRevision(store) : 0
   for (let attempt = 0; attempt < 32 && !stable; attempt++) {
+    const attemptShare = ydoc.share
     const structuralRevision = getStructuralRevision(store)
     const pendingRevision = getPendingRevision(store)
+    const revisionsStable = () => {
+      if (!matchesPendingSnapshot(store, pendingSnapshot)) {
+        throw new Error('Pending state changed during sparse integration planning')
+      }
+      return ydoc.share === attemptShare && structuralRevision === getStructuralRevision(store) && pendingRevision === getPendingRevision(store)
+    }
     try {
       const working = createSparseWorkingSet(ss, store)
       const validation = validateCausalHoleEnvelope(working, store)
-      sparsePlan = validation === null ? null : createSparseIntegrationPlan(working, store, ydoc, validation)
+      sparsePlan = validation === null ? null : createSparseIntegrationPlan(working, store, ydoc, attemptShare, validation)
       sparsePlan?.applySplits()
       schedule = scheduleStructs(store, working, sparsePlan)
     } catch (failure) {
       if (failureCanonical !== null) throw cacheSparsePlanFailure(ydoc, failureCanonical, failure)
       throw failure
     }
-    const revisionsStable = () => {
-      if (!matchesPendingSnapshot(store, pendingSnapshot)) {
-        throw new Error('Pending state changed during sparse integration planning')
-      }
-      return structuralRevision === getStructuralRevision(store) && pendingRevision === getPendingRevision(store)
-    }
     stable = prepareContentDocs(schedule.ordered, ydoc, preparedContentDocs, revisionsStable) && revisionsStable()
     if (stable) {
       let attemptStringRootParents
-      const attemptShare = ydoc.share
       const attemptStagedStringRoots = new Map()
       const attemptExistingStringRoots = new Map()
       try {
         attemptStringRootParents = prepareStringRootParents(schedule.ordered, ydoc, attemptShare, sparsePlan, attemptStagedStringRoots, attemptExistingStringRoots)
-        stable = ydoc.share === attemptShare && revisionsStable()
+        stable = revisionsStable()
       } catch (failure) {
         disposeUnintegratedContentDocs(preparedContentDocs)
         preparedContentDocs.length = 0
@@ -1395,9 +1395,10 @@ const sparseIDKey = id => `${id.client}:${id.clock}`
  * @param {BlockSet} blockSet
  * @param {StructStore} store
  * @param {Doc} doc
+ * @param {Map<string,YType>} share
  * @param {NonNullable<ReturnType<typeof validateCausalHoleEnvelope>>} validation
  */
-const createSparseIntegrationPlan = (blockSet, store, doc, validation) => {
+const createSparseIntegrationPlan = (blockSet, store, doc, share, validation) => {
   const sparseItems = new Set(validation.incomingItems.filter(item =>
     validation.getHoleOverlaps(item.id.client, item.id.clock, item.length).length > 0 ||
     (item.origin !== null && validation.resolve(item.origin)?.constructor === CausalHole) ||
@@ -1463,7 +1464,9 @@ const createSparseIntegrationPlan = (blockSet, store, doc, validation) => {
     const ranges = []
     let parentType = null
     if (typeof group.parent === 'string') {
-      parentType = doc.share.get(group.parent) ?? null
+      parentType = applyIntrinsic(mapHasIntrinsic, share, [group.parent])
+        ? /** @type {YType} */ (applyIntrinsic(mapGetIntrinsic, share, [group.parent]))
+        : null
     } else {
       const parent = validation.resolve(group.parent)
       if (parent?.constructor === Item && parent.content instanceof ContentType) parentType = parent.content.type
@@ -1959,7 +1962,7 @@ const encodeSparseStateWithPending = (doc, stateUpdate, targetStateVector, encod
     const hasPendingHoles = pendingRanges.some(range => range.refs.some(struct => struct.constructor === CausalHole))
     if (hasPendingHoles) normalizeIncomingCausalHoles(pendingBlocks, doc.store)
     const validation = validateCausalHoleEnvelope(pendingBlocks, doc.store)
-    if (validation !== null) createSparseIntegrationPlan(pendingBlocks, doc.store, doc, validation)
+    if (validation !== null) createSparseIntegrationPlan(pendingBlocks, doc.store, doc, doc.share, validation)
     blocks.insertInto(pendingBlocks)
     deleteSets.push(pendingStructs.deletes)
   }

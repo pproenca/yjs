@@ -1273,61 +1273,125 @@ export const testSparseStructuralRevisionWeakMapFailureCannotPublishRoot = () =>
   })
 }
 
-export const testSparseShareReplacementRejectsWithoutAuthoritySplit = () => {
+export const testSparseShareAuthorityPropertyIsStableAndOrdinaryCompatible = () => {
+  const ordinary = new Y.Doc({ gc: false })
+  const ordinaryDescriptor = Object.getOwnPropertyDescriptor(ordinary, 'share')
+  const assignedShare = new Map()
+  ordinary.share = assignedShare
+  const definedShare = new Map()
+  Object.defineProperty(ordinary, 'share', { value: definedShare })
+  t.assert(
+    ordinaryDescriptor?.value instanceof Map && ordinaryDescriptor.writable === true &&
+    ordinaryDescriptor.configurable === true && ordinaryDescriptor.enumerable === true &&
+    ordinary.share === definedShare
+  )
+
+  /** @type {Array<string>} */
+  const outcomes = []
   ;[
     { apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },
     { apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, event: 'updateV2' }
   ].forEach(({ apply, encode, event }) => {
     const source = new Y.Doc({ gc: false })
-    source.get('authority-root').insert(0, ['remote'])
-    const update = encode(source)
+    source.get('authority-root').insert(0, ['x'])
     const target = new Y.Doc({ gc: false, sparseExactResolution: true })
-    const root = target.get('authority-root')
-    root.insert(0, ['base'])
-    const originalShare = target.share
-    const replacementShare = new Map(originalShare)
-    const before = Array.from(encode(target))
-    const beforeState = Array.from(Y.encodeStateVector(target))
-    const beforeClients = new Map(target.store.clients)
-    const pendingStructs = target.store.pendingStructs
-    const pendingDs = target.store.pendingDs
-    let arm = true
-    let events = 0
-    target.on('beforeTransaction', () => {
-      if (!arm) return
-      arm = false
-      target.share = replacementShare
-    })
-    target.on(/** @type {'update'|'updateV2'} */ (event), () => { events++ })
-
-    let failure = null
+    const authority = target.share
+    const replacement = new Map(authority)
+    const descriptor = Object.getOwnPropertyDescriptor(target, 'share')
+    let assignmentFailure = null
+    let definitionFailure = null
     try {
-      try {
-        apply(target, update)
-      } catch (error) {
-        failure = error
-      }
-      t.assert(failure instanceof Error, `${event} replaced root authority must reject`)
-      t.assert(target.share === replacementShare && originalShare !== replacementShare)
-      t.assert(originalShare.size === 1 && originalShare.get('authority-root') === root)
-      t.assert(replacementShare.size === 1 && replacementShare.get('authority-root') === root)
-      t.assert(root.length === 1 && root.toArray()[0] === 'base')
-      t.compareArrays(Array.from(encode(target)), before)
-      t.compareArrays(Array.from(Y.encodeStateVector(target)), beforeState)
-      t.assert(target.store.clients.size === beforeClients.size && [...beforeClients].every(([client, structs]) => target.store.clients.get(client) === structs))
-      t.assert(target.store.pendingStructs === pendingStructs && target.store.pendingDs === pendingDs && events === 0)
-    } finally {
-      target.share = originalShare
+      target.share = replacement
+    } catch (error) {
+      assignmentFailure = error
     }
+    if (target.share !== authority) target.share = authority
+    try {
+      Object.defineProperty(target, 'share', { value: replacement })
+    } catch (error) {
+      definitionFailure = error
+    }
+    if (target.share !== authority) target.share = authority
 
-    apply(target, update)
-    const values = root.toArray()
-    t.assert(target.share === originalShare && target.get('authority-root') === root)
-    t.assert(values.length === 2 && values.includes('base') && values.includes('remote') && events === 1)
+    const sealed =
+      descriptor !== undefined && Object.prototype.hasOwnProperty.call(descriptor, 'value') &&
+      descriptor.value === authority && descriptor.writable === false && descriptor.configurable === false &&
+      descriptor.enumerable === true && assignmentFailure instanceof Error && definitionFailure instanceof Error &&
+      target.share === authority
+    apply(target, encode(source))
     const reload = new Y.Doc({ gc: false })
     apply(reload, encode(target))
-    const reloaded = reload.get('authority-root').toArray()
-    t.assert(reloaded.length === 2 && reloaded.includes('base') && reloaded.includes('remote'))
+    outcomes.push(`${event}:${sealed && target.share === authority && target.get('authority-root').toArray()[0] === 'x' && reload.get('authority-root').toArray()[0] === 'x'}`)
+  })
+  t.assert(outcomes.every(outcome => outcome.endsWith(':true')), outcomes.join(', '))
+}
+
+export const testSparseSubdocConstructorCannotReplaceHostShare = () => {
+  ;[
+    { apply: Y.applyUpdate, encode: Y.encodeStateAsUpdate, event: 'update' },
+    { apply: Y.applyUpdateV2, encode: Y.encodeStateAsUpdateV2, event: 'updateV2' }
+  ].forEach(({ apply, encode, event }) => {
+    let host = /** @type {Y.Doc|null} */ (null)
+    let replaceShare = true
+    let constructions = 0
+    let attemptedShare = /** @type {Map<string,Y.Type>|null} */ (null)
+    class TargetDoc extends Y.Doc {
+      /** @param {import('../src/utils/Doc.js').DocOpts} [opts] */
+      constructor (opts) {
+        super(opts)
+        if (opts?.guid === 'replace-host-share') {
+          constructions++
+          if (host !== null && replaceShare) {
+            attemptedShare = new Map(host.share)
+            host.share = attemptedShare
+          }
+        }
+      }
+    }
+
+    const source = new Y.Doc({ gc: false })
+    source.get('docs').insert(0, [new Y.Doc({ guid: 'replace-host-share', gc: false })])
+    source.get('text').insert(0, ['x'])
+    const update = encode(source)
+    host = new TargetDoc({ gc: false, sparseExactResolution: true })
+    const authority = host.share
+    const existing = host.get('existing-root')
+    existing.insert(0, ['base'])
+    const before = Array.from(encode(host))
+    const beforeState = Array.from(Y.encodeStateVector(host))
+    const beforeClients = new Map(host.store.clients)
+    const pendingStructs = host.store.pendingStructs
+    const pendingDs = host.store.pendingDs
+    const revision = getStructuralRevision(host.store)
+    const failedRuns = _testOnlyGetSparseFailedPlanRuns(host)
+    const proofRuns = _testOnlyGetSparsePendingProofRuns(host)
+    let updates = 0
+    let transactions = 0
+    let subdocs = 0
+    host.on(/** @type {'update'|'updateV2'} */ (event), () => { updates++ })
+    host.on('afterTransaction', () => { transactions++ })
+    host.on('subdocs', () => { subdocs++ })
+
+    t.fails(() => apply(/** @type {Y.Doc} */ (host), update))
+    t.assert(constructions === 1 && host.share === authority && attemptedShare !== authority)
+    t.assert(authority.size === 1 && authority.get('existing-root') === existing && existing.toArray()[0] === 'base')
+    t.compareArrays(Array.from(encode(host)), before)
+    t.compareArrays(Array.from(Y.encodeStateVector(host)), beforeState)
+    t.assert(host.store.clients.size === beforeClients.size && [...beforeClients].every(([client, structs]) => host?.store.clients.get(client) === structs))
+    t.assert(host.store.pendingStructs === pendingStructs && host.store.pendingDs === pendingDs && host.subdocs.size === 0)
+    t.assert(getStructuralRevision(host.store) === revision)
+    t.assert(_testOnlyGetSparseFailedPlanRuns(host) === failedRuns && _testOnlyGetSparsePendingProofRuns(host) === proofRuns)
+    t.assert(updates === 0 && transactions === 0 && subdocs === 0, `${event} constructor replacement failure is prewrite`)
+
+    replaceShare = false
+    apply(host, update)
+    t.assert(constructions === 2 && host.share === authority && updates === 1 && transactions === 1 && subdocs === 1)
+    t.assert(host.get('text').toArray()[0] === 'x' && existing.toArray()[0] === 'base')
+    t.assert(/** @type {Y.Doc} */ (host.get('docs').get(0)).guid === 'replace-host-share')
+    const reload = new Y.Doc({ gc: false })
+    apply(reload, encode(host))
+    t.assert(reload.get('text').toArray()[0] === 'x' && reload.get('existing-root').toArray()[0] === 'base')
+    t.assert(/** @type {Y.Doc} */ (reload.get('docs').get(0)).guid === 'replace-host-share')
   })
 }
 

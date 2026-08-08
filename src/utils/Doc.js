@@ -171,10 +171,19 @@ export class Doc extends ObservableV2 {
       configurable: false
     })
     this.cleanupFormatting = !isSuggestionDoc
-    /**
-     * @type {Map<string, YType>}
-     */
-    this.share = new Map()
+    if (sparseExactResolution) {
+      Object.defineProperty(this, 'share', {
+        value: /** @type {Map<string, YType>} */ (new Map()),
+        enumerable: true,
+        writable: false,
+        configurable: false
+      })
+    } else {
+      /**
+       * @type {Map<string, YType>}
+       */
+      this.share = new Map()
+    }
     this.store = new StructStore(sparseExactResolution)
     /**
      * @type {Transaction | null}
