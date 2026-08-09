@@ -352,6 +352,66 @@ export const testRendererLifecycleProjectionIsolation = () => {
   next.destroy()
 }
 
+export const testRendererLifecycleReplaceAttributions = () => {
+  const base = new Y.Doc()
+  base.clientID = 1
+  base.get('text').insert(0, 'a')
+  const next = Y.cloneDoc(base)
+  next.clientID = 2
+  next.get('text').insert(1, 'b')
+  const renderer = Y.createDiffRenderer(base, next)
+  const before = mustReadRendererLifecycle(renderer)
+  const inserts = Y.createIdMapFromIdSet(Y.createIdSetFromIdMap(renderer.inserts), [Y.createContentAttribute('insert', 'alice')])
+  const deletes = Y.createIdMapFromIdSet(Y.createIdSetFromIdMap(renderer.deletes), [Y.createContentAttribute('delete', 'alice')])
+  let changes = 0
+  renderer.on('change', () => { changes++ })
+
+  renderer.replaceAttributions({ inserts, deletes })
+
+  const replaced = mustReadRendererLifecycle(renderer)
+  t.assert(replaced !== before && replaced.revision > before.revision, 'replacement invalidates the rendered projection')
+  t.assert(changes === 0, 'the policy owner retains event batching authority')
+  t.assert(JSON.stringify(next.get('text').toDelta({ renderer }).toJSON()).includes('alice'))
+  inserts.forEach((range, client) => inserts.delete(client, range.clock, range.len))
+  t.assert(JSON.stringify(next.get('text').toDelta({ renderer }).toJSON()).includes('alice'), 'replacement captures caller-owned maps')
+
+  renderer.destroy()
+  t.fails(() => renderer.replaceAttributions({ inserts, deletes }))
+  base.destroy()
+  next.destroy()
+}
+
+export const testRendererLifecycleReplaceAttributionsRejectsReentrantDestroy = () => {
+  const base = new Y.Doc()
+  base.clientID = 1
+  base.get('text').insert(0, 'a')
+  const next = Y.cloneDoc(base)
+  next.clientID = 2
+  next.get('text').insert(1, 'b')
+  const renderer = Y.createDiffRenderer(base, next)
+  const maliciousValue = {}
+  Object.defineProperty(maliciousValue, 'author', {
+    enumerable: true,
+    get: () => {
+      renderer.destroy()
+      return 'alice'
+    }
+  })
+  const inserts = Y.createIdMapFromIdSet(
+    Y.createIdSetFromIdMap(renderer.inserts),
+    [Y.createContentAttribute('insert', maliciousValue)]
+  )
+
+  t.fails(() => renderer.replaceAttributions({ inserts, deletes: renderer.deletes }))
+  const lifecycle = mustReadRendererLifecycle(renderer)
+  t.assert(!lifecycle.active, 'reentrant destruction remains authoritative')
+  renderer.inserts.forEach(range => {
+    t.assert(!range.attrs.some(attr => attr.name === 'insert'), 'failed replacement leaves the projection unchanged')
+  })
+  base.destroy()
+  next.destroy()
+}
+
 export const testRendererLifecycleInsertDeleteCancellation = () => {
   const base = new Y.Doc()
   base.get('text').insert(0, 'a')

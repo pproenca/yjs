@@ -13,7 +13,7 @@ import { UndoManager, StackItem } from './UndoManager.js'
 import { Doc } from './Doc.js'
 import { readPendingDs, readPendingStructs } from './StructStore.js'
 
-import { $renderer, AttributedContent, cloneRendererContentAttribute, cloneRendererIdMap, cloneRendererIdSet, destroyRendererLifecycle, initializeRendererLifecycle, invalidateRendererLifecycle } from './renderer-helpers.js'
+import { $renderer, AttributedContent, cloneRendererContentAttribute, cloneRendererIdMap, cloneRendererIdSet, destroyRendererLifecycle, initializeRendererLifecycle, invalidateRendererLifecycle, readRendererLifecycle } from './renderer-helpers.js'
 
 export { baseRenderer, AbstractRenderer, rendererContentLength, $renderer } from './renderer-helpers.js'
 
@@ -532,6 +532,26 @@ export class DiffRenderer extends ObservableV2 {
    * @return {IdSet}
    */
   get attributed () { return cloneRendererIdSet(getDiffRendererProjection(this).attributed) }
+
+  /**
+   * Atomically replace attribution values over the current pending projection. Structural
+   * coverage remains renderer-owned and caller values are captured defensively. This method does
+   * not emit a change event; the policy owner controls event batching and origin.
+   *
+   * @param {ContentMap} attrs
+   */
+  replaceAttributions (attrs) {
+    const lifecycle = readRendererLifecycle(this)
+    if (lifecycle == null || !lifecycle.active) throw new Error('DiffRenderer is inactive')
+    const projection = getDiffRendererProjection(this)
+    const inserts = captureAttributions(attrs.inserts, createIdSetFromIdMap(projection.inserts))
+    const deletes = captureAttributions(attrs.deletes, createIdSetFromIdMap(projection.deletes))
+    const currentLifecycle = readRendererLifecycle(this)
+    if (currentLifecycle !== lifecycle || !currentLifecycle.active) throw new Error('DiffRenderer changed while capturing attributions')
+    projection.inserts = inserts
+    projection.deletes = deletes
+    invalidateRendererLifecycle(this)
+  }
 
   /**
    * @param {Item} item
