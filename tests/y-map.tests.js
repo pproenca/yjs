@@ -660,6 +660,14 @@ export const testRepeatGeneratingYmapTests46 = tc => {
   applyRandomTests(tc, mapTransactions, 46)
 }
 
+export const testPendingStructReplayConvergesAfterOutOfOrderNestedMapUpdates = () => {
+  applyRandomTests(
+    /** @type {t.TestCase} */ ({ prng: prng.create(1132695101) }),
+    mapTransactions,
+    46
+  )
+}
+
 /**
  * @param {t.TestCase} tc
  */

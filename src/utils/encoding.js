@@ -636,6 +636,12 @@ const applyOrdinaryUpdate = (structDecoder, structs, doc, origin) => {
   }))
   return doc.transact(transaction => {
     transaction.local = false
+    const pendingBefore = readPendingStructs(doc.store)
+    // Missing clocks are captured client frontiers, so later material from that client can make
+    // retained refs replayable without covering the recorded clock exactly.
+    const resolvesPendingClient = pendingBefore !== null && array.from(structs.clients.entries()).some(([client, range]) =>
+      pendingBefore.missing.has(client) && range.refs.some(struct => struct.constructor === Item || struct.constructor === GC)
+    )
     structs.exclude(collectKnownStructIds(structs, doc.store))
     const rest = integrateOrdinaryStructs(transaction, doc.store, structs)
     const pending = readPendingStructs(doc.store)
@@ -663,7 +669,7 @@ const applyOrdinaryUpdate = (structDecoder, structs, doc, origin) => {
       commitPendingDs(doc.store, update === null ? null : { update })
     }
     const retry = readPendingStructs(doc.store)
-    if (retry !== null && hasOrdinaryPendingResolution(doc.store)) {
+    if (retry !== null && (resolvesPendingClient || hasOrdinaryPendingResolution(doc.store))) {
       const update = retry.update
       commitPendingStructs(doc.store, null)
       applyUpdateV2(transaction.doc, update)
