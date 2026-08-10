@@ -2,18 +2,17 @@ import { ObservableV2 } from 'lib0/observable'
 import * as encoding from 'lib0/encoding'
 
 import { getItemCleanStart } from './transaction-helpers.js'
-import { diffIdSet, createInsertSetFromStructStore, createDeleteSetFromStructStore, insertIntoIdSet, mergeIdSets, intersectSets, createIdSet, createIdSetFromIdMap, writeIdSet, createIdMapFromIdSet, insertIntoIdMap, diffIdMap, createIdMap, mergeIdMaps, intersectMaps, createMaybeAttrRange, createContentAttribute } from './ids.js'
-import { ContentDeleted, ContentFormat } from '../structs/Item.js'
+import { diffIdSet, createInsertSetFromStructStore, createDeleteSetFromStructStore, insertIntoIdSet, mergeIdSets, intersectSets, createIdSet, createIdSetFromIdMap, writeIdSet, createIdMapFromIdSet, insertIntoIdMap, diffIdMap, createIdMap, mergeIdMaps, intersectMaps, createMaybeAttrRange, createContentAttribute, IdMap, IdSet } from './ids.js'
+import { ContentAny, ContentBinary, ContentDeleted, ContentDoc, ContentEmbed, ContentFormat, ContentJSON, ContentString, ContentType } from '../structs/Item.js'
+import { readPendingDs, readPendingStructs, StructStore } from './StructStore.js'
 import { createID } from './ID.js'
 import { writeStructsFromIdSet, writeStructsFromIdSetWithCausalHoles } from './encoding-helpers.js'
 import { applyUpdate, encodeStateAsUpdate } from './encoding.js'
 import { UpdateEncoderV1 } from './UpdateEncoder.js'
-import { transact } from './Transaction.js'
+import { isReservedMutationTransaction, transact } from './Transaction.js'
 import { UndoManager, StackItem } from './UndoManager.js'
 import { Doc } from './Doc.js'
-import { readPendingDs, readPendingStructs } from './StructStore.js'
-
-import { $renderer, AttributedContent, cloneRendererContentAttribute, cloneRendererIdMap, cloneRendererIdSet, destroyRendererLifecycle, initializeRendererLifecycle, invalidateRendererLifecycle, readRendererLifecycle } from './renderer-helpers.js'
+import { $renderer, AttributedContent, cloneRendererContentAttribute, cloneRendererIdMap, cloneRendererIdSet, destroyRendererLifecycle, initializeRendererLifecycle, invalidateRendererLifecycle, readRendererLifecycle, registerRendererExecutionAdapter } from './renderer-helpers.js'
 
 export { baseRenderer, AbstractRenderer, rendererContentLength, $renderer } from './renderer-helpers.js'
 
@@ -30,6 +29,8 @@ export { baseRenderer, AbstractRenderer, rendererContentLength, $renderer } from
 
 /** @type {WeakMap<DiffRenderer, DiffRendererProjection>} */
 const diffRendererProjections = new WeakMap()
+/** @type {WeakMap<DiffRenderer,{suggestionMode:boolean,suggestionOrigins:ReadonlyArray<any>|null}>} */
+const diffRendererPolicies = new WeakMap()
 
 /**
  * @param {DiffRenderer} renderer
@@ -38,6 +39,174 @@ const getDiffRendererProjection = renderer => {
   const projection = diffRendererProjections.get(renderer)
   if (projection === undefined) throw new Error('DiffRenderer projection is not initialized')
   return projection
+}
+
+/** @param {DiffRenderer} renderer */
+const getDiffRendererPolicy = renderer => {
+  const policy = diffRendererPolicies.get(renderer)
+  if (policy === undefined) throw new Error('DiffRenderer policy is not initialized')
+  return policy
+}
+
+/** @param {ReadonlyArray<any>|null} origins @param {any} origin */
+const policyAllowsOrigin = (origins, origin) => {
+  if (origins === null) return true
+  for (let index = 0; index < origins.length; index++) {
+    if (origins[index] === origin) return true
+  }
+  return false
+}
+
+/** @param {ReadonlyArray<any>|null} origins */
+const captureSuggestionOrigins = origins => {
+  if (origins === null) return null
+  if (!Array.isArray(origins)) throw new TypeError('suggestionOrigins must be an array or null')
+  const length = origins.length
+  const owned = new Array(length)
+  for (let index = 0; index < length; index++) {
+    const descriptor = objectGetOwnPropertyDescriptor(origins, String(index))
+    if (descriptor === undefined || !reflectApply(objectHasOwnProperty, descriptor, ['value'])) {
+      throw new TypeError('suggestionOrigins must contain own data entries')
+    }
+    objectDefineProperty(owned, index, {
+      configurable: false,
+      enumerable: true,
+      value: descriptor.value,
+      writable: false
+    })
+  }
+  return objectFreeze(owned)
+}
+
+const objectDefineProperty = Object.defineProperty
+const objectFreeze = Object.freeze
+const objectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
+const objectGetPrototypeOf = Object.getPrototypeOf
+const objectHasOwnProperty = Object.prototype.hasOwnProperty
+const reflectApply = Reflect.apply
+const idMapSlice = IdMap.prototype.slice
+const idMapHas = IdMap.prototype.has
+const idSetIntersects = IdSet.prototype.intersects
+const structStoreGetItem = StructStore.prototype.getItem
+const contentKernels = new Map([ContentAny, ContentBinary, ContentDeleted, ContentDoc, ContentEmbed, ContentFormat, ContentJSON, ContentString, ContentType].map(Content => [Content.prototype, {
+  copy: Content.prototype.copy,
+  getLength: Content.prototype.getLength,
+  isCountable: Content.prototype.isCountable,
+  splice: Content.prototype.splice
+}]))
+
+/** @param {AbstractContent} content */
+const readContentKernel = content => {
+  const kernel = contentKernels.get(objectGetPrototypeOf(content))
+  if (kernel === undefined) throw new Error('Unsupported renderer content')
+  return kernel
+}
+
+/** @param {any[]} values @param {any} value */
+const appendDense = (values, value) => {
+  objectDefineProperty(values, values.length, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true
+  })
+}
+
+/** @param {any[]} values @param {number} index @param {any} value */
+const insertDense = (values, index, value) => {
+  for (let current = values.length; current > index; current--) {
+    objectDefineProperty(values, current, {
+      configurable: true,
+      enumerable: true,
+      value: values[current - 1],
+      writable: true
+    })
+  }
+  objectDefineProperty(values, index, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true
+  })
+}
+
+/** @param {DiffRenderer} renderer @param {Item} item */
+const diffRendererHasItem = (renderer, item) =>
+  reflectApply(idSetIntersects, getDiffRendererProjection(renderer).attributed, [item.id.client, item.id.clock, item.length])
+
+/**
+ * @param {DiffRenderer} renderer
+ * @param {Array<AttributedContent<any>>} contents
+ * @param {number} client
+ * @param {number} clock
+ * @param {boolean} deleted
+ * @param {AbstractContent} initialContent
+ * @param {0|1|2|3} shouldRender
+ */
+const readDiffRendererContent = (renderer, contents, client, clock, deleted, initialContent, shouldRender) => {
+  const projection = getDiffRendererProjection(renderer)
+  const initialKernel = readContentKernel(initialContent)
+  const slice = reflectApply(idMapSlice, deleted ? projection.deletes : projection.inserts, [
+    client,
+    clock,
+    reflectApply(initialKernel.getLength, initialContent, [])
+  ])
+  /** @type {AbstractContent?} */
+  let content = slice.length === 1 ? initialContent : reflectApply(initialKernel.copy, initialContent, [])
+  for (let index = 0; index < slice.length; index++) {
+    const range = slice[index]
+    if (content == null || objectGetPrototypeOf(content) === ContentDeleted.prototype) {
+      if ((!shouldRender && range.attrs == null) || reflectApply(idMapHas, projection.inserts, [client, range.clock])) {
+        continue
+      }
+      const prevItem = reflectApply(structStoreGetItem, projection.prevDocStore, [createID(client, range.clock)])
+      const diffStart = range.clock - prevItem.id.clock
+      const previousKernel = readContentKernel(prevItem.content)
+      content = prevItem.length > 1 ? reflectApply(previousKernel.copy, prevItem.content, []) : prevItem.content
+      if (diffStart > 0) {
+        const currentContent = /** @type {AbstractContent} */ (content)
+        content = reflectApply(readContentKernel(currentContent).splice, currentContent, [diffStart])
+      }
+    }
+    const current = /** @type {AbstractContent} */ (content)
+    const currentKernel = readContentKernel(current)
+    const contentLength = reflectApply(currentKernel.getLength, current, [])
+    if (contentLength < range.len) {
+      insertDense(slice, index + 1, createMaybeAttrRange(range.clock + contentLength, range.len - contentLength, range.attrs))
+      range.len = contentLength
+    }
+    content = range.len < contentLength ? reflectApply(currentKernel.splice, current, [range.len]) : null
+    if (!deleted || range.attrs != null || (shouldRender !== 0 && shouldRender !== 3)) {
+      /** @type {Array<ContentAttribute<any>>?} */
+      let attrs = null
+      if (range.attrs != null) {
+        attrs = []
+        for (let attrIndex = 0; attrIndex < range.attrs.length; attrIndex++) {
+          appendDense(attrs, cloneRendererContentAttribute(range.attrs[attrIndex]))
+        }
+      }
+      appendDense(contents, new AttributedContent(current, range.clock, deleted, attrs, shouldRender))
+    }
+  }
+}
+
+/** @param {DiffRenderer} renderer @param {Item} item */
+const diffRendererContentLength = (renderer, item) => {
+  if (!item.deleted) {
+    return reflectApply(readContentKernel(item.content).isCountable, item.content, []) ? item.length : 0
+  }
+  /** @type {Array<AttributedContent<any>>} */
+  const contents = []
+  readDiffRendererContent(renderer, contents, item.id.client, item.id.clock, true, item.content, 0)
+  let length = 0
+  for (let index = 0; index < contents.length; index++) {
+    const content = contents[index]
+    const kernel = readContentKernel(content.content)
+    if (content.attrs != null && reflectApply(kernel.isCountable, content.content, [])) {
+      length += reflectApply(kernel.getLength, content.content, [])
+    }
+  }
+  return length
 }
 
 /**
@@ -414,6 +583,14 @@ export class DiffRenderer extends ObservableV2 {
     }
     diffRendererProjections.set(this, projection)
     diffResolutionReceipts.set(this, { accepted: createResolutionReceipt(), rejected: createResolutionReceipt() })
+    registerRendererExecutionAdapter(this, /** @type {any} */ ({
+      hasItem: (/** @type {Item} */ item) => diffRendererHasItem(this, item),
+      readContent: (/** @type {Array<AttributedContent<any>>} */ contents, /** @type {number} */ client, /** @type {number} */ clock, /** @type {boolean} */ deleted, /** @type {AbstractContent} */ content, /** @type {0|1|2|3} */ shouldRender) => {
+        readDiffRendererContent(this, contents, client, clock, deleted, content, shouldRender)
+      },
+      contentLength: (/** @type {Item} */ item) => diffRendererContentLength(this, item)
+    }), [prevDoc, nextDoc], () => getDiffRendererPolicy(this))
+
     // update before observer calls fired
     this._nextBOH = nextDoc.on('beforeObserverCalls', tr => {
       const diffInserts = diffIdSet(tr.insertSet, _prevDocInserts)
@@ -477,15 +654,19 @@ export class DiffRenderer extends ObservableV2 {
       origin !== this && applyUpdate(nextDoc, update)
     })
     this._ndUpdateListener = nextDoc.on('update', (update, origin, _doc, tr) => {
+      if (isReservedMutationTransaction(tr)) return
+      const policy = getDiffRendererPolicy(this)
       // only if event is local and suggestion mode is enabled
-      if (!this.suggestionMode && tr.local && (this.suggestionOrigins == null || this.suggestionOrigins.some(o => o === origin))) {
+      if (!policy.suggestionMode && tr.local && policyAllowsOrigin(policy.suggestionOrigins, origin)) {
         applyUpdate(prevDoc, update, this)
       }
     })
     this._afterTrListener = nextDoc.on('afterTransaction', (tr) => {
+      if (isReservedMutationTransaction(tr)) return
+      const policy = getDiffRendererPolicy(this)
       // apply deletes on attributed deletes (content that is already deleted, but is rendered by
       // the renderer)
-      if (!this.suggestionMode && tr.local && (this.suggestionOrigins == null || this.suggestionOrigins.some(o => o === tr.origin))) {
+      if (!policy.suggestionMode && tr.local && policyAllowsOrigin(policy.suggestionOrigins, tr.origin)) {
         const attributedDeletes = tr.meta.get('attributedDeletes')
         if (attributedDeletes != null) {
           transact(prevDoc, () => {
@@ -498,19 +679,32 @@ export class DiffRenderer extends ObservableV2 {
         }
       }
     })
-    this.suggestionMode = true
-    /**
-     * Optionally limit origins that may sync changes to the main doc if suggestion-mode is
-     * disabled.
-     *
-     * @type {Array<any>?}
-     */
-    this.suggestionOrigins = null
+    diffRendererPolicies.set(this, objectFreeze({ suggestionMode: true, suggestionOrigins: null }))
     this._destroyHandler = nextDoc.on('destroy', this.destroy.bind(this))
     prevDoc.on('destroy', this._destroyHandler)
   }
 
   get $type () { return $renderer }
+
+  get suggestionMode () { return getDiffRendererPolicy(this).suggestionMode }
+
+  /** @param {boolean} value */
+  set suggestionMode (value) {
+    if (typeof value !== 'boolean') throw new TypeError('suggestionMode must be a boolean')
+    const policy = getDiffRendererPolicy(this)
+    diffRendererPolicies.set(this, objectFreeze({ suggestionMode: value, suggestionOrigins: policy.suggestionOrigins }))
+    invalidateRendererLifecycle(this)
+  }
+
+  /** @return {ReadonlyArray<any>|null} */
+  get suggestionOrigins () { return getDiffRendererPolicy(this).suggestionOrigins }
+
+  /** @param {ReadonlyArray<any>|null} value */
+  set suggestionOrigins (value) {
+    const policy = getDiffRendererPolicy(this)
+    diffRendererPolicies.set(this, objectFreeze({ suggestionMode: policy.suggestionMode, suggestionOrigins: captureSuggestionOrigins(value) }))
+    invalidateRendererLifecycle(this)
+  }
 
   /**
    * A detached snapshot of pending insert attributions.
@@ -534,9 +728,7 @@ export class DiffRenderer extends ObservableV2 {
   get attributed () { return cloneRendererIdSet(getDiffRendererProjection(this).attributed) }
 
   /**
-   * Atomically replace attribution values over the current pending projection. Structural
-   * coverage remains renderer-owned and caller values are captured defensively. This method does
-   * not emit a change event; the policy owner controls event batching and origin.
+   * Atomically replace attribution values over the current pending projection.
    *
    * @param {ContentMap} attrs
    */
@@ -558,7 +750,7 @@ export class DiffRenderer extends ObservableV2 {
    * @return {boolean}
    */
   hasItem (item) {
-    return getDiffRendererProjection(this).attributed.intersects(item.id.client, item.id.clock, item.length)
+    return diffRendererHasItem(this, item)
   }
 
   destroy () {
@@ -716,42 +908,7 @@ export class DiffRenderer extends ObservableV2 {
    * @param {0|1|2|3} shouldRender - whether this should render or just result in a `retain` operation (see AbstractRenderer#readContent)
    */
   readContent (contents, client, clock, deleted, _content, shouldRender) {
-    const projection = getDiffRendererProjection(this)
-    const slice = (deleted ? projection.deletes : projection.inserts).slice(client, clock, _content.getLength())
-    /**
-     * @type {AbstractContent?}
-     */
-    let content = slice.length === 1 ? _content : _content.copy()
-    for (let i = 0; i < slice.length; i++) {
-      const s = slice[i]
-      if (content == null || content instanceof ContentDeleted) {
-        if ((!shouldRender && s.attrs == null) || projection.inserts.has(client, s.clock)) {
-          continue
-        }
-        // Retrieved item is never more fragmented than the newer item.
-        const prevItem = projection.prevDocStore.getItem(createID(client, s.clock))
-        const diffStart = s.clock - prevItem.id.clock
-        content = prevItem.length > 1 ? prevItem.content.copy() : prevItem.content
-        // trim itemContent to the correct size.
-        if (diffStart > 0) {
-          content = content.splice(diffStart)
-        }
-      }
-      const c = /** @type {AbstractContent} */ (content)
-      const clen = c.getLength()
-      if (clen < s.len) {
-        slice.splice(i + 1, 0, createMaybeAttrRange(s.clock + clen, s.len - clen, s.attrs))
-        s.len = clen
-      }
-      content = s.len < clen ? c.splice(s.len) : null
-      // mode 3 (fresh content deleted in the same transaction) renders as an insert only where
-      // the renderer attributes it — unattributed deleted content is invisible and renders as
-      // *nothing* (there is nothing to insert, and a `delete` op would misapply: the consuming
-      // state has never seen this content)
-      if (!deleted || s.attrs != null || (shouldRender !== 0 && shouldRender !== 3)) {
-        contents.push(new AttributedContent(c, s.clock, deleted, s.attrs?.map(cloneRendererContentAttribute) ?? null, shouldRender))
-      }
-    }
+    readDiffRendererContent(this, contents, client, clock, deleted, _content, shouldRender)
   }
 
   /**
@@ -759,15 +916,7 @@ export class DiffRenderer extends ObservableV2 {
    * @return {number}
    */
   contentLength (item) {
-    if (!item.deleted) {
-      return item.content.isCountable() ? item.length : 0
-    }
-    /**
-     * @type {Array<AttributedContent<any>>}
-     */
-    const cs = []
-    this.readContent(cs, item.id.client, item.id.clock, true, item.content, 0)
-    return cs.reduce((cnt, c) => cnt + ((c.attrs != null && c.content.isCountable()) ? c.content.getLength() : 0), 0)
+    return diffRendererContentLength(this, item)
   }
 }
 

@@ -4,6 +4,18 @@ import { ObservableV2 } from 'lib0/observable'
 
 import { createContentAttribute, createIdMap, createIdSet } from './ids.js'
 
+const objectDefineProperty = Object.defineProperty
+
+/** @param {any[]} values @param {any} value */
+const appendDense = (values, value) => {
+  objectDefineProperty(values, values.length, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true
+  })
+}
+
 /**
  * @typedef {{ revision: number, active: boolean }} RendererLifecycleSnapshot
  */
@@ -15,6 +27,84 @@ import { createContentAttribute, createIdMap, createIdSet } from './ids.js'
  * @type {WeakMap<object, Readonly<RendererLifecycleSnapshot>>}
  */
 const rendererLifecycles = new WeakMap()
+
+/**
+ * Renderer execution is a private projection capability, separate from the caller-visible renderer
+ * object. Reserved mutations retain this sealed adapter so later public property changes cannot
+ * alter targeting or fail after a write.
+ *
+ * @type {WeakMap<object, Readonly<{adapter:Readonly<AbstractRenderer>,dependencies:readonly Doc[],readPolicy:(()=>any)|null}>>}
+ */
+const rendererExecutionAdapters = new WeakMap()
+
+/**
+ * @param {object} renderer
+ * @param {AbstractRenderer} adapter
+ * @param {readonly Doc[]} dependencies
+ * @param {()=>any} [readPolicy]
+ */
+export const registerRendererExecutionAdapter = (renderer, adapter, dependencies, readPolicy) => {
+  error.assert(!rendererExecutionAdapters.has(renderer))
+  const sealed = Object.freeze({
+    hasItem: adapter.hasItem,
+    readContent: adapter.readContent,
+    contentLength: adapter.contentLength
+  })
+  /** @type {Doc[]} */
+  const ownedDependencies = []
+  for (let index = 0; index < dependencies.length; index++) appendDense(ownedDependencies, dependencies[index])
+  rendererExecutionAdapters.set(renderer, Object.freeze({
+    adapter: /** @type {Readonly<AbstractRenderer>} */ (sealed),
+    dependencies: Object.freeze(ownedDependencies),
+    readPolicy: readPolicy ?? null
+  }))
+}
+
+/**
+ * @param {object} renderer
+ * @return {Readonly<{adapter:Readonly<AbstractRenderer>,dependencies:readonly Doc[]}>?}
+ */
+export const readRendererExecutionAdapter = renderer => rendererExecutionAdapters.get(renderer) ?? null
+
+/** @param {object} renderer */
+export const readRendererPolicySnapshot = renderer => {
+  const execution = rendererExecutionAdapters.get(renderer)
+  if (execution === undefined || execution.readPolicy === null) return null
+  const policy = execution.readPolicy()
+  const origins = policy.suggestionOrigins
+  let capturedOrigins = null
+  if (origins !== null) {
+    if (!Array.isArray(origins)) throw new TypeError('suggestionOrigins must be an array or null')
+    const length = origins.length
+    capturedOrigins = new Array(length)
+    for (let index = 0; index < length; index++) {
+      const descriptor = Object.getOwnPropertyDescriptor(origins, String(index))
+      if (descriptor === undefined || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+        throw new TypeError('suggestionOrigins must contain own data entries')
+      }
+      objectDefineProperty(capturedOrigins, index, {
+        configurable: true,
+        enumerable: true,
+        value: descriptor.value,
+        writable: true
+      })
+    }
+    Object.freeze(capturedOrigins)
+  }
+  return Object.freeze({ suggestionMode: policy.suggestionMode, suggestionOrigins: capturedOrigins })
+}
+
+/** @param {object} renderer @param {any} snapshot */
+export const rendererPolicySnapshotIsFresh = (renderer, snapshot) => {
+  const current = readRendererPolicySnapshot(renderer)
+  if (current === null || snapshot === null || current.suggestionMode !== snapshot.suggestionMode) return current === snapshot
+  if (current.suggestionOrigins === null || snapshot.suggestionOrigins === null) return current.suggestionOrigins === snapshot.suggestionOrigins
+  if (current.suggestionOrigins.length !== snapshot.suggestionOrigins.length) return false
+  for (let index = 0; index < current.suggestionOrigins.length; index++) {
+    if (current.suggestionOrigins[index] !== snapshot.suggestionOrigins[index]) return false
+  }
+  return true
+}
 
 /**
  * @param {object} renderer
@@ -137,7 +227,12 @@ const cloneRendererAttributionValue = value => {
           if (descriptor?.enumerable) {
             let item
             try { item = current[index] } catch {}
-            copied[index] = clone(item)
+            objectDefineProperty(copied, index, {
+              configurable: true,
+              enumerable: true,
+              value: clone(item),
+              writable: true
+            })
           }
         }
         return copied
@@ -176,14 +271,18 @@ export const cloneRendererIdMap = idmap => {
   /** @type {Map<ContentAttribute<any>, ContentAttribute<any>>} */
   const attributes = new Map()
   idmap.forEach((range, client) => {
-    clone.add(client, range.clock, range.len, range.attrs.map(attr => {
+    /** @type {Array<ContentAttribute<any>>} */
+    const clonedAttributes = []
+    for (let index = 0; index < range.attrs.length; index++) {
+      const attr = range.attrs[index]
       let cloned = attributes.get(attr)
       if (cloned === undefined) {
         cloned = cloneRendererContentAttribute(attr)
         attributes.set(attr, cloned)
       }
-      return cloned
-    }))
+      appendDense(clonedAttributes, cloned)
+    }
+    clone.add(client, range.clock, range.len, clonedAttributes)
   })
   return clone
 }

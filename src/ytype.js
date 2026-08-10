@@ -28,11 +28,12 @@ import {
   createContentDocFromDoc
 } from './structs/Item.js'
 import { AttributedContent, rendererContentLength } from './utils/renderer-helpers.js'
+import { createDeltaMutationPlanBuilder, createPreparedDeltaMutation, readDeltaMutationPlan } from './utils/delta-mutation.js'
 import { removeEventHandlerListener, callEventHandlerListeners, addEventHandlerListener, createEventHandler } from './utils/EventHandler.js'
 import { createID } from './utils/ID.js'
 import { createIdSet, iterateStructsByIdSetWithoutSplits } from './utils/ids.js'
 import { getItemCleanStart, cleanupFormattingGap } from './utils/transaction-helpers.js'
-import { transact } from './utils/Transaction.js'
+import { isReservedMutationTransaction, transact } from './utils/Transaction.js'
 import { YEvent } from './utils/YEvent.js'
 import { $ydoc } from './utils/schemas.js'
 
@@ -46,6 +47,192 @@ import { $ydoc } from './utils/schemas.js'
 export const warnPrematureAccess = () => { log.warn('Invalid access: Add Yjs type to a document before reading data.') }
 
 const maxSearchMarker = 80
+const objectCreate = Object.create
+const objectDefineProperty = Object.defineProperty
+const objectGetPrototypeOf = Object.getPrototypeOf
+const objectKeys = Object.keys
+const reflectApply = Reflect.apply
+const mapDelete = Map.prototype.delete
+const setAdd = Set.prototype.add
+const setForEach = Set.prototype.forEach
+const NativeMap = Map
+const NativeSet = Set
+const reservedMutationRuntime = Symbol('reserved-mutation-runtime')
+const deltaPlanBuilderFactory = Symbol('delta-plan-builder-factory')
+const deltaPlanRenderer = Symbol('delta-plan-renderer')
+/** @param {any[]} values @param {any} value */
+const appendDense = (values, value) => {
+  objectDefineProperty(values, values.length, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true
+  })
+}
+
+/** @param {YType<any>} target @param {Transaction} transaction @param {Set<null|string>} subs */
+const createReservedYEvent = (target, transaction, subs) => {
+  const keysChanged = new NativeSet()
+  let childListChanged = false
+  reflectApply(setForEach, subs, [sub => {
+    if (sub === null) childListChanged = true
+    else reflectApply(setAdd, keysChanged, [sub])
+  }])
+  const event = /** @type {YEvent<any>} */ (objectCreate(YEvent.prototype))
+  const fields = /** @type {Record<string,any>} */ ({
+    target,
+    currentTarget: target,
+    transaction,
+    _delta: null,
+    _deltaDeep: null,
+    childListChanged,
+    keysChanged
+  })
+  const keys = objectKeys(fields)
+  for (let index = 0; index < keys.length; index++) {
+    const key = keys[index]
+    objectDefineProperty(event, key, {
+      configurable: true,
+      enumerable: true,
+      value: fields[key],
+      writable: true
+    })
+  }
+  return event
+}
+
+/** @param {ItemTextListPosition} position */
+const readPositionRuntime = position => /** @type {any} */ (position)[reservedMutationRuntime]
+
+/** @param {ItemTextListPosition} position @param {Item} item @param {string} key */
+const positionItemRead = (position, item, key) => {
+  const runtime = readPositionRuntime(position)
+  return runtime === null ? /** @type {any} */ (item)[key] : runtime.items.read(item, key)
+}
+
+/** @param {ItemTextListPosition} position @param {Item} item */
+const positionItemDeleted = (position, item) => {
+  const runtime = readPositionRuntime(position)
+  return runtime === null ? item.deleted : runtime.items.isDeleted(item)
+}
+
+/** @param {ItemTextListPosition} position @param {Item} item */
+const positionItemCountable = (position, item) => {
+  const runtime = readPositionRuntime(position)
+  return runtime === null ? item.countable : runtime.items.isCountable(item)
+}
+
+/** @param {ItemTextListPosition} position @param {Item} item */
+const positionItemLastId = (position, item) => {
+  const runtime = readPositionRuntime(position)
+  return runtime === null ? item.lastId : runtime.items.lastId(item)
+}
+
+/** @param {ItemTextListPosition} position @param {import('./structs/Item.js').AbstractContent} content @param {string} key */
+const positionContentRead = (position, content, key) => {
+  const runtime = readPositionRuntime(position)
+  return runtime === null ? /** @type {any} */ (content)[key] : runtime.items.readContent(content, key)
+}
+
+/** @param {ItemTextListPosition} _position @param {import('./structs/Item.js').AbstractContent} content */
+const positionContentPrototype = (_position, content) => objectGetPrototypeOf(content)
+
+/** @param {ItemTextListPosition} position @param {number} client @param {number} clock */
+const positionCreateId = (position, client, clock) => {
+  const runtime = readPositionRuntime(position)
+  return runtime === null ? createID(client, clock) : runtime.items.createId(client, clock)
+}
+
+/** @param {ItemTextListPosition} position @param {Transaction} transaction @param {Item} item @param {number} offset */
+const positionCleanStart = (position, transaction, item, offset) => {
+  const runtime = readPositionRuntime(position)
+  const id = positionItemRead(position, item, 'id')
+  const target = positionCreateId(
+    position,
+    runtime === null ? id.client : runtime.items.readId(id, 'client'),
+    (runtime === null ? id.clock : runtime.items.readId(id, 'clock')) + offset
+  )
+  return runtime === null ? getItemCleanStart(transaction, target) : runtime.items.cleanStart(transaction, target)
+}
+
+/** @param {ItemTextListPosition} position @param {Item} item */
+const positionContentLength = (position, item) => {
+  const runtime = readPositionRuntime(position)
+  return runtime === null ? rendererContentLength(position.renderer, item) : runtime.rendererContentLength(position.renderer, item)
+}
+
+/** @param {ItemTextListPosition} position @param {import('./structs/Item.js').AbstractContent} content */
+const positionRawContentLength = (position, content) => {
+  const runtime = readPositionRuntime(position)
+  return runtime === null ? content.getLength() : runtime.items.getContentLength(content)
+}
+
+/** @param {ItemTextListPosition} position @param {import('./structs/Item.js').AbstractContent} content */
+const positionContentIsCountable = (position, content) => {
+  const runtime = readPositionRuntime(position)
+  return runtime === null ? content.isCountable() : runtime.items.isContentCountable(content)
+}
+
+/** @param {ItemTextListPosition} position @param {Item} item */
+const positionRendererHasItem = (position, item) => {
+  const runtime = readPositionRuntime(position)
+  return runtime === null
+    ? position.renderer !== null && position.renderer.hasItem(item)
+    : runtime.rendererHasItem(position.renderer, item)
+}
+
+/** @param {ItemTextListPosition} position @param {any[]} contents @param {Item} item @param {0|1|2|3} behavior */
+const positionReadRendererContent = (position, contents, item, behavior) => {
+  const runtime = readPositionRuntime(position)
+  if (runtime === null) /** @type {AbstractRenderer} */ (position.renderer).readContent(contents, item.id.client, item.id.clock, item.deleted, item.content, behavior)
+  else runtime.rendererReadContent(position.renderer, contents, item, behavior)
+}
+
+/** @param {ItemTextListPosition} position @param {Map<any,any>} target @param {any} key */
+const positionMapGet = (position, target, key) => {
+  const runtime = readPositionRuntime(position)
+  return runtime === null ? target.get(key) : runtime.mapGet(target, key)
+}
+
+/** @param {ItemTextListPosition} position @param {Map<any,any>} target @param {any} key @param {any} value */
+const positionMapSet = (position, target, key, value) => {
+  const runtime = readPositionRuntime(position)
+  if (runtime === null) target.set(key, value)
+  else runtime.mapSet(target, key, value)
+}
+
+/** @param {ItemTextListPosition} position @param {Map<any,any>} target @param {any} key */
+const positionMapDelete = (position, target, key) => {
+  const runtime = readPositionRuntime(position)
+  if (runtime === null) target.delete(key)
+  else reflectApply(mapDelete, target, [key])
+}
+
+/** @param {ItemTextListPosition} position @param {Map<any,any>} target @param {(value:any,key:any) => void} callback */
+const positionMapForEach = (position, target, callback) => {
+  const runtime = readPositionRuntime(position)
+  if (runtime === null) target.forEach(callback)
+  else runtime.mapForEach(target, callback)
+}
+
+/** @param {ItemTextListPosition} position @param {ConstructorParameters<typeof Item>} args */
+const createPositionItem = (position, args) => {
+  const runtime = readPositionRuntime(position)
+  return runtime === null ? new Item(...args) : runtime.items.create(...args)
+}
+
+/** @param {ItemTextListPosition} position @param {Item} item @param {Transaction} transaction */
+const deletePositionItem = (position, item, transaction) => {
+  const runtime = readPositionRuntime(position)
+  if (runtime === null) item.delete(transaction)
+  else runtime.items.delete(item, transaction)
+}
+
+/** @param {YType<any>} type @param {any} opts */
+const renderNestedTypeDelta = (type, opts) => {
+  const render = opts[deltaPlanRenderer]
+  return render === undefined ? type.toDelta(opts) : render(type, opts)
+}
 
 /**
  * @todo SHOULD NOT RETURN AN OBJECT!
@@ -102,13 +289,15 @@ export class ItemTextListPosition {
    * @param {number} index
    * @param {Map<string,any>} currentFormats
    * @param {AbstractRenderer?} renderer
+   * @param {any} [runtime]
    */
-  constructor (left, right, index, currentFormats, renderer) {
+  constructor (left, right, index, currentFormats, renderer, runtime = null) {
     this.left = left
     this.right = right
     this.index = index
     this.currentFormats = currentFormats
     this.renderer = renderer
+    objectDefineProperty(this, reservedMutationRuntime, { value: runtime })
   }
 
   /**
@@ -118,18 +307,14 @@ export class ItemTextListPosition {
     if (this.right === null) {
       error.unexpectedCase()
     }
-    switch (this.right.content.constructor) {
-      case ContentFormat:
-        if (!this.right.deleted) {
-          updateCurrentFormats(this.currentFormats, /** @type {ContentFormat} */ (this.right.content))
-        }
-        break
-      default:
-        this.index += rendererContentLength(this.renderer, this.right)
-        break
+    const content = positionItemRead(this, this.right, 'content')
+    if (positionContentPrototype(this, content) === ContentFormat.prototype) {
+      if (!positionItemDeleted(this, this.right)) updateCurrentFormats(this, content)
+    } else {
+      this.index += positionContentLength(this, this.right)
     }
     this.left = this.right
-    this.right = this.right.right
+    this.right = positionItemRead(this, this.right, 'right')
   }
 
   /**
@@ -152,63 +337,63 @@ export class ItemTextListPosition {
       (length > 0 ||
         (
           negatedFormats.size > 0 &&
-          ((this.right.deleted && rendererContentLength(this.renderer, this.right) === 0) || this.right.content.constructor === ContentFormat)
+          ((positionItemDeleted(this, this.right) && positionContentLength(this, this.right) === 0) || positionContentPrototype(this, positionItemRead(this, this.right, 'content')) === ContentFormat.prototype)
         )
       )
     ) {
-      switch (this.right.content.constructor) {
-        case ContentFormat: {
-          if (!this.right.deleted) {
-            const { key, value } = /** @type {ContentFormat} */ (this.right.content)
-            const attr = formats[key]
-            if (attr !== undefined) {
-              if (equalFormats(attr, value)) {
-                negatedFormats.delete(key)
-              } else {
-                if (length === 0) {
-                  // no need to further extend negatedFormats
-                  // eslint-disable-next-line no-labels
-                  break iterationLoop
-                }
-                negatedFormats.set(key, value)
-              }
-              this.right.delete(transaction)
+      const rightContent = positionItemRead(this, this.right, 'content')
+      if (positionContentPrototype(this, rightContent) === ContentFormat.prototype) {
+        if (!positionItemDeleted(this, this.right)) {
+          const key = positionContentRead(this, rightContent, 'key')
+          const value = positionContentRead(this, rightContent, 'value')
+          const attr = formats[key]
+          if (attr !== undefined) {
+            if (equalFormats(attr, value)) {
+              positionMapDelete(this, negatedFormats, key)
             } else {
-              this.currentFormats.set(key, value)
+              if (length === 0) {
+                // no need to further extend negatedFormats
+                // eslint-disable-next-line no-labels
+                break iterationLoop
+              }
+              positionMapSet(this, negatedFormats, key, value)
             }
+            deletePositionItem(this, this.right, transaction)
+          } else {
+            positionMapSet(this, this.currentFormats, key, value)
           }
-          break
         }
-        default: {
-          const item = this.right
-          const rightLen = rendererContentLength(this.renderer, item)
-          if (length < rightLen) {
-            if (this.renderer !== null && this.renderer.hasItem(item)) {
-              /**
+      } else {
+        const item = this.right
+        const rightLen = positionContentLength(this, item)
+        if (length < rightLen) {
+          if (positionRendererHasItem(this, item)) {
+            /**
                * @type {Array<AttributedContent<any>>}
                */
-              const contents = []
-              this.renderer.readContent(contents, item.id.client, item.id.clock, item.deleted, item.content, 0)
-              let i = 0
-              for (; i < contents.length && length > 0; i++) {
-                const c = contents[i]
-                if ((!c.deleted || c.attrs != null) && c.content.isCountable()) {
-                  length -= c.content.getLength()
-                }
+            const contents = []
+            positionReadRendererContent(this, contents, item, 0)
+            let i = 0
+            for (; i < contents.length && length > 0; i++) {
+              const c = contents[i]
+              if ((!c.deleted || c.attrs != null) && positionContentIsCountable(this, c.content)) {
+                length -= positionRawContentLength(this, c.content)
               }
-              if (length < 0 || (length === 0 && i !== contents.length)) {
-                const c = contents[--i]
-                getItemCleanStart(transaction, createID(item.id.client, c.clock + c.content.getLength() + length))
-              }
-            } else {
-              // plain content: split directly at the offset
-              getItemCleanStart(transaction, createID(item.id.client, item.id.clock + length))
-              length = 0
+            }
+            if (length < 0 || (length === 0 && i !== contents.length)) {
+              const c = contents[--i]
+              const runtime = readPositionRuntime(this)
+              const id = positionItemRead(this, item, 'id')
+              const itemClock = runtime === null ? id.clock : runtime.items.readId(id, 'clock')
+              positionCleanStart(this, transaction, item, c.clock - itemClock + positionRawContentLength(this, c.content) + length)
             }
           } else {
-            length -= rightLen
+            // plain content: split directly at the offset
+            positionCleanStart(this, transaction, item, length)
+            length = 0
           }
-          break
+        } else {
+          length -= rightLen
         }
       }
       this.forward()
@@ -218,6 +403,13 @@ export class ItemTextListPosition {
     }
     insertNegatedFormats(transaction, parent, this, negatedFormats)
   }
+}
+
+/** @param {ItemTextListPosition} position @param {Transaction} transaction @param {Item} item */
+const integratePositionItem = (position, transaction, item) => {
+  const runtime = readPositionRuntime(position)
+  if (runtime === null) item.integrate(transaction, 0)
+  else runtime.items.integrate(item, transaction, 0)
 }
 
 /**
@@ -235,42 +427,44 @@ const insertNegatedFormats = (transaction, parent, currPos, negatedFormats) => {
   // check if we really need to remove formats
   while (
     currPos.right !== null && (
-      (currPos.right.deleted && rendererContentLength(currPos.renderer, currPos.right) === 0) || (
-        currPos.right.content.constructor === ContentFormat &&
-        equalFormats(negatedFormats.get(/** @type {ContentFormat} */ (currPos.right.content).key), /** @type {ContentFormat} */ (currPos.right.content).value)
+      (positionItemDeleted(currPos, currPos.right) && positionContentLength(currPos, currPos.right) === 0) || (
+        positionContentPrototype(currPos, positionItemRead(currPos, currPos.right, 'content')) === ContentFormat.prototype &&
+        equalFormats(positionMapGet(currPos, negatedFormats, positionContentRead(currPos, positionItemRead(currPos, currPos.right, 'content'), 'key')), positionContentRead(currPos, positionItemRead(currPos, currPos.right, 'content'), 'value'))
       )
     )
   ) {
-    if (!currPos.right.deleted) {
-      negatedFormats.delete(/** @type {ContentFormat} */ (currPos.right.content).key)
+    if (!positionItemDeleted(currPos, currPos.right)) {
+      positionMapDelete(currPos, negatedFormats, positionContentRead(currPos, positionItemRead(currPos, currPos.right, 'content'), 'key'))
     }
     currPos.forward()
   }
   const doc = transaction.doc
   const ownClientId = doc.clientID
-  negatedFormats.forEach((val, key) => {
+  positionMapForEach(currPos, negatedFormats, (val, key) => {
     const left = currPos.left
     const right = currPos.right
-    const nextFormat = new Item(createID(ownClientId, doc.store.getClock(ownClientId)), left, left && left.lastId, right, right && right.id, parent, null, new ContentFormat(key, val))
-    nextFormat.integrate(transaction, 0)
+    const runtime = readPositionRuntime(currPos)
+    const nextFormat = createPositionItem(currPos, [positionCreateId(currPos, ownClientId, doc.store.getClock(ownClientId)), left, left && positionItemLastId(currPos, left), right, right && positionItemRead(currPos, right, 'id'), parent, null, runtime === null ? new ContentFormat(key, val) : runtime.items.createFormat(key, val)])
+    integratePositionItem(currPos, transaction, nextFormat)
     currPos.right = nextFormat
     currPos.forward()
   })
 }
 
 /**
- * @param {Map<string,any>} currentFormats
+ * @param {ItemTextListPosition} position
  * @param {ContentFormat} format
  *
  * @private
  * @function
  */
-const updateCurrentFormats = (currentFormats, format) => {
-  const { key, value } = format
+const updateCurrentFormats = (position, format) => {
+  const key = positionContentRead(position, format, 'key')
+  const value = positionContentRead(position, format, 'value')
   if (value === null) {
-    currentFormats.delete(key)
+    positionMapDelete(position, position.currentFormats, key)
   } else {
-    currentFormats.set(key, value)
+    positionMapSet(position, position.currentFormats, key, value)
   }
 }
 
@@ -286,7 +480,7 @@ const minimizeFormatChanges = (currPos, formats) => {
   while (true) {
     if (currPos.right === null) {
       break
-    } else if (currPos.right.deleted ? (rendererContentLength(currPos.renderer, currPos.right) === 0) : (!currPos.right.deleted && currPos.right.content.constructor === ContentFormat && equalFormats(formats[(/** @type {ContentFormat} */ (currPos.right.content)).key] ?? null, /** @type {ContentFormat} */ (currPos.right.content).value))) {
+    } else if (positionItemDeleted(currPos, currPos.right) ? (positionContentLength(currPos, currPos.right) === 0) : (positionContentPrototype(currPos, positionItemRead(currPos, currPos.right, 'content')) === ContentFormat.prototype && equalFormats(formats[positionContentRead(currPos, positionItemRead(currPos, currPos.right, 'content'), 'key')] ?? null, positionContentRead(currPos, positionItemRead(currPos, currPos.right, 'content'), 'value')))) {
       //
     } else {
       break
@@ -308,17 +502,19 @@ const minimizeFormatChanges = (currPos, formats) => {
 const insertFormats = (transaction, parent, currPos, formats) => {
   const doc = transaction.doc
   const ownClientId = doc.clientID
-  const negatedFormats = new Map()
+  const negatedFormats = readPositionRuntime(currPos) === null ? new Map() : new NativeMap()
   // insert format-start items
   for (const key in formats) {
     const val = formats[key]
-    const currentVal = currPos.currentFormats.get(key) ?? null
+    const currentVal = positionMapGet(currPos, currPos.currentFormats, key) ?? null
     if (!equalFormats(currentVal, val)) {
       // save negated format (set null if currentVal undefined)
-      negatedFormats.set(key, currentVal)
+      positionMapSet(currPos, negatedFormats, key, currentVal)
       const { left, right } = currPos
-      currPos.right = new Item(createID(ownClientId, doc.store.getClock(ownClientId)), left, left && left.lastId, right, right && right.id, parent, null, new ContentFormat(key, val))
-      currPos.right.integrate(transaction, 0)
+      const runtime = readPositionRuntime(currPos)
+      const formatItem = createPositionItem(currPos, [positionCreateId(currPos, ownClientId, doc.store.getClock(ownClientId)), left, left && positionItemLastId(currPos, left), right, right && positionItemRead(currPos, right, 'id'), parent, null, runtime === null ? new ContentFormat(key, val) : runtime.items.createFormat(key, val)])
+      currPos.right = formatItem
+      integratePositionItem(currPos, transaction, formatItem)
       currPos.forward()
     }
   }
@@ -336,7 +532,7 @@ const insertFormats = (transaction, parent, currPos, formats) => {
  * @function
  **/
 export const insertContent = (transaction, parent, currPos, content, formats) => {
-  currPos.currentFormats.forEach((_val, key) => {
+  positionMapForEach(currPos, currPos.currentFormats, (_val, key) => {
     if (formats[key] === undefined) {
       formats[key] = null
     }
@@ -347,10 +543,10 @@ export const insertContent = (transaction, parent, currPos, content, formats) =>
   const negatedFormats = insertFormats(transaction, parent, currPos, formats)
   let { left, right, index } = currPos
   if (parent._searchMarker) {
-    updateMarkerChanges(parent._searchMarker, currPos.index, content.getLength())
+    updateMarkerChanges(parent._searchMarker, currPos.index, positionRawContentLength(currPos, content))
   }
-  right = new Item(createID(ownClientId, doc.store.getClock(ownClientId)), left, left && left.lastId, right, right && right.id, parent, null, content)
-  right.integrate(transaction, 0)
+  right = createPositionItem(currPos, [positionCreateId(currPos, ownClientId, doc.store.getClock(ownClientId)), left, left && positionItemLastId(currPos, left), right, right && positionItemRead(currPos, right, 'id'), parent, null, content])
+  integratePositionItem(currPos, transaction, /** @type {Item} */ (right))
   currPos.right = right
   currPos.index = index
   currPos.forward()
@@ -389,6 +585,75 @@ export const insertContentHelper = (transaction, parent, currPos, insert, format
   }
 }
 
+/** @param {any} runtime @param {Map<string,any>} source */
+const copyFormatsCanonical = (runtime, source) => {
+  const copy = new NativeMap()
+  /** @param {any} value @param {any} key */
+  const copyEntry = (value, key) => runtime.mapSet(copy, key, value)
+  runtime.mapForEach(source, copyEntry)
+  return copy
+}
+
+/** @param {any} runtime @param {Map<string,any>} formats @param {string} key @param {any} value */
+const updateFormatsCanonical = (runtime, formats, key, value) => {
+  if (value === null) reflectApply(mapDelete, formats, [key])
+  else runtime.mapSet(formats, key, value)
+}
+
+/**
+ * @param {Transaction} transaction
+ * @param {Item} start
+ * @param {Item|null} current
+ * @param {Map<string,any>} startFormats
+ * @param {Map<string,any>} currentFormats
+ * @param {any} runtime
+ */
+const cleanupFormattingGapCanonical = (transaction, start, current, startFormats, currentFormats, runtime) => {
+  if (!transaction.doc.cleanupFormatting) return 0
+  /** @type {Item|null} */
+  let end = start
+  const endFormats = new NativeMap()
+  while (end !== null && (!runtime.items.isCountable(end) || runtime.items.isDeleted(end))) {
+    const content = runtime.items.read(end, 'content')
+    if (!runtime.items.isDeleted(end) && objectGetPrototypeOf(content) === ContentFormat.prototype) {
+      runtime.mapSet(endFormats, runtime.items.readContent(content, 'key'), content)
+    }
+    end = runtime.items.read(end, 'right')
+  }
+  let cleanups = 0
+  let reachedCurrent = false
+  while (start !== end) {
+    if (current === start) reachedCurrent = true
+    if (!runtime.items.isDeleted(start)) {
+      const content = runtime.items.read(start, 'content')
+      if (objectGetPrototypeOf(content) === ContentFormat.prototype) {
+        const key = runtime.items.readContent(content, 'key')
+        const value = runtime.items.readContent(content, 'value')
+        const startFormatValue = runtime.mapGet(startFormats, key) ?? null
+        if (runtime.mapGet(endFormats, key) !== content || startFormatValue === value) {
+          runtime.items.delete(start, transaction)
+          const id = runtime.items.read(start, 'id')
+          runtime.idSets.add(
+            transaction.cleanUps,
+            runtime.items.readId(id, 'client'),
+            runtime.items.readId(id, 'clock'),
+            runtime.items.read(start, 'length')
+          )
+          cleanups++
+          if (!reachedCurrent && (runtime.mapGet(currentFormats, key) ?? null) === value && startFormatValue !== value) {
+            updateFormatsCanonical(runtime, currentFormats, key, startFormatValue)
+          }
+        }
+        if (!reachedCurrent && !runtime.items.isDeleted(start)) {
+          updateFormatsCanonical(runtime, currentFormats, key, value)
+        }
+      }
+    }
+    start = runtime.items.read(start, 'right')
+  }
+  return cleanups
+}
+
 /**
  * @param {Transaction} transaction
  * @param {ItemTextListPosition} currPos
@@ -400,26 +665,28 @@ export const insertContentHelper = (transaction, parent, currPos, insert, format
  */
 export const deleteText = (transaction, currPos, length) => {
   const startLength = length
-  const startFormats = map.copy(currPos.currentFormats)
+  const runtime = readPositionRuntime(currPos)
+  const startFormats = runtime === null ? map.copy(currPos.currentFormats) : copyFormatsCanonical(runtime, currPos.currentFormats)
   const start = currPos.right
   while (length > 0 && currPos.right !== null) {
     const item = currPos.right
-    if (!item.deleted && item.countable) {
-      if (length < item.length) {
-        getItemCleanStart(transaction, createID(item.id.client, item.id.clock + length))
+    const itemLength = positionItemRead(currPos, item, 'length')
+    if (!positionItemDeleted(currPos, item) && positionItemCountable(currPos, item)) {
+      if (length < itemLength) {
+        positionCleanStart(currPos, transaction, item, length)
       }
-      length -= item.length
-      item.delete(transaction)
-    } else if (currPos.renderer !== null && currPos.renderer.hasItem(item)) {
+      length -= positionItemRead(currPos, item, 'length')
+      deletePositionItem(currPos, item, transaction)
+    } else if (positionRendererHasItem(currPos, item)) {
       /**
        * @type {Array<AttributedContent<any>>}
        */
       const contents = []
-      currPos.renderer.readContent(contents, item.id.client, item.id.clock, true, item.content, 0)
+      positionReadRendererContent(currPos, contents, item, 0)
       let splitClock = -1
       for (let i = 0; i < contents.length; i++) {
         const c = contents[i]
-        if (c.content.isCountable() && c.attrs != null) {
+        if (positionContentIsCountable(currPos, c.content) && c.attrs != null) {
           if (length === 0) {
             // the delete is exhausted but this item renders more content — split so the cursor
             // advances only past the consumed part (mirrors formatText's renderer branch);
@@ -429,9 +696,21 @@ export const deleteText = (transaction, currPos, length) => {
           }
           // deleting already deleted content. store that information in a meta property, but do
           // nothing
-          const pieceLen = c.content.getLength()
+          const pieceLen = positionRawContentLength(currPos, c.content)
           const contentLen = math.min(pieceLen, length)
-          map.setIfUndefined(transaction.meta, 'attributedDeletes', createIdSet).add(item.id.client, c.clock, contentLen)
+          const runtime = readPositionRuntime(currPos)
+          if (runtime === null) {
+            const id = positionItemRead(currPos, item, 'id')
+            map.setIfUndefined(transaction.meta, 'attributedDeletes', createIdSet).add(id.client, c.clock, contentLen)
+          } else {
+            let attributedDeletes = runtime.mapGet(transaction.meta, 'attributedDeletes')
+            if (attributedDeletes === undefined) {
+              attributedDeletes = runtime.idSets.create()
+              runtime.mapSet(transaction.meta, 'attributedDeletes', attributedDeletes)
+            }
+            const id = positionItemRead(currPos, item, 'id')
+            runtime.idSets.add(attributedDeletes, runtime.items.readId(id, 'client'), c.clock, contentLen)
+          }
           length -= contentLen
           if (contentLen < pieceLen) {
             splitClock = c.clock + contentLen
@@ -440,20 +719,26 @@ export const deleteText = (transaction, currPos, length) => {
         }
       }
       if (splitClock >= 0) {
-        getItemCleanStart(transaction, createID(item.id.client, splitClock))
+        const runtime = readPositionRuntime(currPos)
+        const id = positionItemRead(currPos, item, 'id')
+        const itemClock = runtime === null ? id.clock : runtime.items.readId(id, 'clock')
+        positionCleanStart(currPos, transaction, item, splitClock - itemClock)
       } else {
         const lastContent = contents.length > 0 ? contents[contents.length - 1] : null
-        const nextItemClock = item.id.clock + item.length
-        const nextContentClock = lastContent != null ? lastContent.clock + lastContent.content.getLength() : nextItemClock
+        const runtime = readPositionRuntime(currPos)
+        const id = positionItemRead(currPos, item, 'id')
+        const nextItemClock = (runtime === null ? id.clock : runtime.items.readId(id, 'clock')) + itemLength
+        const nextContentClock = lastContent != null ? lastContent.clock + positionRawContentLength(currPos, lastContent.content) : nextItemClock
         if (nextContentClock < nextItemClock) {
-          getItemCleanStart(transaction, createID(item.id.client, nextContentClock))
+          positionCleanStart(currPos, transaction, item, nextContentClock - (runtime === null ? id.clock : runtime.items.readId(id, 'clock')))
         }
       }
     }
     currPos.forward()
   }
   if (start) {
-    cleanupFormattingGap(transaction, start, currPos.right, startFormats, currPos.currentFormats)
+    if (runtime === null) cleanupFormattingGap(transaction, start, currPos.right, startFormats, currPos.currentFormats)
+    else cleanupFormattingGapCanonical(transaction, start, currPos.right, startFormats, currPos.currentFormats, runtime)
   }
   const parent = /** @type {YType<any>} */ (/** @type {Item} */ (currPos.left || currPos.right).parent)
   if (parent._searchMarker) {
@@ -664,6 +949,228 @@ export const callTypeObservers = (type, transaction, event) => {
 }
 
 /**
+ * The single delta mutation interpreter used by ordinary and reserved application.
+ *
+ * @param {YType<any>} type
+ * @param {any} d
+ * @param {any} origin
+ * @param {AbstractRenderer?} renderer
+ * @param {Transaction?} activeTransaction
+ * @param {any} [runtime]
+ */
+const applyDeltaCanonical = (type, d, origin, renderer, activeTransaction, runtime = null) => {
+  const reserved = runtime !== null
+  if (reserved ? d.children.length === 0 && d.attrs.length === 0 : d.isEmpty()) return null
+  if (type.doc == null) {
+    if (reserved) {
+      error.unexpectedCase()
+    }
+    (type._prelim || (type._prelim = /** @type {any} */ (delta.create()))).apply(d)
+    return null
+  }
+  const titem = type._item
+  if (titem !== null && titem.deleted) {
+    if ((reserved ? runtime.rendererContentLength(renderer, titem) : rendererContentLength(renderer, titem)) > 0) {
+      if (reserved) {
+        return d.preparedFix ?? null
+      }
+      const inv = delta.inverse(/** @type {delta.DeltaAny} */ (d), /** @type {any} */ (type.toDeltaDeep({ renderer })))
+      return inv.isEmpty() ? null : /** @type {any} */ (inv)
+    }
+    return null
+  }
+  /** @param {Transaction} transaction */
+  const execute = transaction => {
+    if (reserved && runtime.items.readType(type, '_searchMarker') !== null) {
+      runtime.items.writeType(type, '_searchMarker', null)
+    }
+    /** @type {delta.DeltaBuilder<any>?} */
+    let fix = null
+    let fixLen = 0
+    let expectedIndex = 0
+    /**
+     * @param {delta.DeltaAny?} childFix
+     * @param {{ [k:string]: any }} [invFormat]
+     */
+    const appendModifyFix = (childFix, invFormat) => {
+      if (reserved) return
+      const f = fix ?? (fix = /** @type {any} */ (delta.create()))
+      expectedIndex > fixLen && f.retain(expectedIndex - fixLen)
+      f.modify(/** @type {any} */ (childFix ?? delta.create().done(false)), invFormat)
+      fixLen = expectedIndex + 1
+    }
+    /**
+     * Ordinary application preserves nested type polymorphism. Reserved execution has already
+     * admitted canonical types and stays on this private interpreter in the captured transaction.
+     *
+     * @param {YType<any>} sub
+     * @param {any} mutation
+     */
+    const applyNestedDelta = (sub, mutation) => activeTransaction === null
+      ? sub.applyDelta(mutation, origin, { renderer })
+      : applyDeltaCanonical(sub, mutation, origin, renderer, transaction, runtime)
+    const currPos = new ItemTextListPosition(null, type._start, 0, reserved ? new NativeMap() : new Map(), renderer, runtime)
+    /** @param {any} format */
+    const getFormat = format => {
+      if (!reserved) return format || {}
+      const owned = objectCreate(null)
+      if (format != null) {
+        const keys = objectKeys(format)
+        for (let index = 0; index < keys.length; index++) {
+          objectDefineProperty(owned, keys[index], {
+            configurable: true,
+            enumerable: true,
+            value: format[keys[index]],
+            writable: true
+          })
+        }
+      }
+      return owned
+    }
+    /**
+     * @param {readonly any[]} entries
+     * @param {Object<string,any>} formats
+     */
+    const insertReservedContent = (entries, formats) => {
+      /** @type {any[]} */
+      let values = []
+      const flushValues = () => {
+        if (values.length > 0) {
+          insertContent(transaction, type, currPos, runtime.items.createAny(values), formats)
+          values = []
+        }
+      }
+      for (let index = 0; index < entries.length; index++) {
+        const entry = entries[index]
+        if (entry.kind === 'nested') {
+          flushValues()
+          const child = entry.type
+          if (child.doc !== null) error.unexpectedCase()
+          insertContent(transaction, type, currPos, entry.content, formats)
+          applyDeltaCanonical(child, entry.value, origin, renderer, transaction, runtime)
+        } else {
+          appendDense(values, entry.value)
+        }
+      }
+      flushValues()
+    }
+    /** @param {any} op */
+    const applyChild = op => {
+      const kind = reserved
+        ? op.kind
+        : (delta.$textOp.check(op)
+            ? 'text'
+            : (delta.$insertOp.check(op)
+                ? 'insert'
+                : (delta.$retainOp.check(op)
+                    ? 'retain'
+                    : (delta.$deleteOp.check(op) ? 'delete' : (delta.$modifyOp.check(op) ? 'modify' : null)))))
+      if (kind === 'text') {
+        insertContent(transaction, type, currPos, reserved ? runtime.items.createString(op.insert) : new ContentString(op.insert), getFormat(op.format))
+        expectedIndex += reserved ? op.length : op.length
+      } else if (kind === 'insert') {
+        if (reserved) insertReservedContent(op.insert, getFormat(op.format))
+        else insertContentHelper(transaction, type, currPos, op.insert, op.format || {})
+        expectedIndex += op.length
+      } else if (kind === 'retain') {
+        currPos.formatText(transaction, type, op.retain, getFormat(op.format))
+        expectedIndex += op.length
+      } else if (kind === 'delete') {
+        deleteText(transaction, currPos, reserved ? op.length : op.delete)
+      } else if (kind === 'modify') {
+        let item = currPos.right
+        while (item !== null && (reserved ? runtime.rendererContentLength(renderer, item) : rendererContentLength(renderer, item)) === 0) {
+          item = reserved ? runtime.items.read(item, 'right') : item.right
+        }
+        if (item == null || (reserved ? objectGetPrototypeOf(runtime.items.read(item, 'content')) !== ContentType.prototype : item.content.constructor !== ContentType)) { error.unexpectedCase() }
+        const itemContent = reserved ? runtime.items.read(item, 'content') : item.content
+        const child = reserved ? runtime.items.readContent(itemContent, 'type') : /** @type {ContentType} */ (itemContent).type
+        if (reserved ? runtime.items.isDeleted(item) : item.deleted) {
+          currPos.formatText(transaction, type, 1, getFormat(null))
+          if (reserved) {
+            if (op.inverseFormat !== undefined) {
+              const keys = objectKeys(op.inverseFormat)
+              for (let index = 0; index < keys.length; index++) {
+                const key = keys[index]
+                objectDefineProperty(op.inverseFormat, key, {
+                  configurable: true,
+                  enumerable: true,
+                  value: positionMapGet(currPos, currPos.currentFormats, key) ?? null,
+                  writable: true
+                })
+              }
+            }
+            applyNestedDelta(child, op.value)
+          } else {
+            /** @type {{ [k:string]: any }|undefined} */
+            let invFormat
+            for (const k in op.format) {
+              (invFormat ?? (invFormat = {}))[k] = currPos.currentFormats.get(k) ?? null
+            }
+            const childFix = applyNestedDelta(child, op.value)
+            if (childFix !== null || invFormat !== undefined) appendModifyFix(childFix, invFormat)
+          }
+        } else {
+          const childFix = applyNestedDelta(child, op.value)
+          currPos.formatText(transaction, type, 1, getFormat(op.format))
+          if (childFix !== null) appendModifyFix(childFix)
+        }
+        expectedIndex += 1
+      } else {
+        error.unexpectedCase()
+      }
+    }
+    if (reserved) {
+      for (let index = 0; index < d.children.length; index++) applyChild(d.children[index])
+    } else {
+      for (const op of d.children) applyChild(op)
+    }
+    /** @param {any} op */
+    const applyAttr = op => {
+      const kind = reserved
+        ? op.kind
+        : (delta.$setAttrOp.check(op) ? 'set' : (delta.$deleteAttrOp.check(op) ? 'delete' : 'modify'))
+      if (kind === 'set') {
+        typeMapSet(transaction, type, op.key, op.value, runtime)
+      } else if (kind === 'delete') {
+        typeMapDelete(transaction, type, op.key, runtime)
+      } else {
+        const mapItem = reserved ? runtime.mapGet(type._map, op.key) : type._map.get(op.key)
+        let sub
+        if (mapItem !== undefined) {
+          if (reserved) {
+            const content = runtime.items.read(mapItem, 'content')
+            if (
+              objectGetPrototypeOf(content) === ContentType.prototype &&
+              (!runtime.items.isDeleted(mapItem) || runtime.rendererContentLength(renderer, mapItem) > 0)
+            ) sub = runtime.items.readContent(content, 'type')
+          } else if (mapItem.deleted) {
+            if (mapItem.content.constructor === ContentType && rendererContentLength(renderer, mapItem) > 0) sub = /** @type {ContentType} */ (mapItem.content).type
+          } else {
+            sub = mapItem.content.getContent()[mapItem.length - 1]
+          }
+        }
+        if (reserved ? sub === undefined : !(sub instanceof YType)) error.unexpectedCase()
+        const subFix = applyNestedDelta(/** @type {YType} */ (sub), op.value)
+        if (subFix !== null) {
+          if (!reserved) {
+            const f = fix ?? (fix = /** @type {any} */ (delta.create()))
+            f.modifyAttr(op.key, /** @type {any} */ (subFix))
+          }
+        }
+      }
+    }
+    if (reserved) {
+      for (let index = 0; index < d.attrs.length; index++) applyAttr(d.attrs[index])
+    } else {
+      for (const op of d.attrs) applyAttr(op)
+    }
+    return reserved ? (d.preparedFix ?? null) : (fix !== null && !(/** @type {delta.DeltaBuilder<any>} */ (fix).done(false).isEmpty()) ? fix : null)
+  }
+  return activeTransaction === null ? transact(type.doc, execute, origin) : execute(activeTransaction)
+}
+
+/**
  * Abstract Yjs Type class.
  *
  * A `YType` is a {@link https://github.com/dmonad/lib0 lib0} `RDT` ("replicated data type", see
@@ -695,7 +1202,7 @@ export class YType extends ObservableV2 {
     /**
      * @type {Map<string,Item>}
      */
-    this._map = new Map()
+    this._map = new NativeMap()
     /**
      * @type {Item|null}
      */
@@ -705,6 +1212,8 @@ export class YType extends ObservableV2 {
      */
     this.doc = null
     this._length = 0
+    /** @type {delta.DeltaBuilder<any>|null} */
+    this._prelim = null
     /**
      * Event handlers
      * @type {EventHandler<YEvent<DeltaToYType<DConf>>,Transaction>}
@@ -945,7 +1454,9 @@ export class YType extends ObservableV2 {
    * @param {Set<null|string>} parentSubs Keys changed on this type. `null` if list was modified.
    */
   _callObserver (transaction, parentSubs) {
-    const event = new YEvent(/** @type {any} */ (this), transaction, parentSubs)
+    const event = isReservedMutationTransaction(transaction)
+      ? createReservedYEvent(/** @type {any} */ (this), transaction, parentSubs)
+      : new YEvent(/** @type {any} */ (this), transaction, parentSubs)
     callTypeObservers(/** @type {any} */ (this), transaction, event)
     // Note: the RDT `'delta'` channel (and the deep-delta cache) is driven in the transaction
     // cleanup's `changedParentTypes` loop (see Transaction.js) so it bubbles to ancestors like
@@ -1027,10 +1538,8 @@ export class YType extends ObservableV2 {
     const { modified = (deep && itemsToRender) ? computeModifiedFromItems(/** @type {Doc} */ (this.doc).store, itemsToRender) : null } = opts
     const renderAttrs = modified?.get(this) || null
     const renderChildren = modified == null || !modified.has(this) || /** @type {Set<string|null>} */ (modified.get(this)).has(null)
-    /**
-     * @type {delta.DeltaBuilderAny}
-     */
-    const d = /** @type {any} */ (delta.create(this.name))
+    const createBuilder = /** @type {(name:null|string)=>any} */ (/** @type {any} */ (opts)[deltaPlanBuilderFactory] ?? delta.create)
+    const d = /** @type {any} */ (createBuilder(this.name))
     const optsAll = object.assign({}, opts, { renderer, modified })
     // opts has been re-computed - do not use opts after this point!
     typeMapGetDelta(d, /** @type {any} */ (this), renderAttrs, renderer, deep, modified, itemsToRender, optsAll, optsAll)
@@ -1161,19 +1670,19 @@ export class YType extends ObservableV2 {
                 usingChangedFormats = true
                 if (c.deleted && c.content.constructor === ContentType) {
                   // @todo use current transaction instead
-                  d.modify(/** @type {any} */ (c.content).type.toDelta(optsAll), undefined, attribution ?? null)
+                  d.modify(/** @type {any} */ (renderNestedTypeDelta((/** @type {ContentType} */ (c.content)).type, optsAll)), undefined, attribution ?? null)
                 } else if (c.content.constructor === ContentType && modified?.has(/** @type {ContentType} */ (c.content).type)) {
                   // a de/re-attributed node the renderer still claims (e.g. a partial accept):
                   // merge/clear its own attribution and descend so the nested walk heals exactly
                   // the child ids in `itemsToRender` — other children keep their attribution
-                  d.modify(/** @type {any} */ (c.content).type.toDelta(optsAll), undefined, attribution ?? clearedOwnAttribution())
+                  d.modify(/** @type {any} */ (renderNestedTypeDelta((/** @type {ContentType} */ (c.content)).type, optsAll)), undefined, attribution ?? clearedOwnAttribution())
                 } else {
                   d.retain(c.content.getLength(), undefined, attribution ?? clearedOwnAttribution())
                 }
               } else if (deep && c.content.constructor === ContentType) {
                 d.useFormats(currentFormats)
                 usingCurrentFormats = true
-                d.insert([/** @type {any} */(c.content).type.toDelta(optsAll)], undefined, attribution)
+                d.insert([/** @type {any} */(renderNestedTypeDelta((/** @type {ContentType} */ (c.content)).type, optsAll))], undefined, attribution)
               } else {
                 d.useFormats(currentFormats)
                 usingCurrentFormats = true
@@ -1184,7 +1693,7 @@ export class YType extends ObservableV2 {
             } else if (retainContent) {
               if (c.content.constructor === ContentType && modified?.has(/** @type {ContentType} */ (c.content).type)) {
                 // @todo use current transaction instead
-                d.modify(/** @type {any} */ (c.content).type.toDelta(optsAll))
+                d.modify(/** @type {any} */ (renderNestedTypeDelta((/** @type {ContentType} */ (c.content)).type, optsAll)))
               } else {
                 d.useFormats(changedFormats)
                 usingChangedFormats = true
@@ -1214,7 +1723,7 @@ export class YType extends ObservableV2 {
             if (renderContent || renderDelete) {
               if (itemsToRender !== null && renderer !== null) {
                 // only attributing change renders consult this (see the reset branch below)
-                if (renderedFormatKeys === null) renderedFormatKeys = new Set()
+                if (renderedFormatKeys === null) renderedFormatKeys = new NativeSet()
                 renderedFormatKeys.add(key)
               }
               // `previousFormats` tracks the value governing the current walk position in the
@@ -1434,7 +1943,7 @@ export class YType extends ObservableV2 {
               d.useFormats(currentFormats)
               usingCurrentFormats = true
               if (deep && content.constructor === ContentType) {
-                d.insert([/** @type {any} */(content).type.toDelta(optsAll)])
+                d.insert([/** @type {any} */(renderNestedTypeDelta((/** @type {ContentType} */ (content)).type, optsAll))])
               } else if (content.constructor === ContentString) {
                 d.insert(/** @type {ContentString} */ (content).str)
               } else {
@@ -1456,7 +1965,7 @@ export class YType extends ObservableV2 {
               if (!idrange.exists) {
                 if (content.constructor === ContentType && modified?.has(/** @type {ContentType} */ (content).type)) {
                   // @todo use current transaction instead
-                  d.modify(/** @type {ContentType} */ (content).type.toDelta(optsAll))
+                  d.modify(/** @type {any} */ (renderNestedTypeDelta(/** @type {ContentType} */ (content).type, optsAll)))
                 } else {
                   d.useFormats(changedFormats)
                   usingChangedFormats = true
@@ -1469,7 +1978,7 @@ export class YType extends ObservableV2 {
                   // own attribution and descend so the nested walk heals exactly the child ids
                   // present in `itemsToRender` — children outside the change set keep their
                   // attribution (id-scoped, never a blanket subtree clear)
-                  d.modify(/** @type {ContentType} */ (content).type.toDelta(optsAll), undefined, clearedOwnAttribution())
+                  d.modify(/** @type {any} */ (renderNestedTypeDelta(/** @type {ContentType} */ (content).type, optsAll)), undefined, clearedOwnAttribution())
                 } else {
                   d.useFormats(changedFormats)
                   usingChangedFormats = true
@@ -1479,7 +1988,7 @@ export class YType extends ObservableV2 {
                 d.useFormats(currentFormats)
                 usingCurrentFormats = true
                 if (deep && content.constructor === ContentType) {
-                  d.insert([/** @type {any} */(content).type.toDelta(optsAll)])
+                  d.insert([/** @type {any} */(renderNestedTypeDelta((/** @type {ContentType} */ (content)).type, optsAll))])
                 } else if (content.constructor === ContentString) {
                   d.insert(/** @type {ContentString} */ (c).str)
                 } else {
@@ -1561,6 +2070,32 @@ export class YType extends ObservableV2 {
   }
 
   /**
+   * Reserve a conservative structural-range bound for `d` without writing, then return a
+   * single-use capability that applies this exact delta through {@link YType#applyDelta}.
+   *
+   * @param {delta.DeltaAny} d
+   * @param {any} [origin]
+   * @param {Object} [opts]
+   * @param {AbstractRenderer?} [opts.renderer]
+   * @return {import('./utils/delta-mutation.js').PreparedDeltaMutation}
+   */
+  reserveDeltaMutation (d, origin = null, { renderer = this._renderer } = {}) {
+    return createPreparedDeltaMutation(
+      this,
+      d,
+      origin,
+      renderer,
+      (transaction, mutation, executionRenderer, runtime) => {
+        return applyDeltaCanonical(this, readDeltaMutationPlan(mutation), origin, executionRenderer, transaction, runtime)
+      },
+      YType.prototype.applyDelta,
+      canonicalYTypeIntegrate,
+      name => new YType(name),
+      renderDeltaMutationPlan
+    )
+  }
+
+  /**
    * Apply a {@link Delta} on this shared type.
    *
    * @param {delta.DeltaAny} d The changes to apply on this element.
@@ -1580,113 +2115,7 @@ export class YType extends ObservableV2 {
    * @public
    */
   applyDelta (d, origin = null, { renderer = this._renderer } = {}) {
-    if (d.isEmpty()) return null
-    if (this.doc == null) {
-      (this._prelim || (this._prelim = /** @type {any} */ (delta.create()))).apply(d)
-      return null
-    }
-    const titem = this._item
-    if (titem !== null && titem.deleted) {
-      if (rendererContentLength(renderer, titem) > 0) {
-        // deleted, but still rendered (e.g. a suggestion-deleted node): apply nothing — revert the
-        // whole change and return its inverse (against the rendered state the caller addressed)
-        const inv = delta.inverse(d, /** @type {any} */ (this.toDeltaDeep({ renderer })))
-        return inv.isEmpty() ? null : /** @type {any} */ (inv)
-      }
-      return null // invisible deleted type: the caller's view shows nothing here — silently drop
-    }
-    // @todo this was moved here from ytext. Make this more generic
-    return transact(this.doc, transaction => {
-      /**
-       * The accumulated fix. Its coordinates live in the caller's *expected* space, so they are
-       * tracked from `d`'s own ops (`expectedIndex`) — not `currPos.index`, which also counts
-       * content that a delete over attributed-deleted ranges leaves rendered.
-       *
-       * @type {delta.DeltaBuilder<any>?}
-       */
-      let fix = null
-      let fixLen = 0
-      let expectedIndex = 0
-      /**
-       * @param {delta.DeltaAny?} childFix
-       * @param {{ [k:string]: any }} [invFormat]
-       */
-      const appendModifyFix = (childFix, invFormat) => {
-        const f = fix ?? (fix = /** @type {any} */ (delta.create()))
-        expectedIndex > fixLen && f.retain(expectedIndex - fixLen)
-        f.modify(/** @type {any} */ (childFix ?? delta.create().done(false)), invFormat)
-        fixLen = expectedIndex + 1
-      }
-      const currPos = new ItemTextListPosition(null, this._start, 0, new Map(), renderer)
-      for (const op of d.children) {
-        if (delta.$textOp.check(op)) {
-          insertContent(transaction, /** @type {any} */ (this), currPos, new ContentString(op.insert), op.format || {})
-          expectedIndex += op.length
-        } else if (delta.$insertOp.check(op)) {
-          insertContentHelper(transaction, this, currPos, op.insert, op.format || {})
-          expectedIndex += op.length
-        } else if (delta.$retainOp.check(op)) {
-          currPos.formatText(transaction, /** @type {any} */ (this), op.retain, op.format || {})
-          expectedIndex += op.length
-        } else if (delta.$deleteOp.check(op)) {
-          deleteText(transaction, currPos, op.delete)
-        } else if (delta.$modifyOp.check(op)) {
-          let item = currPos.right
-          while (item !== null && rendererContentLength(renderer, item) === 0) { item = item.right }
-          if (item == null || item.content.constructor !== ContentType) { error.unexpectedCase() }
-          if (item.deleted) {
-            // deleted but rendered: revert instead of apply. Advance the cursor first (populating
-            // `currentFormats` with any markers up to the node) without applying `op.format`, then
-            // recurse — the child's deleted-guard applies nothing and returns the inverse.
-            currPos.formatText(transaction, /** @type {any} */ (this), 1, {})
-            /** @type {{ [k:string]: any }|undefined} */
-            let invFormat
-            for (const k in op.format) {
-              (invFormat ?? (invFormat = {}))[k] = currPos.currentFormats.get(k) ?? null
-            }
-            const childFix = /** @type {ContentType} */ (item.content).type.applyDelta(op.value, origin, { renderer })
-            if (childFix !== null || invFormat !== undefined) {
-              appendModifyFix(childFix, invFormat)
-            }
-          } else {
-            const childFix = /** @type {ContentType} */ (item.content).type.applyDelta(op.value, origin, { renderer })
-            currPos.formatText(transaction, /** @type {any} */ (this), 1, op.format || {})
-            if (childFix !== null) {
-              appendModifyFix(childFix)
-            }
-          }
-          expectedIndex += 1
-        } else {
-          error.unexpectedCase()
-        }
-      }
-      for (const op of d.attrs) {
-        if (delta.$setAttrOp.check(op)) {
-          typeMapSet(transaction, /** @type {any} */ (this), /** @type {any} */ (op.key), op.value)
-        } else if (delta.$deleteAttrOp.check(op)) {
-          typeMapDelete(transaction, /** @type {any} */ (this), /** @type {any} */ (op.key))
-        } else {
-          // modifyAttr — locate the target renderer-aware: a deleted map value may still be rendered
-          const mapItem = this._map.get(/** @type {any} */ (op.key))
-          const sub = mapItem === undefined
-            ? undefined
-            : (mapItem.deleted
-                ? (mapItem.content.constructor === ContentType && rendererContentLength(renderer, mapItem) > 0
-                    ? /** @type {ContentType} */ (mapItem.content).type
-                    : undefined)
-                : mapItem.content.getContent()[mapItem.length - 1])
-          if (!(sub instanceof YType)) {
-            error.unexpectedCase()
-          }
-          const subFix = sub.applyDelta(op.value, origin, { renderer })
-          if (subFix !== null) {
-            const f = fix ?? (fix = /** @type {any} */ (delta.create()))
-            f.modifyAttr(/** @type {any} */ (op.key), /** @type {any} */ (subFix))
-          }
-        }
-      }
-      return fix !== null && !(/** @type {delta.DeltaBuilder<any>} */ (fix).done(false).isEmpty()) ? fix : null
-    }, origin)
+    return applyDeltaCanonical(this, d, origin, renderer, null)
   }
 
   /**
@@ -2053,6 +2482,21 @@ export class YType extends ObservableV2 {
   }
 }
 
+const canonicalToDelta = YType.prototype.toDelta
+const canonicalYTypeIntegrate = YType.prototype._integrate
+
+/** @param {YType<any>} type @param {AbstractRenderer?} renderer */
+const renderDeltaMutationPlan = (type, renderer) => {
+  /** @param {YType<any>} target @param {any} opts */
+  const render = (target, opts) => reflectApply(canonicalToDelta, target, [opts])
+  return render(type, {
+    renderer,
+    deep: true,
+    [deltaPlanBuilderFactory]: createDeltaMutationPlanBuilder,
+    [deltaPlanRenderer]: render
+  })
+}
+
 /**
  * @template {import('lib0/delta').ReadableDeltaConf} DConf
  * @param {DConf} _dconf
@@ -2069,7 +2513,7 @@ export const computeModifiedFromItems = (store, items) => {
   /**
    * @type {Map<YType,Set<null|string>>}
    */
-  const modified = new Map()
+  const modified = new NativeMap()
   iterateStructsByIdSetWithoutSplits(store, items, /** @param {Item | GC | Skip | null} item */ item => {
     while (item instanceof Item) {
       const parent = /** @type {YType} */ (item.parent)
@@ -2396,14 +2840,16 @@ export const typeListDelete = (transaction, parent, index, length) => {
  * @param {Transaction} transaction
  * @param {YType} parent
  * @param {string} key
+ * @param {any} [runtime]
  *
  * @private
  * @function
  */
-export const typeMapDelete = (transaction, parent, key) => {
-  const c = parent._map.get(key)
+export const typeMapDelete = (transaction, parent, key, runtime = null) => {
+  const c = runtime === null ? parent._map.get(key) : runtime.mapGet(parent._map, key)
   if (c !== undefined) {
-    c.delete(transaction)
+    if (runtime === null) c.delete(transaction)
+    else runtime.items.delete(c, transaction)
   }
 }
 
@@ -2412,16 +2858,21 @@ export const typeMapDelete = (transaction, parent, key) => {
  * @param {YType} parent
  * @param {string} key
  * @param {YValue} value
+ * @param {any} [runtime]
  *
  * @private
  * @function
  */
-export const typeMapSet = (transaction, parent, key, value) => {
-  const left = parent._map.get(key) || null
+export const typeMapSet = (transaction, parent, key, value, runtime = null) => {
+  const left = (runtime === null ? parent._map.get(key) : runtime.mapGet(parent._map, key)) || null
   const doc = transaction.doc
   const ownClientId = doc.clientID
   let content
-  if (value == null) {
+  if (runtime !== null) {
+    content = value !== null && typeof value === 'object' && objectGetPrototypeOf(value) === Uint8Array.prototype
+      ? runtime.items.createBinary(/** @type {Uint8Array} */ (value))
+      : runtime.items.createAny([value])
+  } else if (value == null) {
     content = new ContentAny([value])
   } else {
     switch (value.constructor) {
@@ -2447,7 +2898,12 @@ export const typeMapSet = (transaction, parent, key, value) => {
         }
     }
   }
-  new Item(createID(ownClientId, doc.store.getClock(ownClientId)), left, left && left.lastId, null, null, parent, key, content).integrate(transaction, 0)
+  const args = [runtime === null ? createID(ownClientId, doc.store.getClock(ownClientId)) : runtime.items.createId(ownClientId, doc.store.getClock(ownClientId)), left, left && (runtime === null ? left.lastId : runtime.items.lastId(left)), null, null, parent, key, content]
+  const item = runtime === null
+    ? new Item(.../** @type {ConstructorParameters<typeof Item>} */(args))
+    : runtime.items.create(...args)
+  if (runtime === null) item.integrate(transaction, 0)
+  else runtime.items.integrate(item, transaction, 0)
 }
 
 /**
@@ -2561,10 +3017,10 @@ export const typeMapGetDelta = (d, parent, attrsToRender, renderer, deep, modifi
         d.deleteAttr(key, attribution)
       }
     } else if (deep && c instanceof YType && modified?.has(c)) {
-      d.modifyAttr(key, c.toDelta(opts))
+      d.modifyAttr(key, renderNestedTypeDelta(c, opts))
     } else {
       if (deep && c instanceof YType) {
-        c = /** @type {any} */(c).toDelta(optsAll)
+        c = /** @type {any} */ (renderNestedTypeDelta(c, optsAll))
       }
       d.setAttr(key, c, attribution)
     }
