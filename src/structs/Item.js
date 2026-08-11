@@ -293,6 +293,7 @@ export class Item extends AbstractStruct {
    * @param {number} offset
    */
   integrate (transaction, offset) {
+    if (this.length === 0) return
     const reservedRuntime = readReservedMutationTransactionRuntime(transaction)
     if (reservedRuntime !== undefined) return integrateItemCanonical(this, transaction, offset, reservedRuntime)
     if (offset > 0) {

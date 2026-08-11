@@ -12,6 +12,27 @@ import * as delta from 'lib0/delta'
 import * as array from 'lib0/array'
 import { CausalHole, sameCausalHoleMetadata } from '../src/structs/CausalHole.js'
 
+export const testZeroLengthItemIntegrationIsANoop = () => {
+  const doc = new Y.Doc({ gc: false })
+  const parent = doc.get('items')
+
+  Y.transact(doc, transaction => {
+    new Y.Item(
+      Y.createID(doc.clientID, 0),
+      null,
+      null,
+      null,
+      null,
+      parent,
+      null,
+      new Y.ContentAny([])
+    ).integrate(transaction, 0)
+  })
+
+  t.assert(doc.store.clients.size === 0)
+  t.assert(Y.encodeStateAsUpdate(doc).byteLength === 2)
+}
+
 /**
  * @typedef {Object} Enc
  * @property {function(Array<Uint8Array<ArrayBuffer>>):Uint8Array<ArrayBuffer>} Enc.mergeUpdates
